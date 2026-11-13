@@ -18,6 +18,9 @@ extension PairingService {
         let peers = PeerService(runtime: runtime, build: configuration.build)
         await peers.install()
         let service = PairingService(runtime: runtime, peers: peers, configuration: configuration)
+        // Features installed later (transfers, clipboard) reach the same instances.
+        await runtime.provide(peers)
+        await runtime.provide(service)
         await runtime.register("pair.start") { _ in await respond { try await service.start() } }
         await runtime.register("pair.join") { request in
             await respond { try await service.join(code: request.arguments["code"] ?? "") }

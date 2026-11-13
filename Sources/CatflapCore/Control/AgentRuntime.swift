@@ -33,9 +33,16 @@ public actor AgentRuntime {
     private var ui = UIState()
     public typealias Handler = @Sendable (ControlRequest) async throws -> ControlResponse
     private var handlers: [String: Handler] = [:]
+    private var services: [ObjectIdentifier: any Sendable] = [:]
     public init(paths: AgentPaths) throws {
         store = try Store(paths: paths)
         identityServer = try IdentityServer(persistence: IdentityStore(paths: paths))
+    }
+    /// Hands a long-lived service to the features installed after this one. One per type.
+    public func provide<Service: Sendable>(_ service: Service) { services[ObjectIdentifier(Service.self)] = service }
+    /// The service of this type an earlier feature provided, if any.
+    public func service<Service: Sendable>(_ type: Service.Type = Service.self) -> Service? {
+        services[ObjectIdentifier(type)] as? Service
     }
     public func start() async throws {
         let devices = try await store.devices()
