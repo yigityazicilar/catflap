@@ -18,7 +18,7 @@ var targets: [Target] = [
     .target(name: "Tailcat", dependencies: ["CTailcat"], swiftSettings: [.swiftLanguageMode(.v6)], linkerSettings: nativeLibraries),
     .target(name: "CatflapCore", dependencies: ["Tailcat", "CSQLite", .product(name: "Crypto", package: "swift-crypto")], swiftSettings: [.swiftLanguageMode(.v6)]),
     .testTarget(name: "TailcatTests", dependencies: ["Tailcat", "CTailcat", .product(name: "Crypto", package: "swift-crypto")]),
-    .testTarget(name: "CatflapCoreTests", dependencies: ["CatflapCore"]),
+    .testTarget(name: "CatflapCoreTests", dependencies: ["CatflapCore", "Tailcat", .product(name: "Crypto", package: "swift-crypto")]),
     .testTarget(name: "CatflapE2ETests", dependencies: ["CatflapCore", "catflap"]),
 ]
 var executableDependencies: [Target.Dependency] = [
