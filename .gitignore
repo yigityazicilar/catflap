@@ -1,0 +1,30 @@
+# Swift and platform build output
+/.build/
+/.swiftpm/
+/build/
+/DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+
+# Local planning, experiments, and machine-specific review evidence
+/PLAN.md
+/probe/
+/reviews/
+/.hermes/
+/.omh/
+
+# Local configuration and credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local runtime data
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.log
