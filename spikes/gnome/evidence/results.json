@@ -1,0 +1,119 @@
+{
+  "extension loads and enables": true,
+  "clipboard_latency_ms": 21.25,
+  "ordinary_read": {
+    "before": 0,
+    "after": 1,
+    "clip": {
+      "types": [
+        "text/plain;charset=utf-8"
+      ],
+      "marked": false,
+      "time": 155068116557,
+      "length": 25,
+      "sha256": "c4a7a9db849021a5bfc69ef47abbf52d684971026d8e8e1313d3db9ed4d311e9"
+    }
+  },
+  "clipboard change reports offered types within 1 s": true,
+  "marked_cases": [
+    {
+      "name": "marker-first",
+      "clip": {
+        "types": [
+          "x-kde-passwordManagerHint",
+          "text/plain;charset=utf-8"
+        ],
+        "marked": true,
+        "time": 155068138097
+      },
+      "before_reads": 1,
+      "after_reads": 1,
+      "baseline_reads": 1,
+      "provider_requests": [
+        "text/plain;charset=utf-8"
+      ],
+      "requests_without_observer": [
+        "text/plain;charset=utf-8"
+      ],
+      "passed": true
+    },
+    {
+      "name": "marker-after-text",
+      "clip": {
+        "types": [
+          "text/plain;charset=utf-8",
+          "x-kde-passwordManagerHint"
+        ],
+        "marked": true,
+        "time": 155070345108
+      },
+      "before_reads": 1,
+      "after_reads": 1,
+      "baseline_reads": 1,
+      "provider_requests": [
+        "text/plain;charset=utf-8"
+      ],
+      "requests_without_observer": [
+        "text/plain;charset=utf-8"
+      ],
+      "passed": true
+    }
+  ],
+  "extension_transfer_calls": 1,
+  "clipboard_events": [
+    {
+      "types": [
+        "text/plain;charset=utf-8"
+      ],
+      "marked": false,
+      "time": 155068116557,
+      "length": 25,
+      "sha256": "c4a7a9db849021a5bfc69ef47abbf52d684971026d8e8e1313d3db9ed4d311e9"
+    },
+    {
+      "types": [
+        "x-kde-passwordManagerHint",
+        "text/plain;charset=utf-8"
+      ],
+      "marked": true,
+      "time": 155068138097
+    },
+    {
+      "types": [
+        "text/plain;charset=utf-8",
+        "x-kde-passwordManagerHint"
+      ],
+      "marked": true,
+      "time": 155070345108
+    }
+  ],
+  "marked clipboard item is never read": true,
+  "placement": {
+    "x": 430,
+    "y": 32,
+    "width": 420,
+    "area": {
+      "x": 0,
+      "y": 32,
+      "width": 1280
+    },
+    "above": true,
+    "sticky": true,
+    "skip": true,
+    "tab": false
+  },
+  "overview_clone_titles": [
+    "Other GTK4 window"
+  ],
+  "GTK4 placement above windows, absent from overview and Alt+Tab": true,
+  "focus": {
+    "prior": "Other GTK4 window",
+    "hover": "Other GTK4 window",
+    "requested": true
+  },
+  "show without focus and focus on request": true,
+  "dwell_elapsed_ms": 231.58,
+  "pointer dwell on top band": true,
+  "shortcut_action": 129,
+  "registered shortcut reported": true
+}

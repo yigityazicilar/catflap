@@ -1,0 +1,19 @@
+name: GNOME
+on:
+  push:
+    branches: [main, 'ci/**']
+  workflow_dispatch:
+jobs:
+  gnome:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Build headless session
+        run: DOCKER_BUILDKIT=0 docker build -t catflap-gnome-test:51 ci/gnome
+      - name: Shell version
+        run: ci/gnome/run.sh gnome-shell --version
+      - name: Swift version
+        run: ci/gnome/run.sh swift --version
+      - name: Decision prototype
+        run: ci/gnome/run.sh spikes/gnome/check.sh
