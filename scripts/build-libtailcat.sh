@@ -31,6 +31,11 @@ if ! git -C "$source_dir" cat-file -e "$commit^{commit}" 2>/dev/null; then
 fi
 # Extract the exact commit, not a moving branch or the state of a working tree.
 git -C "$source_dir" archive "$commit" | tar -x -C "$source_dir"
+# Without this check a missing cmp would be reported as a header mismatch.
+if ! command -v cmp >/dev/null 2>&1; then
+    printf '%s\n' 'cmp is required to check the vendored header (install diffutils)' >&2
+    exit 1
+fi
 if ! cmp -s "$source_dir/cmd/libtailcat/tailcat.h" "$root/Sources/CTailcat/tailcat.h"; then
     printf '%s\n' 'CTailcat header differs from the pinned upstream header' >&2
     exit 1
