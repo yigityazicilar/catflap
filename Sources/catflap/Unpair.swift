@@ -11,9 +11,7 @@ struct Unpair: ParsableCommand {
     func run() throws {
         let result = try PairClient(options).send("unpair", ["device": device], as: UnpairResult.self)
         if options.json {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-            print(String(decoding: try encoder.encode(result), as: UTF8.self))
+            print(try ControlJSON.text(result))
         } else {
             print("Removed \(result.name).")
         }

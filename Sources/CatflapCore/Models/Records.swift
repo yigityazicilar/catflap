@@ -26,6 +26,10 @@ public struct DeviceSummary: Codable, Sendable {
     public let build: String
     public let pairedAt: Date
     public let lastSentAt: Date?
+    enum CodingKeys: String, CodingKey {
+        case id, name, build
+        case pairedAt = "paired_at", lastSentAt = "last_sent_at"
+    }
     public init(_ device: DeviceRecord) {
         id = device.id; name = device.name; build = device.build
         pairedAt = device.pairedAt; lastSentAt = device.lastSentAt
@@ -42,6 +46,10 @@ public struct HistoryRecord: Codable, Sendable, Identifiable {
     public var status: String
     public var text: String?
     public var path: String?
+    enum CodingKeys: String, CodingKey {
+        case id, timestamp, direction, kind, size, status, text, path
+        case deviceID = "device_id"
+    }
     public init(id: String = UUID().uuidString, deviceID: String, timestamp: Date = Date(),
                 direction: String, kind: String, size: Int64, status: String, text: String? = nil, path: String? = nil) {
         self.id = id; self.deviceID = deviceID; self.timestamp = timestamp

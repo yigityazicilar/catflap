@@ -35,7 +35,12 @@ struct AgentE2E {
         let message = String(decoding: secondError.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         #expect(message == "An agent is already running for this data directory.\n")
         #expect(!message.contains("Usage:"))
-        for command in ["pair", "send", "clip"] { #expect(try agent.command([command]).code == 64) }
+        for command in ["send", "clip"] { #expect(try agent.command([command]).code == 64) }
+        let barePair = try agent.command(["pair"])
+        #expect(barePair.code == 64)
+        let pairUsage = try JSONSerialization.jsonObject(with: barePair.output) as? [String: Any]
+        #expect(pairUsage?["ok"] as? Bool == false)
+        #expect(pairUsage?["error"] as? String == #"Use "catflap pair start" on one device and "catflap pair join <code>" on the other."#)
         #expect(try agent.command(["toggle"]).decode(UIState.self).visible)
         #expect(try agent.command(["ui", "state"]).decode(UIState.self).mode == "focused")
         #expect(try agent.command(["ui", "invoke", "hide"]).decode(UIState.self).visible == false)

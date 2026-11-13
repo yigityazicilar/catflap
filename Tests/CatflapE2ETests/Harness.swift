@@ -15,7 +15,7 @@ struct CommandResult {
     let code: Int32
     let output: Data
     let error: Data
-    func decode<T: Decodable>(_ type: T.Type) throws -> T { try JSONDecoder().decode(type, from: output) }
+    func decode<T: Decodable>(_ type: T.Type) throws -> T { try ControlJSON.decoder.decode(type, from: output) }
 }
 
 /// Real subprocess harness shared by agent, pairing, transfer and clipboard scenarios.

@@ -124,7 +124,7 @@ private func identityProbeArm(_ executable: URL, directory: URL, label: String, 
             lastResult = "failed"
         } else {
             do {
-                deviceID = try JSONDecoder().decode(AgentStatus.self, from: attempt.output).deviceID
+                deviceID = try ControlJSON.decoder.decode(AgentStatus.self, from: attempt.output).deviceID
                 lastResult = "status decoded"
             } catch { lastResult = "invalid status JSON" }
         }

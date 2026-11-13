@@ -16,6 +16,11 @@ struct Catflap: AsyncParsableCommand {
                       Pair.self, Unpair.self, Send.self, Clip.self, Version.self, EraseIdentity.self])
 }
 
+struct ClientErrorOutput: Encodable {
+    let ok = false
+    let error: String
+}
+
 struct ClientOptions: ParsableArguments {
     @Option(name: .long, help: "Agent data directory.") var dataDir: String?
     @Flag(name: .long, help: "Print JSON.") var json = false
@@ -24,14 +29,13 @@ struct ClientOptions: ParsableArguments {
         let response: ControlResponse
         do { response = try ControlClient.request(.init(command, arguments: arguments), socket: socket) }
         catch {
-            if json { print("{\"ok\":false,\"error\":\"Cannot reach the agent control channel.\"}") }
+            if json { print(try ControlJSON.text(ClientErrorOutput(error: AgentError.control.rawValue))) }
             else { FileHandle.standardError.write(Data("Cannot reach the agent control channel.\n".utf8)) }
             throw ExitCode.failure
         }
         guard response.ok else {
             if json {
-                let message = try JSONSerialization.data(withJSONObject: ["ok": false, "error": response.error ?? "Control request failed."])
-                print(String(decoding: message, as: UTF8.self))
+                print(try ControlJSON.text(ClientErrorOutput(error: response.error ?? "Control request failed.")))
             } else { FileHandle.standardError.write(Data(((response.error ?? "Control request failed.") + "\n").utf8)) }
             throw ExitCode(response.exitCode)
         }
@@ -39,7 +43,7 @@ struct ClientOptions: ParsableArguments {
         print(String(decoding: response.payload, as: UTF8.self))
     }
     func unavailable() throws {
-        if json { print("{\"ok\":false,\"error\":\"This command is not available yet.\"}") }
+        if json { print(try ControlJSON.text(ClientErrorOutput(error: AgentError.unsupported.rawValue))) }
         else { FileHandle.standardError.write(Data("This command is not available yet.\n".utf8)) }
         throw ExitCode(64)
     }
@@ -104,8 +108,13 @@ struct UI: ParsableCommand {
 }
 struct Version: ParsableCommand {
     @Flag(name: .long) var json = false
-    func run() {
-        if json { print("{\"version\":\"0.1.0-dev\",\"tailcat_abi\":\(tc_abi_version())}") }
+    private struct Output: Encodable {
+        let version = "0.1.0-dev"
+        let tailcatABI: UInt32
+        enum CodingKeys: String, CodingKey { case version, tailcatABI = "tailcat_abi" }
+    }
+    func run() throws {
+        if json { print(try ControlJSON.text(Output(tailcatABI: tc_abi_version()))) }
         else { print("Catflap 0.1.0-dev"); print("tailcat-abi \(tc_abi_version())") }
     }
 }

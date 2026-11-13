@@ -14,7 +14,7 @@ struct Pair: ParsableCommand, AgentFeature {
     func run() throws {
         // Pairing needs a direction: make a code here, or use one made elsewhere.
         let message = "Use \"catflap pair start\" on one device and \"catflap pair join <code>\" on the other."
-        if options.json { print(jsonLine(["ok": false, "error": message])) }
+        if options.json { print(try ControlJSON.text(ClientErrorOutput(error: message))) }
         else { FileHandle.standardError.write(Data((message + "\n").utf8)) }
         throw ExitCode(64)
     }
@@ -87,17 +87,12 @@ struct Pair: ParsableCommand, AgentFeature {
                 Thread.sleep(forTimeInterval: 0.5)
                 result = try client.send("pair.check", ["device": device], as: PairingService.CheckStatus.self)
             }
-            if options.json { print(String(decoding: try JSONEncoder().encode(result), as: UTF8.self)) }
+            if options.json { print(try ControlJSON.text(result)) }
             else if result.state == "ok" { print("\(device) answered.") }
             else { FileHandle.standardError.write(Data(((result.error ?? "Check failed.") + "\n").utf8)) }
             if result.state != "ok" { throw ExitCode.failure }
         }
     }
-}
-
-func jsonLine(_ object: [String: Any]) -> String {
-    let data = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data("{}".utf8)
-    return String(decoding: data, as: UTF8.self)
 }
 
 /// Control requests for pairing, with the agent's error text passed through.
@@ -123,7 +118,7 @@ struct PairClient {
     }
 
     func fail(_ message: String, code: ExitCode) throws -> Never {
-        if options.json { say(jsonLine(["ok": false, "error": message])) }
+        if options.json { say(try ControlJSON.text(ClientErrorOutput(error: message))) }
         else { FileHandle.standardError.write(Data((message + "\n").utf8)) }
         throw code
     }
@@ -136,9 +131,7 @@ struct PairClient {
 
     func show(_ status: PairingStatus) throws {
         if options.json {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-            say(String(decoding: try encoder.encode(status), as: UTF8.self))
+            say(try ControlJSON.text(status))
             return
         }
         switch status.state {

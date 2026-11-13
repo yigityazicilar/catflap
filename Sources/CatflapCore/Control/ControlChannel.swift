@@ -19,13 +19,17 @@ public struct ControlResponse: Codable, Sendable {
     public var payload: Data
     public var error: String?
     public var exitCode: Int32
+    enum CodingKeys: String, CodingKey {
+        case ok, payload, error
+        case exitCode = "exit_code"
+    }
     public init<T: Encodable>(value: T) throws {
-        ok = true; payload = try JSONEncoder().encode(value); error = nil; exitCode = 0
+        ok = true; payload = try ControlJSON.encoder.encode(value); error = nil; exitCode = 0
     }
     public init(error: AgentError, exitCode: Int32 = 1) {
         ok = false; payload = Data("null".utf8); self.error = error.rawValue; self.exitCode = exitCode
     }
-    public func decode<T: Decodable>(_ type: T.Type) throws -> T { try JSONDecoder().decode(type, from: payload) }
+    public func decode<T: Decodable>(_ type: T.Type) throws -> T { try ControlJSON.decoder.decode(type, from: payload) }
 }
 
 private enum LocalSocket {
@@ -138,8 +142,8 @@ public enum ControlClient {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
         }
         guard connected == 0, LocalSocket.owner(fd) else { throw AgentError.control }
-        try LocalSocket.writeFrame(JSONEncoder().encode(request), fd)
-        return try JSONDecoder().decode(ControlResponse.self, from: LocalSocket.readFrame(fd))
+        try LocalSocket.writeFrame(ControlJSON.encoder.encode(request), fd)
+        return try ControlJSON.decoder.decode(ControlResponse.self, from: LocalSocket.readFrame(fd))
     }
 }
 
@@ -284,17 +288,17 @@ public final class ControlServer: Sendable {
                     workers.leave()
                 }
                 do {
-                    let request = try JSONDecoder().decode(ControlRequest.self, from: LocalSocket.readFrame(client))
+                    let request = try ControlJSON.decoder.decode(ControlRequest.self, from: LocalSocket.readFrame(client))
                     let task = Task {
                         let response = await handler(request)
                         session.complete(response)
                     }
                     session.install(task)
                     if let response = session.reply() {
-                        try LocalSocket.writeFrame(JSONEncoder().encode(response), client)
+                        try LocalSocket.writeFrame(ControlJSON.encoder.encode(response), client)
                     }
                 } catch {
-                    try? LocalSocket.writeFrame(JSONEncoder().encode(ControlResponse(error: .invalidRequest)), client)
+                    try? LocalSocket.writeFrame(ControlJSON.encoder.encode(ControlResponse(error: .invalidRequest)), client)
                 }
             }
         }
