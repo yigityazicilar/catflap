@@ -61,12 +61,35 @@ one pkg-config module per system target, so the four Linux system modules are
 CGtk, CAdwaita, CGtkLayerShell and CWayland, housed under `Sources/CGtk/`.
 CDataControl and CGtkShim are real but empty C targets under `vendor/stubs/`;
 their implementation tasks should replace those paths in the manifest when
-adding the real C sources. Tailcat, CatflapCore, CatflapMac and CatflapLinux hold
-Swift placeholders. Only the host platform's UI module and UI tests are declared.
+adding the real C sources. CatflapCore, CatflapMac and CatflapLinux hold
+Swift placeholders; Tailcat holds the wrapper described below. Only the host platform's UI module and UI tests are declared.
 The executable and cross-platform test modules exist on both hosts.
 
-The initial tests are explicitly trivial package-loading tests, not wrapper,
-network, transfer, UI or privacy verification. No tunnel tests are skipped or
-gated at this stage because none exist yet. Linux CI and macOS CI each run the
+Apart from TailcatTests, the tests are still trivial package-loading tests, not
+network, transfer, UI or privacy verification. Linux CI and macOS CI each run the
 native library build, `swift build`, `swift test`, and `swift run catflap version`,
 checking for the exact `tailcat-abi 1` line.
+
+## Tailcat wrapper and its tests
+
+The `Tailcat` module runs every blocking C call on a thread of its own with a
+fresh cancellation token. Cancelling the Swift task signals that token and the
+caller resumes only after the C call has returned; a handle that arrives after
+cancellation is closed by the wrapper. Every wrapper object has an async
+`close()` that runs `tc_close` on a separate thread. Error text is scrubbed of
+addresses, keys and IP literals before it is stored.
+
+`swift test --filter TailcatTests` runs eight tests in one serialized suite (they
+share test-only hooks). They open real tunnels through tailcat's public relays,
+so they need internet access and take about 30 seconds; the unlisted-key case
+waits for its 15-second dial timeout. They run unconditionally on the Linux and
+macOS CI jobs: no environment flag skips them.
+
+In repeated dials between a server and a client in one process, meeting through
+the public relays, some dials went unanswered until their deadline: between
+none and five in a thousand, depending on the run. It also happened when calling
+the C API directly, without this wrapper. The cause is not known. Relay
+throttling, a switch from a relayed to a direct path, and both ends sharing one
+host have not been ruled out, and no measurement used two separate machines.
+Test setup retries such a dial, and callers of `dial` should use a finite
+timeout and retry.
