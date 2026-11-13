@@ -1,38 +1,35 @@
 # Catflap
 
-Quick transfers between your own machines, without another window getting in the way.
+Catflap is currently a Swift package skeleton, **not a usable transfer app**.
+The only implemented command is `catflap version`, which queries the loaded
+tailcat C ABI. Tests are package-loading placeholders, not feature tests.
 
-Catflap is a planned Swift app for macOS and Linux, using
-[tailcat](https://github.com/tailscale/tailcat) to move text, images, and files
-between paired devices.
+The intended platforms are macOS 26 or later on Apple silicon and Linux on
+Wayland (KDE and GNOME). Pairing, transfers, history, clipboard capture, desktop
+panels, and installation packages are not implemented yet.
 
-## Status
+## Build
 
-Early design and architecture review. There is no application build or release yet.
-The features below describe the intended product, not functionality available today.
+Requires Swift 6.2 or later, Go 1.27.2 or later, Git, a C compiler, and the
+system SQLite development headers. Linux additionally needs GTK4, libadwaita,
+gtk4-layer-shell, Wayland client headers and pkg-config. See
+[toolchains](docs/toolchains.md) for versions and CI details.
 
-## Direction
+```sh
+scripts/build-libtailcat.sh
+swift build
+swift run catflap version
+swift test
+```
 
-- A small panel summoned with a keyboard shortcut or an optional screen-edge hover.
-- Send text, images, and files to a paired machine.
-- Searchable, device-local history of sent and received items.
-- Optional clipboard history for quickly selecting something to send.
-- Native macOS UI following Apple's design guidance, with a Linux desktop interface.
-- A shared Swift core and platform-specific desktop integration.
-
-## Privacy goals
-
-Transfers are explicit. Clipboard and transfer histories are intended to stay on
-each device, without cloud history sync or telemetry.
-
-Clipboard capture should respect sensitive-content markers and exclude recognized
-secrets. Unmarked passwords cannot be identified reliably; capture defaults,
-retention, and storage protections are still under review.
-
-Tailcat provides end-to-end encrypted transport, but can use external rendezvous
-and relay servers. LAN-only operation and permitted relay use are unresolved design
-choices, not guarantees of this repository.
+The first command downloads and builds tailcat from the pinned commit
+`e00cdde6ff787f801361ff85ed085775c775d4c5`. Network access is required for
+that source and for Go and Swift dependencies. Repeated builds reuse the native
+library when its build fingerprint is unchanged. No library-path environment
+variable is needed when running in this checkout.
 
 ## License
 
-A project license has not been selected yet.
+Catflap is [BSD-3-Clause](LICENSE). The copied tailcat header retains its upstream
+notice; its license is in [vendor/tailcat/LICENSE](vendor/tailcat/LICENSE).
+Dependencies retain their own licenses.

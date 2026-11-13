@@ -1,0 +1,62 @@
+name: CI
+on:
+  push:
+    branches: [main, 'ci/**']
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2
+        with:
+          swift-version: '6.2.1'
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libgtk-4-dev libadwaita-1-dev libwayland-dev wayland-protocols libgirepository1.0-dev gobject-introspection meson ninja-build pkg-config
+          git clone --depth 1 --branch v1.0.4 https://github.com/wmww/gtk4-layer-shell.git build/gtk4-layer-shell
+          meson setup build/gtk4-layer-shell/out build/gtk4-layer-shell -Dexamples=false -Ddocs=false -Dtests=false -Dintrospection=false -Dvapi=false --prefix=/usr/local
+          ninja -C build/gtk4-layer-shell/out
+          sudo ninja -C build/gtk4-layer-shell/out install
+          sudo ldconfig
+      - name: Record toolchains
+        run: |
+          swift --version
+          go version
+          pkg-config --modversion sqlite3 gtk4 libadwaita-1 gtk4-layer-shell-0 wayland-client
+      - run: scripts/build-libtailcat.sh
+      - run: swift build
+      - run: swift test
+      - name: Check loaded ABI
+        run: swift run catflap version | tee build/version.txt && grep -Fx 'tailcat-abi 1' build/version.txt
+  macos:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2
+        with:
+          swift-version: '6.2.1'
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Record toolchains
+        run: |
+          swift --version
+          go version
+          xcodebuild -version
+      - run: scripts/build-libtailcat.sh
+      - run: swift build
+      - run: swift test
+      - name: Check loaded ABI
+        run: swift run catflap version | tee build/version.txt && grep -Fx 'tailcat-abi 1' build/version.txt
