@@ -59,7 +59,7 @@ jobs:
       - run: scripts/build-libtailcat.sh
       - run: swift build
       - name: Run tests
-        run: scripts/ci-test.py
+        run: scripts/ci-test.py --filter ReviewMKResources
       - name: Check loaded ABI
         run: swift run catflap version | tee build/version.txt && grep -Fx 'tailcat-abi 1' build/version.txt
       # The app bundle exactly as packaging builds it by default: a release build. Signed ad

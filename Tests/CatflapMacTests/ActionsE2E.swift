@@ -405,6 +405,41 @@ struct MacActionsE2E {
         }
     }
 
+    @Test func testReviewMKDontKeepCopyIsNotRecorded() async throws {
+        let saved = try await MainActor.run { try PasteboardSnapshot() }
+        var failure: (any Error)?
+        do {
+            try await withAgents { panel, peer in
+                let peer = try #require(peer)
+                try await pairFromPanel(panel, peer)
+                let panelID = try #require(try await actionsOffPool { try peer.devices().first?.id })
+                let note = "review private copy " + UUID().uuidString
+                let sent = try await actionsOffPool { try peer.command(["send", "--to", panelID, "--text", note, "--dont-keep"]) }
+                #expect(sent.code == 0)
+                let received = try await row(on: panel, "private transfer") { $0.direction == "received" && !$0.keep }
+                let copied = try await actionsOffPool { try panel.invoke("copy", ["id": received.deviceID + "/" + received.id]) }
+                #expect(copied.ok)
+                // The shortcut's pre-send poll observes this copy before we replace it.
+                _ = try await actionsOffPool { try panel.invoke("send-latest") }
+                let concealed = await MainActor.run { NSPasteboard.general.types?.contains(.init("org.nspasteboard.ConcealedType")) ?? false }
+                // An ordinary subsequent copy is a processing barrier, not a timing assertion.
+                let marker = "review barrier " + UUID().uuidString
+                await MainActor.run { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(marker, forType: .string) }
+                _ = try await actionsOffPool { try panel.waitFor("clipboard barrier") { () -> Bool? in
+                    let items = try panel.request("clip.list").decode([ClipboardItem].self)
+                    return items.contains { $0.text == marker } ? true : nil
+                } }
+                let persisted = try await actionsOffPool { try panel.request("clip.list").decode([ClipboardItem].self).contains { $0.text == note } }
+                print("REVIEW macOS dont-keep Copy: concealed=\(concealed) clipboardPersisted=\(persisted)")
+                #expect(concealed, "Copy of don't-keep text must be marked before the watcher can read it")
+                // The marker assertion is deterministic; the first poll can coalesce rapid copies.
+                #expect(!persisted, "don't-keep text must not become a persistent clipboard row")
+            }
+        } catch { failure = error }
+        await MainActor.run { saved.restore() }
+        if let failure { throw failure }
+    }
+
     @Test func testSendTextClipAttachAndCopyFromThePanel() async throws {
         try await withAgents { panel, peer in
             let peer = try #require(peer)

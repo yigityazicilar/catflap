@@ -13,6 +13,8 @@ final class PanelShortcut {
     let name: KeyboardShortcuts.Name
     /// The system's answer when the shortcut was offered at start; 0 means accepted.
     private var refusal: OSStatus?
+    // Scratch review only: hold a Carbon registration inside this agent process.
+    private static var reviewReservation: EventHotKeyRef?
 
     init(onPress: @escaping @MainActor () -> Void) {
         // The default goes into the registration domain, which lives only in memory.
@@ -25,6 +27,13 @@ final class PanelShortcut {
         // Ask the system first, so a combination another app holds exclusively is reported.
         // KeyboardShortcuts registers the same way but does not say when it fails.
         if let shortcut = KeyboardShortcuts.getShortcut(for: name) { refusal = Self.probe(shortcut) }
+        if ProcessInfo.processInfo.environment["CATFLAP_REVIEW_IN_PROCESS_CONFLICT"] == "1",
+           let shortcut = KeyboardShortcuts.getShortcut(for: name) {
+            let reserved = RegisterEventHotKey(UInt32(shortcut.carbonKeyCode), UInt32(shortcut.carbonModifiers),
+                EventHotKeyID(signature: 0x52455657, id: 9), GetEventDispatcherTarget(), 0, &Self.reviewReservation)
+            let refused = Self.probe(shortcut)
+            FileHandle.standardError.write(Data("REVIEW in-agent Carbon reservation=\(reserved) secondProbe=\(refused)\n".utf8))
+        }
         KeyboardShortcuts.onKeyDown(for: name) { MainActor.assumeIsolated { onPress() } }
     }
 

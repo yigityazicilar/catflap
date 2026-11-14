@@ -446,7 +446,13 @@ final class LinuxPanelE2E: XCTestCase {
         let opened = try session.toggle()
         XCTAssertTrue(opened.visible)
         XCTAssertEqual(opened.mode, "focused")
-        XCTAssertTrue(try session.eventually { try session.state().hasFocus })
+        let focused = try session.eventually { try session.state().hasFocus }
+        XCTAssertTrue(focused)
+        if !focused {
+            let windows = try session.windows()
+            let object = try JSONSerialization.jsonObject(with: session.catflap(["ui", "invoke", "describe"])) as? [String: Any]
+            print("REVIEW KDE focus failure: portalDialogs=\(windows.filter { $0.caption == "Global Shortcuts Requested" }.count) sendClipboardShortcut=\(object?["send_clipboard_shortcut"] ?? "missing") mode=\(try session.state().mode)")
+        }
         let state = try session.state()
         XCTAssertTrue(state.visible)
         XCTAssertEqual(state.mode, "focused")
