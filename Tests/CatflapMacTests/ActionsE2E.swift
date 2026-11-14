@@ -175,7 +175,11 @@ private final class ActionsAgent: @unchecked Sendable {
         throw ActionsTestError.timeout(what)
     }
 
-    func start(environment extra: [String: String] = [:], arguments prefix: [String] = []) throws {
+    /// `errors`, when given, keeps the agent's standard error there; a failed start quotes its end.
+    /// `launcher`, when given, starts the agent through another program (sandbox-exec), with
+    /// the agent's executable as its first argument; other commands still run it directly.
+    func start(environment extra: [String: String] = [:], arguments prefix: [String] = [], errors: URL? = nil,
+               launcher: (URL, [String])? = nil) throws {
         if !preferencesSaved {
             let export = try actionsRun("/usr/bin/defaults", ["export", domain, "-"], in: directory)
             savedPreferences = export.code == 0 ? export.output : nil
@@ -189,8 +193,16 @@ private final class ActionsAgent: @unchecked Sendable {
         environment.removeValue(forKey: "CATFLAP_STATUS_ITEM")
         for (key, value) in extra { environment[key] = value }
         child.environment = environment
+        if let launcher {
+            child.executableURL = launcher.0
+            child.arguments = launcher.1 + [executable.path] + (child.arguments ?? [])
+        }
         child.standardOutput = FileHandle.nullDevice
         child.standardError = FileHandle.nullDevice
+        if let errors {
+            FileManager.default.createFile(atPath: errors.path, contents: nil)
+            child.standardError = try FileHandle(forWritingTo: errors)
+        }
         try child.run()
         process = child
         let deadline = Date().addingTimeInterval(30)
@@ -201,7 +213,8 @@ private final class ActionsAgent: @unchecked Sendable {
             }
             Thread.sleep(forTimeInterval: 0.05)
         }
-        throw ActionsTestError.startup(child.isRunning ? "no answer within 30 s" : "exited \(child.terminationStatus)")
+        let said = errors.flatMap { try? String(contentsOf: $0, encoding: .utf8) }.map { " saying: " + String($0.suffix(400)) } ?? ""
+        throw ActionsTestError.startup((child.isRunning ? "no answer within 30 s" : "exited \(child.terminationStatus)") + said)
     }
 
     /// Stops the agent; returns the problems found on the way.
@@ -209,10 +222,11 @@ private final class ActionsAgent: @unchecked Sendable {
         guard let child = process else { return [] }
         process = nil
         if child.isRunning { child.terminate() }
-        guard actionsWait(child, seconds: 7) != nil else {
-            FileHandle.standardError.write(Data("harness-error: actions agent failed to stop within 7 s\n".utf8))
+        // The wait only catches a hang: a slow runner must not fail this.
+        guard actionsWait(child, seconds: 30) != nil else {
+            FileHandle.standardError.write(Data("harness-error: actions agent failed to stop within 30 s\n".utf8))
             kill(child.processIdentifier, SIGKILL); _ = actionsWait(child, seconds: 5)
-            return ["Actions agent failed to stop within 7 s"]
+            return ["Actions agent failed to stop within 30 s"]
         }
         return []
     }
@@ -678,13 +692,19 @@ struct MacActionsE2E {
         #expect(ran[3].code == 0, "the moved app still verifies")
         print("MacActionsE2E bundle: rpaths=\(rpaths) outside_dependencies=\(outside.count) version_without_checkout_exit=\(ran[2].code) checkout_read_exit=\(ran[1].code)")
 
-        // The agent as the app runs it: a bundle, so notifications go to Notification Center and
-        // the login item can be switched. The app's preferences domain is saved and put back.
+        // The agent as the app runs it, with the checkout still out of reach: nothing it loads
+        // may come from the build (KeyboardShortcuts' resource bundle, for one, is looked for
+        // beside the app and in the build directory only). A bundle, so notifications go to
+        // Notification Center and the login item can be switched. The app's preferences domain
+        // is saved and put back.
         let bundled = try ActionsAgent(platform: true, executable: installed.appendingPathComponent("Contents/MacOS/catflap"),
                                        domain: "io.github.yigityazicilar.Catflap")
+        let agentErrors = moved.appendingPathComponent("agent-stderr.txt")
         var failure: (any Error)?
         do {
-            try await actionsOffPool { try bundled.start() }
+            try await actionsOffPool {
+                try bundled.start(errors: agentErrors, launcher: (URL(fileURLWithPath: "/usr/bin/sandbox-exec"), ["-p", profile]))
+            }
             let state = try await actionsOffPool { try bundled.state() }
             #expect(state.actions.wired)
             #expect(state.actions.notificationDelivery == "notification_center")
