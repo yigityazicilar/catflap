@@ -56,7 +56,7 @@ struct PanelReport: Codable, Sendable {
 final class PanelController: @unchecked Sendable {
     let runtime: AgentRuntime
     let loop: GtkLoop
-    let host: LayerShellHost
+    let host: any PanelHost
     let dataDirectory: URL
     // Everything below is touched only on the GTK thread.
     var machine = PanelMachine()
@@ -68,12 +68,12 @@ final class PanelController: @unchecked Sendable {
     var notifier: Notifier!
     var watcher: StoreWatcher!
     var tray: StatusNotifierItem!
-    let clipboard = ClipboardWriter()
+    let clipboard: any ClipboardBackend
     let picker = FilePicker()
     var settings = PanelSettings()
     private let style = PanelStyle()
-    let shortcut = GlobalShortcut()
-    let sendShortcut = SendClipboardShortcut()
+    let shortcut: any ShortcutBackend
+    let sendShortcut: any ShortcutBackend
     private var sendShortcutStarted = false
     private var timers: [PanelMachine.Timer: UInt32] = [:]
     private var waiters: [(id: Int, mode: PanelMode, resume: () -> Void)] = []
@@ -91,12 +91,13 @@ final class PanelController: @unchecked Sendable {
     var items: [ClipboardItem] = []
     private let snapshots = ProcessInfo.processInfo.environment["CATFLAP_PANEL_SNAPSHOT_DIR"]
 
-    private init(runtime: AgentRuntime, loop: GtkLoop, host: LayerShellHost, dataDirectory: URL) {
-        self.runtime = runtime; self.loop = loop; self.host = host; self.dataDirectory = dataDirectory
+    private init(runtime: AgentRuntime, loop: GtkLoop, backends: DesktopBackends, dataDirectory: URL) {
+        self.runtime = runtime; self.loop = loop; self.host = backends.host; self.dataDirectory = dataDirectory
+        shortcut = backends.shortcut; sendShortcut = backends.sendShortcut; clipboard = backends.clipboard
     }
 
-    /// Starts the panel if this session has a Wayland display whose compositor offers
-    /// layer-shell. Nil otherwise; the agent then goes on without a panel.
+    /// Starts the panel if this session has a Wayland display and a desktop that
+    /// `DesktopBackends.select` can serve. Nil otherwise; the agent then goes on without a panel.
     static func start(on runtime: AgentRuntime) async -> PanelController? {
         let environment = ProcessInfo.processInfo.environment
         // Only the display the agent was given: without one there is no desktop to show on.
@@ -111,13 +112,13 @@ final class PanelController: @unchecked Sendable {
             await loop.stop()
             return nil
         }
-        guard await loop.perform({ LayerShellHost.isSupported }) else {
+        guard let backends = await loop.perform({ DesktopBackends.select() }) else {
             await loop.stop()
             return nil
         }
         let directory = await runtime.store.paths.directory
         let settings = await PanelSettings.load(from: runtime.store)
-        let app = PanelController(runtime: runtime, loop: loop, host: LayerShellHost(), dataDirectory: directory)
+        let app = PanelController(runtime: runtime, loop: loop, backends: backends, dataDirectory: directory)
         await loop.perform { app.settings = settings; app.build() }
         let desktop = app.host.desktop
         await runtime.updatePlatformStatus { $0.desktop = desktop }
