@@ -35,7 +35,9 @@ final class PanelShortcut {
         return "bound"
     }
 
-    var description: String { KeyboardShortcuts.getShortcut(for: name)?.description ?? "" }
+    /// Written here, not by KeyboardShortcuts' `description`: that reads its resource bundle,
+    /// which an installed Catflap.app cannot hold where SwiftPM looks, and stops the agent.
+    var description: String { KeyboardShortcuts.getShortcut(for: name).map(ShortcutBinding.describe) ?? "" }
 
     func stop() {
         KeyboardShortcuts.removeHandler(for: name)

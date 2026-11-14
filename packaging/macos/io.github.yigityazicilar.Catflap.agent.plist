@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Start at login: Catflap registers this agent with SMAppService when the person switches
+     "Start Catflap at login" on. It runs the bundle's own executable as `catflap agent`. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>@IDENTIFIER@.agent</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/catflap</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>catflap</string>
+		<string>agent</string>
+	</array>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>@IDENTIFIER@</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>

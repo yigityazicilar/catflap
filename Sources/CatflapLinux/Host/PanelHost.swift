@@ -8,6 +8,7 @@ protocol PanelHost: AnyObject {
     var desktop: String { get }
     /// Whether the compositor can blur behind the panel, so a translucent background is readable.
     var blurAvailable: Bool { get }
+    var onDrop: (([String]) -> Void)? { get set }
     /// Called once with the panel window, before it is first shown.
     func adopt(_ window: OpaquePointer)
     /// Shows the window in `mode` on `display` (a connector name; nil lets the system choose),
