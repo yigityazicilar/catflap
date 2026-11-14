@@ -1,18 +1,22 @@
+#if os(macOS)
 import CatflapCore
 
-/// The desktop side of the agent on macOS: pasteboard capture (T8) and, later, the panel (T11).
-///
-/// The agent calls `start(on:)` once the core features are installed, the runtime is running
-/// and the control socket is bound, and `stop()` after the control socket is closed and
-/// before the runtime stops. `ClipboardHistory` is available from
-/// `await runtime.service(ClipboardHistory.self)` by then.
-///
-/// `start(on:)` returns promptly. A missing permission does not fail the agent: report it with
-/// `runtime.setPlatformStatus(_:)` (`pasteboardAccess`) and carry on. Throw only for a fault
-/// that should stop the agent. `stop()` ends every timer and thread `start(on:)` opened.
+/// Owns capture for exactly the agent's platform lifetime.
 public actor Platform {
+    private var watcherTask: Task<Void, Never>?
+    private init(watcherTask: Task<Void, Never>) { self.watcherTask = watcherTask }
     public static func start(on runtime: AgentRuntime) async throws -> Platform {
-        Platform()
+        guard let history = await runtime.service(ClipboardHistory.self) else { throw ClipboardFailure.missing }
+        let watcher = await ClipboardWatcher(source: SystemClipboardSource(), history: history, runtime: runtime)
+        await watcher.reportStatus()
+        let task = Task { @MainActor in await watcher.run() }
+        return Platform(watcherTask: task)
     }
-    public func stop() async {}
+    public func stop() async {
+        guard let task = watcherTask else { return }
+        watcherTask = nil
+        task.cancel()
+        await task.value
+    }
 }
+#endif
