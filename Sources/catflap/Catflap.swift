@@ -13,7 +13,7 @@ struct Catflap: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "catflap", abstract: "Local Catflap agent and control client.",
         subcommands: [Agent.self, Status.self, Devices.self, History.self, Toggle.self, UI.self,
-                      Pair.self, Unpair.self, Send.self, Clip.self, Version.self, EraseIdentity.self])
+                      Pair.self, Unpair.self, Send.self, Clip.self, Audit.self, Version.self, EraseIdentity.self])
 }
 
 struct ClientErrorOutput: Encodable {
@@ -61,6 +61,7 @@ struct Agent: AsyncParsableCommand {
             try await Pair.install(on: runtime)
             try await Send.install(on: runtime)
             try await Clip.install(on: runtime)
+            try await Audit.install(on: runtime)
             try await runtime.start()
             let control = try ControlServer(paths: paths, lock: lock)
             let (signals, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
