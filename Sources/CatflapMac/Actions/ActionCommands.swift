@@ -80,6 +80,10 @@ struct MacActionResult: Encodable, Sendable {
 /// - `pair`, `pair-start`, `pair-join code`, `pair-copy-code`, `pair-confirm`, `pair-decline`,
 ///   `pair-close`; `settings`, `settings-close`, `set key value`, `remove device`.
 /// - `clear-notifications`.
+/// - `press control [id]`: clicks one of the panel's own controls (`attach`, `pair`,
+///   `settings`, `send`, `pause`, `remove-attachments`, or `copy`, `delete`, `retry`, `reveal`
+///   on the row `id`) and answers with its spoken label. `simulate-key key [modifiers]`: a key
+///   equivalent in the panel, such as `c` or `delete` with `cmd`.
 ///
 /// Any other action goes to the panel's own (`toggle`, `hide`, `simulate-*`).
 extension PanelActions {
@@ -138,6 +142,18 @@ extension PanelActions {
         return text.split(whereSeparator: \.isNewline).map(String.init).filter { !$0.isEmpty }.map { line in
             line.hasPrefix("file://") ? (URL(string: line) ?? URL(fileURLWithPath: line)) : URL(fileURLWithPath: line)
         }
+    }
+
+    /// Waits for the send or row action a control started, so the answer shows its effect.
+    private func finishPanelAction(_ action: String, message text: String?) async -> ControlResponse {
+        if let send = takePanelSend() {
+            switch await send.value {
+            case .success(let rows): return await answer(action, transfers: rows, message: text)
+            case .failure(let refusal): return refuse(refusal)
+            }
+        }
+        if let row = takeRowAction() { await row.value }
+        return await answer(action, message: text)
     }
 
     func invoke(_ arguments: [String: String]) async -> ControlResponse {
@@ -303,6 +319,36 @@ extension PanelActions {
         case "clear-notifications":
             notifier.clearRecords()
             return await answer(action)
+
+        case "press":
+            guard let control = arguments["control"] else { return ControlResponse(failure: "Name the control to press.", exitCode: 64) }
+            _ = takePanelSend()
+            _ = takeRowAction()
+            guard let label = controller.press(control, rowID: arguments["id"]) else {
+                return refuse(ActionRefusal(message: "The panel shows no \(control) control that can be pressed now."))
+            }
+            return await finishPanelAction(action, message: label)
+
+        case "simulate-key":
+            guard let key = arguments["key"]?.lowercased(), !key.isEmpty else { return ControlResponse(failure: "Name the key.", exitCode: 64) }
+            var modifiers: NSEvent.ModifierFlags = []
+            for part in (arguments["modifiers"] ?? "cmd").lowercased().split(separator: "+") {
+                switch part {
+                case "cmd", "command": modifiers.insert(.command)
+                case "option", "opt", "alt": modifiers.insert(.option)
+                case "shift": modifiers.insert(.shift)
+                case "ctrl", "control": modifiers.insert(.control)
+                default: return ControlResponse(failure: "Use the modifiers cmd, option, shift and ctrl.", exitCode: 64)
+                }
+            }
+            let characters = key == "delete" ? "\u{7F}" : key
+            let keyCode: UInt16 = ["delete": 51, "c": 8, "v": 9, "d": 2][key] ?? 0
+            _ = takePanelSend()
+            _ = takeRowAction()
+            guard controller.isVisible, controller.pressKey(characters, keyCode: keyCode, modifiers: modifiers) else {
+                return refuse(ActionRefusal(message: "The panel did not take that key."))
+            }
+            return await finishPanelAction(action, message: nil)
 
         default:
             guard let state = controller.invoke(action) else { return ControlResponse(error: .unsupported, exitCode: 64) }

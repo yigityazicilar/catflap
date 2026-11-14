@@ -19,10 +19,18 @@ final class HistoryWatcher {
 
     private let runtime: AgentRuntime
     var onChange: ((Change) -> Void)?
+    /// Called after every read, once its changes are reported.
+    var onRead: (() -> Void)?
     private var directory: URL?
     private var directorySource: DispatchSourceFileSystemObject?
     private var journalSource: DispatchSourceFileSystemObject?
     private var known: [String: String] = [:]
+    /// Each history row's status as last read, by `device/id`.
+    var statuses: [String: String] { known }
+    /// Reads begun so far, and for each send marked as started, the reads begun before it:
+    /// those read the row as it was and must not overwrite the mark.
+    private var generation = 0
+    private var marked: [String: Int] = [:]
     private var seeded = false
     private var reading = false
     private var again = false
@@ -51,6 +59,15 @@ final class HistoryWatcher {
 
     /// Reads now instead of waiting for the next write, for callers that just changed history.
     func refresh() { schedule() }
+
+    /// A send just started (or started again, for Retry) under `key`: it counts as sending
+    /// until a read begun after this shows how it is, and whatever it ends as is reported, even
+    /// when that is what it was before.
+    func markSending(_ key: String) {
+        known[key] = "sending"
+        marked[key] = generation
+        schedule()
+    }
 
     private func watchJournal() {
         guard journalSource == nil, let directory else { return }
@@ -94,12 +111,19 @@ final class HistoryWatcher {
     private func read() async {
         if reading { again = true; return }
         reading = true
+        generation += 1
+        let current = generation
         let store = await runtime.store
         let rows = (try? await TransferHistory(store: store).rows()) ?? []
         let transfers = await runtime.service(TransferService.self)
         var changes: [Change] = []
         for row in rows {
             let key = row.deviceID + "/" + row.id
+            if let mark = marked[key] {
+                // This read began before the send was marked: it holds the row as it was.
+                if mark >= current { continue }
+                marked[key] = nil
+            }
             let before = known[key]
             known[key] = row.status
             guard seeded, before != row.status else { continue }
@@ -116,7 +140,10 @@ final class HistoryWatcher {
         }
         seeded = true
         reading = false
-        if !stopped { for change in changes { onChange?(change) } }
+        if !stopped {
+            for change in changes { onChange?(change) }
+            onRead?()
+        }
         if again {
             again = false
             await read()
