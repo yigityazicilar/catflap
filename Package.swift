@@ -31,10 +31,10 @@ targets += [
     .systemLibrary(name: "CGtkLayerShell", path: "Sources/CGtk/LayerShell", pkgConfig: "gtk4-layer-shell-0"),
     .systemLibrary(name: "CWayland", path: "Sources/CGtk/Wayland", pkgConfig: "wayland-client", providers: [.apt(["libwayland-dev"])]),
     // Temporary C targets live under vendor until their implementation tasks replace them.
-    .target(name: "CDataControl", dependencies: ["CWayland"], path: "vendor/stubs/CDataControl"),
+    .target(name: "CDataControl", dependencies: ["CWayland"], path: "Sources/CDataControl"),
     .target(name: "CGtkShim", dependencies: ["CGtk", "CAdwaita", "CGtkLayerShell"], path: "vendor/stubs/CGtkShim"),
     .target(name: "CatflapLinux", dependencies: ["CatflapCore", "CGtk", "CAdwaita", "CGtkLayerShell", "CWayland", "CDataControl", "CGtkShim"]),
-    .testTarget(name: "CatflapLinuxTests", dependencies: ["CatflapLinux"]),
+    .testTarget(name: "CatflapLinuxTests", dependencies: ["CatflapLinux", "CatflapCore", "catflap"]),
 ]
 executableDependencies.append("CatflapLinux")
 #elseif os(macOS)

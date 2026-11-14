@@ -1,0 +1,4 @@
+# Verbatim wayland-scanner output (see Sources/CDataControl/README.md); it ends with a blank
+# line, and editing it by hand would make it differ from a fresh run.
+Sources/CDataControl/ext-data-control-v1-protocol.c -whitespace
+Sources/CDataControl/ext-data-control-v1-client-protocol.h -whitespace

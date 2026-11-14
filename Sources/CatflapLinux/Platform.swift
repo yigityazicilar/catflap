@@ -11,8 +11,27 @@ import CatflapCore
 /// report it with `runtime.setPlatformStatus(_:)` and carry on. Throw only for a fault that
 /// should stop the agent. `stop()` ends every thread and connection `start(on:)` opened.
 public actor Platform {
+    private var clipboard: DataControlWatcher?
+
     public static func start(on runtime: AgentRuntime) async throws -> Platform {
-        Platform()
+        let platform = Platform()
+        await platform.install(on: runtime)
+        return platform
     }
-    public func stop() async {}
+
+    private func install(on runtime: AgentRuntime) async {
+        guard let history = await runtime.service(ClipboardHistory.self) else {
+            await runtime.setPlatformStatus(.init(clipboardCapture: "failed"))
+            return
+        }
+        let watcher = DataControlWatcher(history: history, runtime: runtime)
+        clipboard = watcher
+        await watcher.start()
+    }
+
+    public func stop() async {
+        let watcher = clipboard
+        clipboard = nil
+        await watcher?.stop()
+    }
 }
