@@ -32,6 +32,8 @@ private final class ClipboardSession {
         environment = ProcessInfo.processInfo.environment
         for name in ["WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY"] { environment[name] = nil }
         environment["CATFLAP_PLATFORM"] = "on"
+        // Capture only: the panel (T10) would start GTK, which adds seconds and tests nothing here.
+        environment["CATFLAP_PANEL"] = "off"
         environment["XDG_RUNTIME_DIR"] = root.path
         environment["XDG_CONFIG_HOME"] = root.appendingPathComponent("config").path
         environment["XDG_DATA_HOME"] = root.appendingPathComponent("share").path

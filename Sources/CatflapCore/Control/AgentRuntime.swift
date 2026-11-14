@@ -21,7 +21,7 @@ public struct AgentStatus: Codable, Sendable {
     }
 }
 /// What the platform module (CatflapLinux, CatflapMac) reports about the desktop it runs on.
-/// It sets this through `AgentRuntime.setPlatformStatus(_:)`, and `catflap status` shows it.
+/// It changes this through `AgentRuntime.updatePlatformStatus(_:)`, and `catflap status` shows it.
 public struct PlatformStatus: Sendable, Equatable {
     public var desktop: String
     public var clipboardCapture: String
@@ -69,6 +69,9 @@ public actor AgentRuntime {
     public func register(_ command: String, handler: @escaping Handler) { handlers[command] = handler }
     public func setUIState(_ state: UIState) { ui = state }
     public func setPlatformStatus(_ status: PlatformStatus) { platform = status }
+    /// Changes some fields and keeps the rest. Parts of the platform module (the clipboard
+    /// watcher, the panel) report independently, so each changes only its own fields.
+    public func updatePlatformStatus(_ change: @Sendable (inout PlatformStatus) -> Void) { change(&platform) }
     public func platformStatus() -> PlatformStatus { platform }
     private func toggle() {
         ui.visible.toggle(); ui.mode = ui.visible ? "focused" : "hidden"; ui.hasFocus = ui.visible

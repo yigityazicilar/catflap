@@ -29,7 +29,7 @@ final class DataControlWatcher: @unchecked Sendable {
     private func run(ready: CheckedContinuation<Void, Never>) {
         guard let connection else {
             Task {
-                await runtime.setPlatformStatus(.init(clipboardCapture: "failed"))
+                await runtime.updatePlatformStatus { $0.clipboardCapture = "failed" }
                 ready.resume()
             }
             return
@@ -38,7 +38,7 @@ final class DataControlWatcher: @unchecked Sendable {
         let state = result == 1 ? "active" : result == 0 ? "unsupported" : "failed"
         let published = DispatchSemaphore(value: 0)
         Task {
-            await runtime.setPlatformStatus(.init(clipboardCapture: state))
+            await runtime.updatePlatformStatus { $0.clipboardCapture = state }
             ready.resume()
             published.signal()
         }
@@ -50,7 +50,7 @@ final class DataControlWatcher: @unchecked Sendable {
                     if next < 0 {
                         let updated = DispatchSemaphore(value: 0)
                         Task {
-                            await runtime.setPlatformStatus(.init(clipboardCapture: "failed"))
+                            await runtime.updatePlatformStatus { $0.clipboardCapture = "failed" }
                             updated.signal()
                         }
                         updated.wait()
