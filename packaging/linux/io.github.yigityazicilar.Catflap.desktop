@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Catflap
+GenericName=Send to your own devices
+Comment=Send text and files between your own machines, with a clipboard history
+Exec=catflap agent
+TryExec=catflap
+Icon=io.github.yigityazicilar.Catflap
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=send;transfer;clipboard;tailcat;
+StartupNotify=false
+SingleMainWindow=true
+X-GNOME-UsesNotifications=true

@@ -1,3 +1,4 @@
+import CAdwaita
 import CGtk
 import CGtkLayerShell
 import CGtkShim
