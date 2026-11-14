@@ -110,8 +110,14 @@ func waitForEnd(of child: Process, limit: TimeInterval) -> ChildEnd {
 final class AgentHarness {
     let dataDirectory: URL
     let executable: URL
+    /// Set on top of the agent's environment. By default the agent runs without its platform
+    /// module and without a display: a test agent must never watch the person's real
+    /// clipboard or open a window in their session. A test of capture passes
+    /// `["CATFLAP_PLATFORM": "on", "WAYLAND_DISPLAY": <its nested compositor>]`.
+    let environment: [String: String]
     private var process: Process?
-    init() throws {
+    init(environment: [String: String] = [:]) throws {
+        self.environment = environment
         dataDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("ce-" + UUID().uuidString.prefix(8))
         try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         if let override = ProcessInfo.processInfo.environment["CATFLAP_EXECUTABLE"] {
@@ -142,6 +148,7 @@ final class AgentHarness {
         let child = Process()
         child.executableURL = executable
         child.arguments = ["agent", "--data-dir", dataDirectory.path]
+        child.environment = agentEnvironment(overrides: environment)
         child.standardOutput = FileHandle.nullDevice
         child.standardError = FileHandle.nullDevice
         try child.run(); process = child
@@ -168,6 +175,16 @@ final class AgentHarness {
     func command(_ arguments: [String], timeout: TimeInterval = 10) throws -> CommandResult {
         try runHarnessProcess(executable, arguments: arguments + ["--data-dir", dataDirectory.path, "--json"], timeout: timeout)
     }
+}
+
+/// The environment a test agent runs in: this process's, with the display sockets removed and
+/// the platform module off, then the test's overrides on top.
+func agentEnvironment(overrides: [String: String]) -> [String: String] {
+    var environment = ProcessInfo.processInfo.environment
+    for name in ["WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY"] { environment[name] = nil }
+    environment["CATFLAP_PLATFORM"] = "off"
+    environment.merge(overrides) { _, override in override }
+    return environment
 }
 
 func runHarnessProcess(_ executable: URL, arguments: [String], timeout: TimeInterval = 10) throws -> CommandResult {

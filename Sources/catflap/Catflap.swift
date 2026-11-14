@@ -3,6 +3,11 @@ import CatflapCore
 import CTailcat
 import Foundation
 #if os(Linux)
+import CatflapLinux
+#elseif os(macOS)
+import CatflapMac
+#endif
+#if os(Linux)
 import Glibc
 #else
 import Darwin
@@ -64,6 +69,16 @@ struct Agent: AsyncParsableCommand {
             try await Audit.install(on: runtime)
             try await runtime.start()
             let control = try ControlServer(paths: paths, lock: lock)
+            // The desktop side: clipboard capture, later the panel. CATFLAP_PLATFORM=off runs
+            // the agent without it, for tests (whose agents must not watch the person's real
+            // clipboard) and for a machine with no desktop session.
+            let platform: Platform?
+            if ProcessInfo.processInfo.environment["CATFLAP_PLATFORM"] == "off" {
+                await runtime.setPlatformStatus(PlatformStatus(clipboardCapture: "off"))
+                platform = nil
+            } else {
+                platform = try await Platform.start(on: runtime)
+            }
             let (signals, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
             signal(SIGTERM, SIG_IGN); signal(SIGINT, SIG_IGN)
             let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global())
@@ -75,6 +90,7 @@ struct Agent: AsyncParsableCommand {
             for await _ in signals { break }
             control.stop(); await task.value
             continuation.finish(); term.cancel(); interrupt.cancel()
+            await platform?.stop()
             await runtime.stop()
             withExtendedLifetime(control) {}
         } catch {

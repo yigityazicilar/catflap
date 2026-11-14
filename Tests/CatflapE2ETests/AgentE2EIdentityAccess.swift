@@ -127,6 +127,7 @@ private func identityProbeArm(_ executable: URL, directory: URL, label: String, 
     let stderr = Pipe()
     child.executableURL = executable
     child.arguments = ["agent", "--data-dir", directory.path]
+    child.environment = agentEnvironment(overrides: [:])
     child.standardOutput = FileHandle.nullDevice
     child.standardError = stderr
     defer { if child.isRunning { kill(child.processIdentifier, SIGKILL); _ = waitForEnd(of: child, limit: 5) } }
