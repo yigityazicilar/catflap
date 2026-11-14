@@ -102,7 +102,11 @@ final class ClipboardWatcher {
                                     pasteboardAccess: access)
         if status != lastStatus {
             lastStatus = status
-            await runtime.setPlatformStatus(status)
+            // Only the watcher's own fields: other parts of the app report beside it.
+            let capture = status.clipboardCapture
+            await runtime.updatePlatformStatus {
+                $0.desktop = "macos"; $0.clipboardCapture = capture; $0.pasteboardAccess = access
+            }
         }
     }
     /// A writer clears the pasteboard, which moves the change count, before it writes, and
@@ -124,7 +128,25 @@ final class ClipboardWatcher {
         guard count != lastChange else { return }
         let types = source.offeredTypes
         guard source.changeCount == count, !Task.isCancelled else { return }
-        if types.isEmpty, stillSettling(count) { return }
+        if types.isEmpty {
+            if unsettled?.count != count {
+                // First sight. A copy is judged by the gates as they stand now: one made while
+                // history is paused or a password manager is in front is dropped below, so it
+                // cannot be read once its types arrive after either has lifted.
+                let protected = source.passwordManagerFrontmost
+                let paused = await history.isPaused()
+                guard source.changeCount == count, !Task.isCancelled else { return }
+                if !protected && !paused {
+                    unsettled = (count, ContinuousClock.now)
+                    // Until it settles, this change is the newest copy: `clip send --latest`
+                    // waits for it instead of sending the copy before it.
+                    await history.noteChange()
+                    return
+                }
+            } else if stillSettling(count) {
+                return
+            }
+        }
         let previous = lastChange
         lastChange = count
         let marked = Self.isMarked(types, frontmost: source.passwordManagerFrontmost)
@@ -149,8 +171,10 @@ final class ClipboardWatcher {
             unsettled = nil
         } catch {
             if case ClipboardReadFailure.unavailable = error, stillSettling(count) {
-                // Declared but not written yet: look at this change again on the next poll.
+                // Declared but not written yet: look at this change again on the next poll,
+                // and until then it is still the newest copy.
                 lastChange = previous
+                await history.noteChange()
             } else {
                 // Oversized, superseded and still-unavailable copies are dropped once, without
                 // logging their contents or retrying a read under an obsolete list of types.

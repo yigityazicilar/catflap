@@ -244,13 +244,14 @@ def memory_now():
         return ""
 
 
-def sample(path):
+def sample(path, parent):
     """The stall sampler, run as a process of its own: a line every half second with the time
     and the load, with the memory every two seconds. A gap in its lines means that it was not
-    running either, so the whole machine paused, not only the test process."""
+    running either, so the whole machine paused, not only the test process. It ends by itself
+    once the wrapper that started it is gone, however that ended."""
     with open(path, "a", buffering=1) as out:
         memory_at = 0.0
-        while True:
+        while os.getppid() == parent:
             now = time.time()
             memory = ""
             if now - memory_at >= 2:
@@ -290,22 +291,31 @@ def stall_report(path, silences):
     say(f"stall-watch: at the end, {around(times[-1])}")
 
 
+def stop_on_signal(number, frame):
+    raise SystemExit(128 + number)
+
+
 def run_once(arguments, limit, scratch):
     samples = os.path.join(scratch, "stall-samples.txt")
-    sampler = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--stall-sampler", samples],
-                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     silences, quiet_since = [], time.time()
-    master, slave = pty.openpty()
-    settings = termios.tcgetattr(slave)
-    settings[1] &= ~termios.OPOST  # leave line endings as they are written
-    termios.tcsetattr(slave, termios.TCSANOW, settings)
-    runner = subprocess.Popen(["swift", "test", "--skip-build", *arguments], stdin=subprocess.DEVNULL,
-                              stdout=slave, stderr=slave, env=dict(os.environ, TERM="dumb"))
-    os.close(slave)
-    family, tests = Family(runner), Tests()
-    deadline = time.monotonic() + limit
-    next_look, unread, open_output = 0.0, b"", True
+    sampler = family = master = None
+    # SIGTERM or SIGHUP ends the run through the same cleanup as any other end: the tests,
+    # what they started and the sampler are stopped, and the wrapper exits 128 + the signal.
+    previous = {number: signal.signal(number, stop_on_signal) for number in (signal.SIGTERM, signal.SIGHUP)}
     try:
+        sampler = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--stall-sampler", samples,
+                                    str(os.getpid())],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        master, slave = pty.openpty()
+        settings = termios.tcgetattr(slave)
+        settings[1] &= ~termios.OPOST  # leave line endings as they are written
+        termios.tcsetattr(slave, termios.TCSANOW, settings)
+        runner = subprocess.Popen(["swift", "test", "--skip-build", *arguments], stdin=subprocess.DEVNULL,
+                                  stdout=slave, stderr=slave, env=dict(os.environ, TERM="dumb"))
+        os.close(slave)
+        family, tests = Family(runner), Tests()
+        deadline = time.monotonic() + limit
+        next_look, unread, open_output = 0.0, b"", True
         while True:
             chunk = b""
             if open_output and select.select([master], [], [], 0.25)[0]:
@@ -355,14 +365,21 @@ def run_once(arguments, limit, scratch):
             return runner.returncode or 1
         return runner.returncode
     finally:
-        family.stop()
-        os.close(master)
-        sampler.terminate()
-        try:
-            sampler.wait(5)
-        except subprocess.TimeoutExpired:
-            sampler.kill()
-            sampler.wait()
+        for number in previous:
+            signal.signal(number, signal.SIG_IGN)  # a second signal must not cut the cleanup short
+        if family:
+            family.stop()
+        if master is not None:
+            os.close(master)
+        if sampler:
+            sampler.terminate()
+            try:
+                sampler.wait(5)
+            except subprocess.TimeoutExpired:
+                sampler.kill()
+                sampler.wait()
+        for number, handler in previous.items():
+            signal.signal(number, handler)
         stall_report(samples, silences)
         try:
             os.remove(samples)
@@ -372,7 +389,7 @@ def run_once(arguments, limit, scratch):
 
 def main():
     if sys.argv[1:2] == ["--stall-sampler"]:
-        sample(sys.argv[2])
+        sample(sys.argv[2], int(sys.argv[3]))
         return 0
     limit = int(os.environ.get("CATFLAP_TEST_LIMIT", "600"))
     repeat = int(os.environ.get("CATFLAP_TEST_REPEAT", "1"))

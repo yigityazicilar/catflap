@@ -149,9 +149,87 @@ struct ClipboardFixture {
         let last = try await f.history.ingest(offeredTypes: ["text/plain"]) { .text("the last note") }
         try await f.history.delete(id: try #require(last.id))
         await #expect(throws: ClipboardFailure.latestDeleted) { try await f.history.latestItem() }
-        // An agent that has seen no copy yet falls back to the newest stored item.
-        let restarted = ClipboardHistory(store: f.store)
-        #expect(try await restarted.latestItem().id == first.id)
+        // After a restart the agent does not know what the clipboard holds: it sends nothing.
+        let restarted = try await ClipboardHistory.open(store: f.store)
+        await #expect(throws: ClipboardFailure.latestEmpty) { try await restarted.latestItem() }
+    }
+    /// A restart must not turn a refusal into a send of an older item: the sequences a second
+    /// reader found, a marked newest copy and a deleted one.
+    @Test func testAfterARestartLatestSendsNothingUntilACopyArrives() async throws {
+        let f = try ClipboardFixture(); defer { f.cleanup() }
+        _ = try await f.history.ingest(offeredTypes: ["text/plain"]) { .text("an ordinary note") }
+        _ = try await f.history.ingest(offeredTypes: ["text/plain", try #require(SecretFilter.markers.first)]) { .text("unread") }
+        let restarted = try await ClipboardHistory.open(store: f.store)
+        await #expect(throws: ClipboardFailure.latestEmpty) { try await restarted.latestItem() }
+        let newest = try await restarted.ingest(offeredTypes: ["text/plain"]) { .text("copied after the restart") }
+        #expect(try await restarted.latestItem().id == newest.id)
+        try await restarted.delete(id: try #require(newest.id))
+        let again = try await ClipboardHistory.open(store: f.store)
+        await #expect(throws: ClipboardFailure.latestEmpty) { try await again.latestItem() }
+    }
+    /// While a new copy is read, the copy before it is no longer the newest one: `--latest`
+    /// waits for the new copy's outcome and sends that copy, or refuses if it was not recorded.
+    @Test func testLatestWaitsForTheCopyBeingRead() async throws {
+        let f = try ClipboardFixture(); defer { f.cleanup() }
+        _ = try await f.history.ingest(offeredTypes: ["text/plain"]) { .text("the previous note") }
+        let history = f.history
+        let (entered, enteredContinuation) = AsyncStream<Void>.makeStream()
+        let (letGo, release) = AsyncStream<Void>.makeStream()
+        defer { release.finish(); enteredContinuation.finish() }
+        let copy = Task {
+            try await history.ingest(offeredTypes: ["text/plain"]) {
+                enteredContinuation.yield(())
+                for await _ in letGo { break }
+                return .text("the newest note")
+            }
+        }
+        var iterator = entered.makeAsyncIterator()
+        _ = await iterator.next()
+        // The read is held open here, so the new copy's outcome is certainly not known yet.
+        await #expect(throws: ClipboardFailure.latestReading) { try await history.latestItem(wait: .milliseconds(50)) }
+        let waiting = Task { try await history.latestItem(wait: .seconds(20)) }
+        release.yield(())
+        let stored = try await copy.value
+        #expect(try await waiting.value.id == stored.id)
+        // A read that fails leaves a refusal, not the copy before it.
+        do {
+            _ = try await history.ingest(offeredTypes: ["text/plain"]) {
+                do {
+                    _ = try await history.latestItem(wait: .milliseconds(50))
+                    Issue.record("an item came back while the new copy was read")
+                } catch ClipboardFailure.latestReading {}
+                throw ClipboardFailure.invalid
+            }
+            Issue.record("the read did not fail")
+        } catch ClipboardFailure.invalid {}
+        await #expect(throws: ClipboardFailure.latestUnreadable) { try await history.latestItem() }
+    }
+    /// A copy that was being read when history paused is not recorded, and not replaced by
+    /// the copy before it.
+    @Test func testACopyBeingReadWhenHistoryPausesIsRefused() async throws {
+        let f = try ClipboardFixture(); defer { f.cleanup() }
+        _ = try await f.history.ingest(offeredTypes: ["text/plain"]) { .text("the previous note") }
+        let history = f.history
+        let result = try await history.ingest(offeredTypes: ["text/plain"]) {
+            try await history.setPaused(true)
+            return .text("copied just before the pause")
+        }
+        #expect(result.status == "superseded")
+        try await history.setPaused(false)
+        await #expect(throws: ClipboardFailure.latestCopiedWhilePaused) { try await history.latestItem() }
+    }
+    /// A change whose contents have not arrived is the newest copy until it settles.
+    @Test func testANotedChangeIsTheNewestCopyUntilItSettles() async throws {
+        let f = try ClipboardFixture(); defer { f.cleanup() }
+        _ = try await f.history.ingest(offeredTypes: ["text/plain"]) { .text("the previous note") }
+        await f.history.noteChange()
+        await #expect(throws: ClipboardFailure.latestReading) { try await f.history.latestItem(wait: .milliseconds(50)) }
+        let newest = try await f.history.ingest(offeredTypes: ["text/plain"]) { .text("its contents, once they arrive") }
+        #expect(try await f.history.latestItem().id == newest.id)
+        await f.history.noteChange()
+        try await f.history.setPaused(true)
+        try await f.history.setPaused(false)
+        await #expect(throws: ClipboardFailure.latestCopiedWhilePaused) { try await f.history.latestItem() }
     }
     @Test func testOversizeItemIsSkipped() async throws {
         let f = try ClipboardFixture(); defer { f.cleanup() }
