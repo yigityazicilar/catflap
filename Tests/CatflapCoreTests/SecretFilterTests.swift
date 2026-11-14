@@ -90,6 +90,30 @@ import Testing
     /// The JWT check is a one-pass scan. On short strings it must find exactly what the regex
     /// it replaced finds, less the regex's closing word boundary. The pieces make every case
     /// likely: starts after a hyphen or an underscore, missing runs, double dots, spaces.
+    /// A UUID is an identifier, not a secret (the person's decision, 2026-11-14), so one copied
+    /// on its own is kept, in either case. The exemption is for that shape only: 36 random
+    /// letters and digits laid out 8-4-4-4-12 are still a token.
+    @Test func testBareUUIDsAreKept() async throws {
+        let (uuids, lookalikes) = try await filterOffPool { () -> (Int, Int) in
+            var kept = 0
+            for index in 0..<1000 {
+                let value = UUID().uuidString
+                if !SecretFilter.rejects(index % 2 == 0 ? value : value.lowercased()) { kept += 1 }
+            }
+            var generator = SeededGenerator(seed: 0x5EED_CA7F_1A90_0002)
+            let characters = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+            var accepted = 0
+            for _ in 0..<500 {
+                let groups = [8, 4, 4, 4, 12].map { length in
+                    String((0..<length).map { _ in characters.randomElement(using: &generator)! })
+                }
+                if !SecretFilter.rejects(groups.joined(separator: "-")) { accepted += 1 }
+            }
+            return (kept, accepted)
+        }
+        #expect(uuids == 1000, "\(1000 - uuids) of 1000 UUIDs were treated as secrets")
+        #expect(lookalikes <= 10, "\(lookalikes) of 500 random 8-4-4-4-12 tokens were accepted")
+    }
     @Test func testJWTScanFindsWhatTheRegexFinds() async throws {
         let (found, different) = try await filterOffPool { () -> (Int, [String]) in
             var generator = SeededGenerator(seed: 0x7E57_0000_0000_0042)

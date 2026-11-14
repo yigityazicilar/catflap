@@ -50,8 +50,30 @@ public enum SecretFilter {
             let p = Double(count) / size
             return total - p * log2(p)
         }
-        if readsAsWords(text) { return false }
+        if readsAsWords(text) || isUUID(text) { return false }
         return entropy >= (text.utf8.count >= 32 ? 3.5 : 4.0)
+    }
+
+    /// A UUID in its usual text form, 8-4-4-4-12 hex digits in one case. An identifier, not a
+    /// secret (the person's decision, 2026-11-14). Checked only after the provider shapes, so
+    /// it never lets a known key format through.
+    static func isUUID(_ text: String) -> Bool {
+        let bytes = Array(text.utf8)
+        guard bytes.count == 36 else { return false }
+        var lower = false, upper = false
+        for (index, byte) in bytes.enumerated() {
+            if [8, 13, 18, 23].contains(index) {
+                guard byte == UInt8(ascii: "-") else { return false }
+                continue
+            }
+            switch byte {
+            case UInt8(ascii: "0")...UInt8(ascii: "9"): continue
+            case UInt8(ascii: "a")...UInt8(ascii: "f"): lower = true
+            case UInt8(ascii: "A")...UInt8(ascii: "F"): upper = true
+            default: return false
+            }
+        }
+        return !(lower && upper)
     }
 
     /// Letters alone, or words joined by "_" or "-", that read as words: snake_case,
