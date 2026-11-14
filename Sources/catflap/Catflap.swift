@@ -120,7 +120,14 @@ struct UI: ParsableCommand {
     struct Invoke: ParsableCommand {
         @OptionGroup var options: ClientOptions
         @Argument var action: String
-        func run() throws { try options.call("ui.invoke", arguments: ["action": action]) }
+        @Option(name: .long, help: "A file for the action, such as attach. Repeat for several.") var file: [String] = []
+        func run() throws {
+            var arguments = ["action": action]
+            // Absolute paths: the agent does not share this command's working directory.
+            let paths = file.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+            if !paths.isEmpty { arguments["files"] = paths.joined(separator: "\n") }
+            try options.call("ui.invoke", arguments: arguments)
+        }
     }
 }
 struct Version: ParsableCommand {
