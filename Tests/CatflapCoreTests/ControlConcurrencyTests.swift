@@ -42,6 +42,30 @@ private func rawControlConnection(_ url: URL) throws -> Int32 {
     }
 }
 
+/// True while a connection is open and the server has written nothing to it.
+private func openAndUnanswered(_ descriptor: Int32) -> Bool {
+    var byte: UInt8 = 0
+    let count = recv(descriptor, &byte, 1, Int32(MSG_DONTWAIT))
+    return count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)
+}
+/// True when the connection is closed with nothing written to it (20 s guard against a hang).
+private func closedUnanswered(_ descriptor: Int32) throws -> Bool {
+    try onControlProbeThread {
+        var timeout = timeval(tv_sec: 20, tv_usec: 0)
+        _ = setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        var byte: UInt8 = 0
+        return recv(descriptor, &byte, 1, 0) == 0
+    }
+}
+private func waitUntil(seconds: Int, _ condition: () -> Bool) async throws -> Bool {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(seconds))
+    while !condition() {
+        guard ContinuousClock.now < deadline else { return false }
+        try await Task.sleep(for: .milliseconds(1))
+    }
+    return true
+}
+
 extension ControlTests {
     @Test func testSilentClientDoesNotDelayOthers() async throws {
         let paths = try storeTestPaths()
@@ -53,34 +77,37 @@ extension ControlTests {
         let task = Task { await server.run { await runtime.handle($0) } }
         var silent: [Int32] = []
         defer { silent.forEach { close($0) } }
-        silent.append(try rawControlConnection(paths.socket))
-        // A reply that waited for the silent connection would take the 5 s after which the
-        // server closes it. The limits below sit between that and a busy test machine.
-        let start = ContinuousClock.now
-        let response = try await ControlClient.requestAsync(.init("status"), socket: paths.socket)
-        #expect(start.duration(to: .now) < .seconds(3))
-        #expect(response.ok)
-        #expect(try response.decode(AgentStatus.self).running)
-        // Wait for the completed status worker to release its slot before filling the limit.
-        let released = ContinuousClock.now.advanced(by: .seconds(5))
-        while server.activeConnections != 1 && ContinuousClock.now < released {
-            try await Task.sleep(for: .milliseconds(1))
+        // A server that served one connection at a time would answer the status request only
+        // after giving up on the silent connection, which it does 5 s after it opened, by
+        // writing a reply and closing it. So when the reply arrives, the silent connection
+        // must still be open with nothing written to it. That is an order of events, not a
+        // time limit: a slow runner cannot fail it, and one that pauses for more than 5 s
+        // inside an attempt gets two more.
+        var overlapped = false
+        for _ in 1...3 where !overlapped {
+            let probe = try rawControlConnection(paths.socket)
+            defer { close(probe) }
+            let response = try await ControlClient.requestAsync(.init("status"), socket: paths.socket)
+            #expect(response.ok)
+            #expect(try response.decode(AgentStatus.self).running)
+            overlapped = openAndUnanswered(probe)
         }
-        #expect(server.activeConnections == 1)
-        // Keep 32 silent connections open. The next one must be closed, not queued to a worker.
-        for _ in 1..<32 { silent.append(try rawControlConnection(paths.socket)) }
+        try #require(overlapped, "every status reply came after the server gave up on the silent connection")
+        // Wait for the probes to release their slots, then hold all 32, each admitted before
+        // the next one connects. The next connection must be closed, not queued to a worker.
+        try #require(try await waitUntil(seconds: 20) { server.activeConnections == 0 })
+        for count in 1...32 {
+            silent.append(try rawControlConnection(paths.socket))
+            try #require(try await waitUntil(seconds: 20) { server.activeConnections == count })
+        }
         let extra = try rawControlConnection(paths.socket)
         defer { close(extra) }
-        let rejected = try onControlProbeThread {
-            var timeout = timeval(tv_sec: 3, tv_usec: 0)
-            _ = setsockopt(extra, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-            var byte: UInt8 = 0
-            return recv(extra, &byte, 1, 0) == 0
-        }
-        #expect(rejected)
-        let shutdownStart = ContinuousClock.now
+        #expect(try closedUnanswered(extra))
+        // Stopping must interrupt the silent connections, not wait out their 5 s: an
+        // interrupted one is closed with nothing written to it, while one that ran out of time
+        // gets a reply first. The newest one opened moments before the stop.
         server.stop(); await task.value
-        #expect(shutdownStart.duration(to: .now) < .seconds(3))
+        #expect(try closedUnanswered(silent[silent.count - 1]))
         await runtime.stop()
     }
     @Test func testSlowHandlerDoesNotDelayOthers() async throws {
