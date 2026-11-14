@@ -254,6 +254,35 @@ private final class ActionsAgent: @unchecked Sendable {
     }
 }
 
+/// One field of `ui state`, or of the `state` in an action's reply, as text; nil when the agent
+/// does not report it. Read without the typed state, so these checks run against an agent
+/// that lacks the field, and fail there.
+private func stateField(_ payload: Data, _ name: String) -> String? {
+    guard let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else { return nil }
+    let state = (object["state"] as? [String: Any]) ?? object
+    return state[name].map { "\($0)" }
+}
+
+extension ActionsAgent {
+    func field(_ name: String) throws -> String? {
+        let response = try request("ui.state")
+        guard response.ok else { throw ActionsTestError.decode("ui state refused") }
+        return stateField(response.payload, name)
+    }
+
+    /// Clicks one of the panel's own controls; `row` names the list row of a row control.
+    func press(_ control: String, row: String? = nil) throws -> ControlResponse {
+        var arguments = ["control": control]
+        if let row { arguments["id"] = row }
+        return try invoke("press", arguments)
+    }
+
+    /// A key equivalent pressed in the panel, such as `cmd` + `c`.
+    func key(_ key: String, modifiers: String = "cmd") throws -> ControlResponse {
+        try invoke("simulate-key", ["key": key, "modifiers": modifiers])
+    }
+}
+
 /// The general pasteboard as it was, put back after the test. On CI it is the runner's.
 @MainActor
 private struct PasteboardSnapshot {
@@ -624,6 +653,80 @@ struct MacActionsE2E {
         }
     }
 
+    /// Catflap.app opened with no arguments (as Finder and `open` start it) runs the agent in
+    /// its default data folder; the bare executable with no arguments still prints its help.
+    /// The app runs with the checkout out of reach. The default folder is the person's own, so
+    /// this runs on CI only, and only while that folder does not exist; the home folder stays
+    /// the real one, because the agent's keys live in the login keychain under it.
+    @Test func testOpeningTheAppWithoutArgumentsRunsTheAgent() async throws {
+        let data = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Catflap")
+        guard ProcessInfo.processInfo.environment["CI"] == "true" else {
+            print("MacActionsE2E app without arguments: skipped, it runs on CI only (it uses the default data folder)")
+            return
+        }
+        // Declared before testBundledAppIsSignedAndRunsWithoutTheCheckout, which this serialized
+        // suite runs later: its login item starts a real agent in the default folder.
+        guard !FileManager.default.fileExists(atPath: data.path) else {
+            Issue.record("Catflap's default data folder already exists on this runner; the test leaves it alone")
+            return
+        }
+        let executable = try locateExecutable()
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .resolvingSymlinksInPath()
+        let output = try scratchDirectory("cz-")
+        defer { try? FileManager.default.removeItem(at: output) }
+        let app = output.appendingPathComponent("Catflap.app")
+        let binary = app.appendingPathComponent("Contents/MacOS/catflap")
+        let profile = "(version 1)(allow default)(deny file-read* (subpath \"\(root.path)\"))"
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "CATFLAP_SIGN_IDENTITY")
+        environment.removeValue(forKey: "CATFLAP_STATUS_ITEM")
+        environment["CATFLAP_PLATFORM"] = "off"
+        let fixed = environment
+        let bundled = try await actionsOffPool {
+            try actionsRun("/bin/bash", [root.appendingPathComponent("packaging/macos/bundle.sh").path, "--binary", executable.path,
+                                         "--output", output.path], environment: fixed, in: output, seconds: 120)
+        }
+        #expect(bundled.code == 0, "bundle.sh: \(bundled.errorText)")
+
+        let bare = try await actionsOffPool { try actionsRun(executable.path, [], environment: fixed, in: output) }
+        let help = (bare.text + bare.errorText).contains("USAGE: catflap")
+        #expect(help, "the bare executable prints its help")
+        #expect(!FileManager.default.fileExists(atPath: data.path), "the bare executable started no agent")
+
+        let (answered, exitCode, said) = try await actionsOffPool { () -> (Bool, Int32?, String) in
+            let errors = output.appendingPathComponent("app-stderr.txt")
+            FileManager.default.createFile(atPath: errors.path, contents: nil)
+            let child = Process()
+            child.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
+            child.arguments = ["-p", profile, binary.path]
+            child.environment = fixed
+            child.standardOutput = FileHandle.nullDevice
+            child.standardError = try FileHandle(forWritingTo: errors)
+            child.standardInput = FileHandle.nullDevice
+            try child.run()
+            var answered = false
+            // A hang guard only.
+            let deadline = Date().addingTimeInterval(30)
+            while Date() < deadline, child.isRunning {
+                let status = try? ControlClient.request(ControlRequest("status"), socket: data.appendingPathComponent("control.sock"))
+                if status?.ok == true { answered = true; break }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if child.isRunning { child.terminate() }
+            var code = actionsWait(child, seconds: 30)
+            if code == nil { kill(child.processIdentifier, SIGKILL); code = actionsWait(child, seconds: 5) }
+            if FileManager.default.fileExists(atPath: data.path) {
+                _ = try? actionsRun(binary.path, ["erase-identity", "--data-dir", data.path], environment: fixed, in: output)
+                try? FileManager.default.removeItem(at: data)
+            }
+            return (answered, code, String((try? String(contentsOf: errors, encoding: .utf8))?.suffix(300) ?? ""))
+        }
+        #expect(answered, "the app with no arguments runs the agent in its default data folder: \(said)")
+        #expect(exitCode == 0, "the agent stops cleanly on SIGTERM: \(exitCode.map { "\($0)" } ?? "no exit")")
+        print("MacActionsE2E app without arguments: agent_answered=\(answered) exit=\(exitCode.map { "\($0)" } ?? "none") bare_prints_help=\(help)")
+    }
+
     @Test func testBundledAppIsSignedAndRunsWithoutTheCheckout() async throws {
         let executable = try locateExecutable()
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -722,6 +825,169 @@ struct MacActionsE2E {
         let problems = (try? await actionsOffPool { bundled.close() }) ?? ["could not stop the bundled agent"]
         for problem in problems { Issue.record(Comment(rawValue: problem)) }
         if let failure { throw failure }
+    }
+
+    /// Attach, Pair a device and Settings, clicked on the panel itself, open what they name.
+    @Test func testPanelButtonsReachTheActions() async throws {
+        try await withAgents(peer: false) { panel, _ in
+            let start = try await actionsOffPool { try panel.state() }
+            #expect(start.actions.wired, "the panel's own controls reach the actions")
+            var opened: [String: Bool] = [:]
+            // Pair a device is in the panel while no device is paired.
+            for (control, close) in [("attach", "attach-cancel"), ("pair", "pair-close"), ("settings", "settings-close")] {
+                _ = try await actionsOffPool { try panel.reply("type", ["text": ""]) }
+                let pressed = try await actionsOffPool { try panel.press(control) }
+                #expect(pressed.ok, "press \(control): \(pressed.error ?? "")")
+                guard pressed.ok else { opened[control] = false; continue }
+                opened[control] = try await actionsOffPool {
+                    try panel.waitFor("the window behind \(control)") { () -> Bool? in
+                        let actions = try panel.state().actions
+                        let open = switch control {
+                        case "attach": actions.pickerOpen
+                        case "pair": actions.pairingOpen
+                        default: actions.settingsOpen
+                        }
+                        return open ? true : nil
+                    }
+                }
+                _ = try await actionsOffPool { try panel.reply(close) }
+            }
+            #expect(opened == ["attach": true, "pair": true, "settings": true], "\(opened)")
+            print("MacActionsE2E buttons: " + opened.keys.sorted().map { "\($0)=\(opened[$0] ?? false)" }.joined(separator: " "))
+        }
+    }
+
+    /// Copy and Delete on the list's rows: by their buttons, and by ⌘C and ⌘⌫ on the selected
+    /// row, each button with a spoken label naming its row.
+    @Test func testRowCopyAndDeleteControls() async throws {
+        try await withAgents(peer: false) { panel, _ in
+            let marker = UUID().uuidString
+            let texts = ["copy by click " + marker, "copy by key " + marker]
+            var ids: [String] = []
+            for text in texts {
+                let added = try await actionsOffPool { try panel.command(["clip", "add", "--text", text]) }
+                #expect(added.code == 0, "clip add: \(added.errorText)")
+                ids.append(try #require(try ControlJSON.decoder.decode(ClipboardIngestResult.self, from: added.output).id))
+            }
+            let rows = ids
+            // The field filters the list down to this test's two rows.
+            _ = try await actionsOffPool { try panel.reply("type", ["text": marker]) }
+            let listed = try await actionsOffPool { try panel.waitFor("both rows in the panel") { try panel.state().ui.rows == 2 ? true : nil } }
+            #expect(listed)
+
+            // Copy writes the general pasteboard: it is saved first and put back after.
+            let saved = try await MainActor.run { try PasteboardSnapshot() }
+            var pasted: [String] = []
+            var labels: [String] = []
+            var failure: (any Error)?
+            do {
+                let click = try await actionsOffPool { try panel.press("copy", row: rows[0]) }
+                #expect(click.ok, "press copy: \(click.error ?? "")")
+                if click.ok { labels.append(try click.decode(ActionsReply.self).message) }
+                pasted.append(await MainActor.run { NSPasteboard.general.string(forType: .string) ?? "" })
+                _ = try await actionsOffPool { try panel.reply("select", ["id": rows[1]]) }
+                let key = try await actionsOffPool { try panel.key("c") }
+                #expect(key.ok, "cmd-C: \(key.error ?? "")")
+                pasted.append(await MainActor.run { NSPasteboard.general.string(forType: .string) ?? "" })
+            } catch { failure = error }
+            await MainActor.run { saved.restore() }
+            if let failure { throw failure }
+            #expect(pasted == texts, "the Copy button copies its row, cmd-C the selected row")
+
+            _ = try await actionsOffPool { try panel.reply("select", ["id": rows[1]]) }
+            let deleteKey = try await actionsOffPool { try panel.key("delete") }
+            #expect(deleteKey.ok, "cmd-delete: \(deleteKey.error ?? "")")
+            let deleteClick = try await actionsOffPool { try panel.press("delete", row: rows[0]) }
+            #expect(deleteClick.ok, "press delete: \(deleteClick.error ?? "")")
+            if deleteClick.ok { labels.append(try deleteClick.decode(ActionsReply.self).message) }
+            let left = try await actionsOffPool { try panel.command(["clip", "list"]) }.text
+            let gone = ids.map { !left.contains($0) }
+            #expect(gone == [true, true], "both rows are deleted")
+            #expect(labels == ["Copy " + texts[0], "Delete " + texts[0]], "spoken labels: \(labels)")
+            print("MacActionsE2E row controls: pasted_match=\(pasted == texts) deleted=\(gone) labels=\(labels.map { $0.replacingOccurrences(of: marker, with: "<marker>") })")
+        }
+    }
+
+    /// The menu bar glyph and the panel's line follow each send: cf-moving while it goes,
+    /// cf-arrived after it got there or something arrived, cf-problem after a failure until the
+    /// panel opens. A failure notifies while the panel is closed; Retry is clicked on its row.
+    @Test func testStatusGlyphAndTheLastSendLine() async throws {
+        try await withAgents { panel, peer in
+            let peer = try #require(peer)
+            try await pairFromPanel(panel, peer)
+            let peerName = try #require(try await actionsOffPool { try panel.devices().first?.name })
+            let idle = try await actionsOffPool { try panel.field("glyph") }
+            #expect(idle == "cf-idle")
+
+            // The send button with a file attached.
+            let file = panel.directory.appendingPathComponent("large-\(UUID().uuidString.prefix(6)).bin")
+            try Data(count: 32 << 20).write(to: file)
+            _ = try await actionsOffPool { try panel.reply("attach", ["files": file.path]) }
+            let pressed = try await actionsOffPool { try panel.press("send") }
+            #expect(pressed.ok, "press send: \(pressed.error ?? "")")
+            #expect(stateField(pressed.payload, "glyph") == "cf-moving", "the glyph while the file goes")
+            #expect(stateField(pressed.payload, "send_line")?.hasPrefix("Sending to \(peerName)") == true)
+            _ = try await row(on: peer, "the file on the peer") { $0.direction == "received" && $0.kind == "file" }
+            _ = try await row(on: panel, "the file sent from the panel") { $0.direction == "sent" && $0.kind == "file" }
+            let (line, lasted) = try await actionsOffPool { () -> (String?, TimeInterval) in
+                _ = try panel.waitFor("cf-arrived after the send") { try panel.field("glyph") == "cf-arrived" ? true : nil }
+                let seen = Date()
+                let line = try panel.field("send_line")
+                _ = try panel.waitFor("cf-idle after cf-arrived") { try panel.field("glyph") == "cf-idle" ? true : nil }
+                return (line, Date().timeIntervalSince(seen))
+            }
+            #expect(line == "Sent to \(peerName).")
+            print("MacActionsE2E glyph: cf-arrived then cf-idle after \(String(format: "%.1f", lasted)) s")
+
+            // Something arriving.
+            let panelID = try #require(try await actionsOffPool { try peer.devices().first?.id })
+            let fromPeer = try await actionsOffPool { try peer.command(["send", "--to", panelID, "--text", "arriving " + UUID().uuidString]) }
+            #expect(fromPeer.code == 0, "send from the peer: \(fromPeer.errorText)")
+            let arrival = try await actionsOffPool { try panel.waitFor("cf-arrived after an arrival") { try panel.field("glyph") == "cf-arrived" ? true : nil } }
+            #expect(arrival)
+
+            // A send that fails while the panel is closed.
+            _ = try await actionsOffPool { try panel.invoke("hide") }
+            let stopped = try await actionsOffPool { peer.stop() }
+            #expect(stopped.isEmpty, "\(stopped)")
+            let failing = try await actionsOffPool { try panel.invoke("send-text", ["text": "to a stopped peer " + UUID().uuidString]) }
+            #expect(failing.ok, "send-text: \(failing.error ?? "")")
+            #expect(stateField(failing.payload, "glyph") == "cf-moving")
+            let failed = try #require(try failing.decode(ActionsReply.self).transfers.first)
+            let failedRow = failed.deviceID + "/" + failed.id
+            let started = Date()
+            let afterFailure = try await actionsOffPool { () -> ActionsState in
+                _ = try panel.waitFor("cf-problem", seconds: 90) { try panel.field("glyph") == "cf-problem" ? true : nil }
+                return try panel.state()
+            }
+            let took = Date().timeIntervalSince(started)
+            let failureLine = try await actionsOffPool { try panel.field("send_line") }
+            #expect(failureLine?.hasPrefix("Not sent to \(peerName).") == true, "\(failureLine ?? "no line")")
+            #expect(afterFailure.actions.notifications.last?.title == "Not sent to \(peerName)", "a closed panel still notifies")
+            print("MacActionsE2E glyph: cf-problem \(String(format: "%.1f", took)) s after the send to the stopped peer")
+
+            // Opening the panel takes cf-problem away.
+            let opened = try await actionsOffPool { try panel.reply("type", ["text": ""]) }
+            #expect(opened.state.ui.visible)
+            #expect(try await actionsOffPool { try panel.field("glyph") } == "cf-idle", "the panel opened")
+
+            // Retry on the failed row, with the panel open: the line says how it went, and there
+            // is no notification beside it.
+            let notified = afterFailure.actions.notifications.count
+            _ = try await actionsOffPool { try panel.reply("select", ["id": failedRow]) }
+            let retried = try await actionsOffPool { try panel.press("retry", row: failedRow) }
+            #expect(retried.ok, "press retry: \(retried.error ?? "")")
+            #expect(stateField(retried.payload, "glyph") == "cf-moving")
+            if retried.ok {
+                let again = try await actionsOffPool { () -> ActionsState in
+                    _ = try panel.waitFor("cf-problem after Retry", seconds: 90) { try panel.field("glyph") == "cf-problem" ? true : nil }
+                    return try panel.state()
+                }
+                #expect(again.ui.visible, "the panel stayed open")
+                #expect(again.actions.notifications.count == notified, "no notification while the panel is open")
+                #expect(try await actionsOffPool { try panel.field("send_line") }?.hasPrefix("Not sent to \(peerName).") == true)
+            }
+        }
     }
 }
 }
