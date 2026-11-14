@@ -62,7 +62,7 @@ jobs:
         run: scripts/ci-test.py
       - name: Check loaded ABI
         run: swift run catflap version | tee build/version.txt && grep -Fx 'tailcat-abi 1' build/version.txt
-      # The app bundle as packaging builds it, from the debug build above, so this adds
-      # seconds, not a release build. Ad hoc: the runner has no signing identity.
+      # The app bundle exactly as packaging builds it by default: a release build. Signed ad
+      # hoc, because the runner has no signing identity.
       - name: Bundle and verify Catflap.app
-        run: packaging/macos/bundle.sh --configuration debug && codesign --verify --strict --deep build/Catflap.app
+        run: packaging/macos/bundle.sh && codesign --verify --strict --deep build/Catflap.app
