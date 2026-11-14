@@ -17,8 +17,10 @@ private final class ClipboardSpy: ClipboardSource {
     var passwordManagerFrontmost = false
     var access = "alwaysAllow"
     var reads = 0
+    var unavailableReads = 0
     var value = ClipboardContent.text("a normal clipboard note")
     func content(type: String, kind: ClipboardKind, limit: Int) throws -> ClipboardContent {
+        if unavailableReads > 0 { unavailableReads -= 1; throw ClipboardReadFailure.unavailable }
         reads += 1
         return value
     }
@@ -64,6 +66,52 @@ struct ClipboardWatcherTests {
             try await history.setPaused(false)
             await watcher.poll()
             #expect(source.reads == 0)
+            source.changeCount += 1
+            await watcher.poll()
+            #expect(source.reads == 1)
+            #expect(try await history.items().count == 1)
+        }
+    }
+    /// A writer clears the pasteboard, which moves the change count, before it writes. A poll
+    /// in between sees the new count with no types yet. On a CI runner that lost pbcopy's
+    /// first copy for good: the change was marked as seen, and its types arrived later under
+    /// the same count. It must be read once they arrive.
+    @Test func testAChangeSeenBeforeItsTypesIsReadOnceTheyArrive() async throws {
+        try await withWatcher { (watcher, source, history, _) async throws in
+            source.types = []
+            source.changeCount += 1
+            await watcher.poll()
+            #expect(source.reads == 0)
+            source.types = ["public.utf8-plain-text"]
+            await watcher.poll()
+            #expect(source.reads == 1)
+            #expect(try await history.items().count == 1)
+        }
+    }
+    /// The same for a representation that is declared but not written yet.
+    @Test func testARepresentationNotWrittenYetIsReadOnTheNextPoll() async throws {
+        try await withWatcher { (watcher, source, history, _) async throws in
+            source.unavailableReads = 1
+            source.changeCount += 1
+            await watcher.poll()
+            #expect(source.reads == 0)
+            await watcher.poll()
+            #expect(source.reads == 1)
+            #expect(try await history.items().count == 1)
+        }
+    }
+    /// An app that only clears the pasteboard leaves a change that never gets types. It is
+    /// let go after the settle window, and the next copy is read as usual.
+    @Test func testAChangeThatStaysEmptyIsLetGo() async throws {
+        try await withWatcher { (watcher, source, history, _) async throws in
+            watcher.settleWindow = .zero
+            source.types = []
+            source.changeCount += 1
+            await watcher.poll()
+            await watcher.poll()
+            await watcher.poll()
+            #expect(source.reads == 0)
+            source.types = ["public.utf8-plain-text"]
             source.changeCount += 1
             await watcher.poll()
             #expect(source.reads == 1)

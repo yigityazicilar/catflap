@@ -83,6 +83,10 @@ final class ClipboardWatcher {
     private let runtime: AgentRuntime
     private var lastChange: Int
     private var lastStatus: PlatformStatus?
+    /// How long a change may show no types, or lack its chosen representation, before it is
+    /// let go. Tests shorten it.
+    var settleWindow: Duration = .seconds(2)
+    private var unsettled: (count: Int, since: ContinuousClock.Instant)?
     init(source: any ClipboardSource, history: ClipboardHistory, runtime: AgentRuntime) {
         self.source = source; self.history = history; self.runtime = runtime
         // Do not collect a copy that predates this agent's capture session.
@@ -101,13 +105,28 @@ final class ClipboardWatcher {
             await runtime.setPlatformStatus(status)
         }
     }
+    /// A writer clears the pasteboard, which moves the change count, before it writes, and
+    /// from another process the write can land a poll or more later. Until then the change
+    /// shows no types, or its chosen representation is missing. Such a change is looked at
+    /// again on later polls within `settleWindow` instead of being lost; one that stays
+    /// empty, such as an app that only cleared the pasteboard, is then let go.
+    private func stillSettling(_ count: Int) -> Bool {
+        let now = ContinuousClock.now
+        guard let unsettled, unsettled.count == count else {
+            unsettled = (count, now)
+            return true
+        }
+        return now - unsettled.since < settleWindow
+    }
     func poll() async {
         await reportStatus()
         let count = source.changeCount
         guard count != lastChange else { return }
-        lastChange = count
         let types = source.offeredTypes
         guard source.changeCount == count, !Task.isCancelled else { return }
+        if types.isEmpty, stillSettling(count) { return }
+        let previous = lastChange
+        lastChange = count
         let marked = Self.isMarked(types, frontmost: source.passwordManagerFrontmost)
         let selection: (String, ClipboardKind)? = [
             ("public.file-url", .files), ("public.url", .url), ("public.png", .image),
@@ -127,9 +146,16 @@ final class ClipboardWatcher {
                     return value
                 }
             }
+            unsettled = nil
         } catch {
-            // Unavailable, oversized and superseded copies are dropped once, without logging
-            // their contents or retrying a read under an obsolete list of types.
+            if case ClipboardReadFailure.unavailable = error, stillSettling(count) {
+                // Declared but not written yet: look at this change again on the next poll.
+                lastChange = previous
+            } else {
+                // Oversized, superseded and still-unavailable copies are dropped once, without
+                // logging their contents or retrying a read under an obsolete list of types.
+                unsettled = nil
+            }
         }
     }
     func run() async {
