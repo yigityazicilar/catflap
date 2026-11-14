@@ -100,6 +100,53 @@ struct ClipboardWatcherTests {
             #expect(try await history.items().count == 1)
         }
     }
+    /// A copy is judged by the gates as they stood when its change was first seen, also when
+    /// its types arrive later: one made while history was paused, or while a password manager
+    /// was in front, is never read (found by a second reader).
+    @Test func testAnEmptyChangeSeenWhilePausedIsNotReadAfterResume() async throws {
+        try await withWatcher { (watcher, source, history, _) async throws in
+            try await history.setPaused(true)
+            source.types = []
+            source.changeCount += 1
+            await watcher.poll()
+            try await history.setPaused(false)
+            source.types = ["public.utf8-plain-text"]
+            await watcher.poll()
+            #expect(source.reads == 0)
+            #expect(try await history.items().isEmpty)
+        }
+    }
+    @Test func testAnEmptyChangeSeenWithAManagerInFrontIsNotReadAfterSwitching() async throws {
+        try await withWatcher { (watcher, source, history, _) async throws in
+            source.passwordManagerFrontmost = true
+            source.types = []
+            source.changeCount += 1
+            await watcher.poll()
+            source.passwordManagerFrontmost = false
+            source.types = ["public.utf8-plain-text"]
+            await watcher.poll()
+            #expect(source.reads == 0)
+            #expect(try await history.items().isEmpty)
+        }
+    }
+    /// While a change waits for its types, `clip send --latest` must not send the copy before it.
+    @Test func testLatestWaitsForAChangeStillWaitingForItsTypes() async throws {
+        try await withWatcher { (watcher, source, history, _) async throws in
+            source.changeCount += 1
+            await watcher.poll()
+            let first = try #require(try await history.items().first)
+            source.types = []
+            source.changeCount += 1
+            await watcher.poll()
+            await #expect(throws: ClipboardFailure.latestReading) { try await history.latestItem(wait: .milliseconds(50)) }
+            source.types = ["public.utf8-plain-text"]
+            source.value = .text("the copy whose types came late")
+            await watcher.poll()
+            let latest = try await history.latestItem()
+            #expect(latest.id != first.id)
+            #expect(latest.text == "the copy whose types came late")
+        }
+    }
     /// An app that only clears the pasteboard leaves a change that never gets types. It is
     /// let go after the settle window, and the next copy is read as usual.
     @Test func testAChangeThatStaysEmptyIsLetGo() async throws {
