@@ -152,7 +152,8 @@ final class AgentHarness {
         child.standardOutput = FileHandle.nullDevice
         child.standardError = FileHandle.nullDevice
         try child.run(); process = child
-        let deadline = Date().addingTimeInterval(10)
+        // Only a guard against a hang: a loaded runner can take many seconds to start one.
+        let deadline = Date().addingTimeInterval(30)
         while Date() < deadline && child.isRunning {
             if let response = try? ControlClient.request(.init("status"), socket: dataDirectory.appendingPathComponent("control.sock")), response.ok { return }
             Thread.sleep(forTimeInterval: 0.05)
@@ -172,7 +173,7 @@ final class AgentHarness {
         if waitForEnd(of: child, limit: 5) == .stillRunning { harnessError("agent \(pid) is still running 5 s after SIGKILL") }
     }
     func restart() throws { stop(); try start() }
-    func command(_ arguments: [String], timeout: TimeInterval = 10) throws -> CommandResult {
+    func command(_ arguments: [String], timeout: TimeInterval = 30) throws -> CommandResult {
         try runHarnessProcess(executable, arguments: arguments + ["--data-dir", dataDirectory.path, "--json"], timeout: timeout)
     }
 }
@@ -187,33 +188,62 @@ func agentEnvironment(overrides: [String: String]) -> [String: String] {
     return environment
 }
 
-func runHarnessProcess(_ executable: URL, arguments: [String], timeout: TimeInterval = 10) throws -> CommandResult {
-    let child = Process(); let output = Pipe(); let error = Pipe()
+/// A pipe whose two ends are close-on-exec, so only the child it is given to holds its write
+/// end. Without that, an agent another test spawns at the same moment inherits the write end
+/// and keeps it open for its whole life, and this side sees no end of output until then.
+/// (`Process` puts the write end on the child's descriptor 1 or 2, which is not close-on-exec.)
+func harnessPipe() -> Pipe {
+    let pipe = Pipe()
+    for descriptor in [pipe.fileHandleForReading.fileDescriptor, pipe.fileHandleForWriting.fileDescriptor] {
+        _ = fcntl(descriptor, F_SETFD, fcntl(descriptor, F_GETFD) | FD_CLOEXEC)
+    }
+    return pipe
+}
+
+/// Reads both output streams of a child to their end, each on a thread of its own: a full
+/// parallel run can occupy every thread of the global dispatch queues, and a reader waiting
+/// for one could then miss the drain limit although the child had long ended.
+final class HarnessReaders: @unchecked Sendable {
+    private let lock = NSLock()
+    private var out = Data(), err = Data(), started = 0
+    private let done = DispatchGroup()
+    init(output: Pipe, error: Pipe) {
+        for (pipe, isOutput) in [(output, true), (error, false)] {
+            done.enter()
+            Thread.detachNewThread { [self] in
+                lock.lock(); started += 1; lock.unlock()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                lock.lock(); if isOutput { out = data } else { err = data }; lock.unlock()
+                done.leave()
+            }
+        }
+    }
+    /// Waits for both streams to end. The limit only keeps a stuck run from hanging.
+    func finish(limit: TimeInterval, command: String) -> (output: Data, error: Data)? {
+        guard done.wait(timeout: .now() + limit) == .success else {
+            lock.lock(); let count = started; lock.unlock()
+            harnessNote("\(command): output still open \(Int(limit)) s after the child ended; readers started: \(count) of 2")
+            return nil
+        }
+        lock.lock(); defer { lock.unlock() }
+        return (out, err)
+    }
+}
+
+func runHarnessProcess(_ executable: URL, arguments: [String], timeout: TimeInterval = 30) throws -> CommandResult {
+    let child = Process(); let output = harnessPipe(); let error = harnessPipe()
     child.executableURL = executable
     child.arguments = arguments
     child.standardOutput = output; child.standardError = error
     try child.run()
-    // Drain both streams concurrently so larger future history replies cannot fill a pipe.
-    let group = DispatchGroup()
-    let buffers = HarnessBuffers()
-    group.enter()
-    DispatchQueue.global().async { buffers.setOutput(output.fileHandleForReading.readDataToEndOfFile()); group.leave() }
-    group.enter()
-    DispatchQueue.global().async { buffers.setError(error.fileHandleForReading.readDataToEndOfFile()); group.leave() }
+    // Both streams are drained at once, so a large reply cannot fill a pipe.
+    let readers = HarnessReaders(output: output, error: error)
     let end = waitForEnd(of: child, limit: timeout)
     if end == .stillRunning { kill(child.processIdentifier, SIGKILL); _ = waitForEnd(of: child, limit: 5) }
     // Both pipes close once the child has gone.
-    let drained = group.wait(timeout: .now() + 10) == .success
+    let drained = readers.finish(limit: 30, command: commandName(arguments))
     guard case .ended(let status) = end else { throw HarnessError.commandTimedOut }
-    guard drained else { throw HarnessError.outputNotClosed }
+    guard let drained else { throw HarnessError.outputNotClosed }
     guard let status else { throw HarnessError.exitStatusLost }
-    return CommandResult(code: status, output: buffers.output, error: buffers.error, command: commandName(arguments))
-}
-private final class HarnessBuffers: @unchecked Sendable {
-    private let lock = NSLock()
-    private var out = Data(); private var err = Data()
-    var output: Data { lock.lock(); defer { lock.unlock() }; return out }
-    var error: Data { lock.lock(); defer { lock.unlock() }; return err }
-    func setOutput(_ value: Data) { lock.lock(); out = value; lock.unlock() }
-    func setError(_ value: Data) { lock.lock(); err = value; lock.unlock() }
+    return CommandResult(code: status, output: drained.output, error: drained.error, command: commandName(arguments))
 }
