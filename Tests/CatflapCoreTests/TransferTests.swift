@@ -159,6 +159,17 @@ func transferInput(id: String = "sample", name: String = "sample.bin", kind: Str
         let rows = try await f.service.history.rows()
         #expect(rows.count == 1 && rows.first?.direction == "sent" && rows.first?.status == "unconfirmed" && rows.first?.text == "mine")
     }
+    @Test func testSendCutShortByARestartIsUnconfirmed() async throws {
+        let f = try TransferFixture(); defer { f.cleanup() }
+        // What a restart finds when the agent stopped during a send: the row as `start` saved it.
+        var cut = TransferRecord(id: "cut", deviceID: "peer", direction: "sent", kind: "text", size: 4, status: "sending")
+        cut.text = "text"
+        try await f.service.history.save(cut)
+        try await f.service.reconcile()
+        // This device no longer knows how far the send got, so it does not claim it failed.
+        let row = try #require(try await f.service.history.record(deviceID: "peer", id: "cut"))
+        #expect(row.status == "unconfirmed" && row.canRetry && row.text == "text")
+    }
     @Test func testUnknownDeviceIsRefusedWithoutAHistoryRow() async throws {
         let f = try TransferFixture(); defer { f.cleanup() }
         await #expect(throws: TransferFailure.self) { _ = try await f.service.start(deviceID: "nobody", payload: .text("x")) }

@@ -36,11 +36,19 @@ struct Send: AsyncParsableCommand, AgentFeature {
             try await Task.sleep(for: .milliseconds(200))
             row = try await request(.init("send.status", arguments: ["device_id": device, "id": row.id])).decode(TransferRecord.self)
         }
-        print(try ControlJSON.text(row))
-        if row.status != "ok" {
-            if !options.json { FileHandle.standardError.write(Data(((row.error ?? "Not sent.") + "\n").utf8)) }
-            throw ExitCode.failure
-        }
+        if row.status == "ok" { print(try ControlJSON.text(row)); return }
+        // The send did not end well. A row read back from the store carries no reason, so one
+        // is supplied here. With --json the reason and the row are one object, in the shape
+        // every other failure has; without it the row is printed and the reason follows on
+        // standard error.
+        let reason: String
+        if let said = row.error { reason = said }
+        else if row.status == "unconfirmed" { reason = "Not confirmed. The other device may have it; Retry will not send a second copy." }
+        else if row.status == "sending" { reason = "Still sending after an hour. `catflap history` shows how it ends." }
+        else { reason = "Not sent." }
+        if options.json { print(try ControlJSON.text(SendFailureOutput(error: reason, transfer: row))) }
+        else { print(try ControlJSON.text(row)); FileHandle.standardError.write(Data((reason + "\n").utf8)) }
+        throw ExitCode.failure
     }
     /// One control request. A refusal, or an agent that cannot be reached, ends the command
     /// with the reason: JSON on standard output with `--json`, a line on standard error without.
@@ -56,4 +64,12 @@ struct Send: AsyncParsableCommand, AgentFeature {
         else { FileHandle.standardError.write(Data((message + "\n").utf8)) }
         throw ExitCode(code)
     }
+}
+
+/// A send that started and did not end well: the reason, and the row, which holds the id to
+/// retry with.
+private struct SendFailureOutput: Encodable {
+    let ok = false
+    let error: String
+    let transfer: TransferRecord
 }

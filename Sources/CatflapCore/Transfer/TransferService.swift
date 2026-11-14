@@ -106,6 +106,9 @@ public actor TransferService {
 
     public func reconcile() async throws {
         for var row in try await history.rows() {
+            // A send this device was in the middle of when it stopped. How far it got is not
+            // recorded, so the other device may have the item: unconfirmed, not failed. Retry
+            // settles it, because the other device answers `duplicate` for an id it stored.
             if row.direction == "sent" && row.status == "sending" { row.status = "unconfirmed"; try await history.save(row) }
             guard row.direction == "received", row.status == "receiving" else { continue }
             // Only a file can be found finished on disk. A text is stored with its row in one
@@ -260,7 +263,8 @@ public actor TransferService {
         defer { sending.remove(key) }
         var session: PeerSession?
         // Until `done` is on its way the other device cannot have stored the item, so a failure
-        // before that is certain. After it, only the acknowledgement tells.
+        // before that is certain. From the moment it is handed to the connection, only the
+        // acknowledgement tells: a write that fails may still have delivered the frame.
         var doneSent = false
         do {
             guard let peers else { throw TransferFailure.invalid }
