@@ -141,6 +141,10 @@ private struct PasteboardSnapshot {
     }
 }
 
+// This suite and MacActionsE2E both use the general pasteboard, and the agents of each watch
+// it, so a copy made by one would land in the other's history. Both run inside MacPanelE2E,
+// whose `.serialized` covers nested suites, and never beside each other.
+extension MacPanelE2E {
 @Suite(.serialized)
 @MainActor
 struct MacClipboardE2E {
@@ -230,5 +234,6 @@ struct MacClipboardE2E {
             #expect(!items.contains { $0.text == text })
         }
     }
+}
 }
 #endif
