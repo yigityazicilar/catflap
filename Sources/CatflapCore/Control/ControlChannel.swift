@@ -29,6 +29,10 @@ public struct ControlResponse: Codable, Sendable {
     public init(error: AgentError, exitCode: Int32 = 1) {
         ok = false; payload = Data("null".utf8); self.error = error.rawValue; self.exitCode = exitCode
     }
+    /// A refusal with its own sentence for the person, when none of the general errors says it.
+    public init(failure message: String, exitCode: Int32 = 1) {
+        ok = false; payload = Data("null".utf8); error = message; self.exitCode = exitCode
+    }
     public func decode<T: Decodable>(_ type: T.Type) throws -> T { try ControlJSON.decoder.decode(type, from: payload) }
 }
 
