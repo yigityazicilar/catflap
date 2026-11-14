@@ -13,8 +13,9 @@ public enum SecretFilter {
         passwordManagerFrontmost || offeredTypes.contains { markers.contains($0) }
     }
     /// Known shapes, compiled once. `String.range(of:options:)` compiles its pattern again on
-    /// every call, which is eight compilations for every copy. NSRegularExpression objects are
-    /// immutable and safe to share between threads, as Apple's documentation says.
+    /// every call: on a macOS CI runner that made 4 MiB of prose take 17 s against 0.15 s
+    /// compiled. NSRegularExpression objects are immutable and safe to share between threads,
+    /// as Apple's documentation says.
     nonisolated(unsafe) private static let shapes: [NSRegularExpression] = [
         // PEM blocks, and the PGP armour, whose header ends in "KEY BLOCK".
         #"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE"# + #" KEY(?: BLOCK)?-----"#,
@@ -33,17 +34,8 @@ public enum SecretFilter {
     }
     /// Whether one of the known shapes is in the text.
     static func matchesShape(_ content: String) -> Bool {
-        #if canImport(Darwin)
-        // One contiguous UTF-16 copy, which the regex engine reads in place. Given a native
-        // Swift string, it reads through the bridge to it for every pattern.
-        let units = Array(content.utf16)
-        let text = NSString(characters: units, length: units.count) as String
-        let range = NSRange(location: 0, length: units.count)
-        #else
-        let text = content
         let range = NSRange(location: 0, length: content.utf16.count)
-        #endif
-        return shapes.contains { $0.firstMatch(in: text, range: range) != nil }
+        return shapes.contains { $0.firstMatch(in: content, range: range) != nil }
     }
     public static func rejects(_ content: String) -> Bool {
         if matchesShape(content) || containsJWT(content) { return true }
