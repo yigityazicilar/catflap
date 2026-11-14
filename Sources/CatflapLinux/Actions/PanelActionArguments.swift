@@ -75,7 +75,8 @@ enum PanelActionArguments {
             }
             return await result(action, panel) { panel.sender.retry(deviceID: device, id: id) }
         case "remove":
-            guard let device = await panel.loop.perform({ resolve(arguments["device"], panel) }) else {
+            let paired = await pairedDevices(panel)
+            guard let device = await panel.loop.perform({ resolve(arguments["device"], panel, paired: paired) }) else {
                 return ControlResponse(failure: "No paired device has that id or name.")
             }
             let outcome = await withCheckedContinuation { (done: CheckedContinuation<Result<Void, SendRefusal>, Never>) in
@@ -138,9 +139,12 @@ enum PanelActionArguments {
             }
         }
         let request = arguments
+        // The agent's own list, as it is now: the panel's copy follows the store a moment
+        // later, so a send right after pairing would find no device in it.
+        let paired = await pairedDevices(panel)
         let outcome = await withCheckedContinuation { (done: CheckedContinuation<Result<[TransferRecord], SendRefusal>, Never>) in
             GLib.idle {
-                guard let device = resolve(request["device"] ?? request["device_id"], panel) else {
+                guard let device = resolve(request["device"] ?? request["device_id"], panel, paired: paired) else {
                     done.resume(returning: .failure(SendRefusal(message: "No paired device. Pair one first.")))
                     return
                 }
@@ -198,9 +202,27 @@ enum PanelActionArguments {
 
     // MARK: Rows and devices, on the GTK thread
 
-    private static func resolve(_ text: String?, _ panel: PanelController) -> PanelDevice? {
-        guard let text else { return panel.view.selectedDevice ?? panel.settingsPage.firstDevice }
-        return panel.settingsPage.device(text)
+    /// The paired devices as the agent lists them, most recently used first; nil when the
+    /// agent could not be asked, and then the panel's own list is used.
+    private static func pairedDevices(_ panel: PanelController) async -> [PanelDevice]? {
+        await PanelController.request([DeviceSummary].self, "devices", panel.runtime)?.map { PanelDevice(id: $0.id, name: $0.name) }
+    }
+
+    /// The device a `ui invoke` action names: by id, or by a name only one device has; with
+    /// none named, the device selected in the panel if it is still paired, else the most
+    /// recently used one. Called on the GTK thread.
+    private static func resolve(_ text: String?, _ panel: PanelController, paired: [PanelDevice]?) -> PanelDevice? {
+        guard let devices = paired else {
+            guard let text else { return panel.view.selectedDevice ?? panel.settingsPage.firstDevice }
+            return panel.settingsPage.device(text)
+        }
+        guard let text else {
+            if let selected = panel.view.selectedDevice, devices.contains(selected) { return selected }
+            return devices.first
+        }
+        if let device = devices.first(where: { $0.id == text }) { return device }
+        let named = devices.filter { $0.name == text }
+        return named.count == 1 ? named[0] : nil
     }
 
     private static func clipboardRow(_ id: String?, _ panel: PanelController) -> PanelRow? {
