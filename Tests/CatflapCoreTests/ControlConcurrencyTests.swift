@@ -54,13 +54,15 @@ extension ControlTests {
         var silent: [Int32] = []
         defer { silent.forEach { close($0) } }
         silent.append(try rawControlConnection(paths.socket))
+        // A reply that waited for the silent connection would take the 5 s after which the
+        // server closes it. The limits below sit between that and a busy test machine.
         let start = ContinuousClock.now
         let response = try await ControlClient.requestAsync(.init("status"), socket: paths.socket)
-        #expect(start.duration(to: .now) < .seconds(1))
+        #expect(start.duration(to: .now) < .seconds(3))
         #expect(response.ok)
         #expect(try response.decode(AgentStatus.self).running)
         // Wait for the completed status worker to release its slot before filling the limit.
-        let released = ContinuousClock.now.advanced(by: .seconds(1))
+        let released = ContinuousClock.now.advanced(by: .seconds(5))
         while server.activeConnections != 1 && ContinuousClock.now < released {
             try await Task.sleep(for: .milliseconds(1))
         }
@@ -70,7 +72,7 @@ extension ControlTests {
         let extra = try rawControlConnection(paths.socket)
         defer { close(extra) }
         let rejected = try onControlProbeThread {
-            var timeout = timeval(tv_sec: 1, tv_usec: 0)
+            var timeout = timeval(tv_sec: 3, tv_usec: 0)
             _ = setsockopt(extra, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
             var byte: UInt8 = 0
             return recv(extra, &byte, 1, 0) == 0
@@ -78,7 +80,7 @@ extension ControlTests {
         #expect(rejected)
         let shutdownStart = ContinuousClock.now
         server.stop(); await task.value
-        #expect(shutdownStart.duration(to: .now) < .seconds(1))
+        #expect(shutdownStart.duration(to: .now) < .seconds(3))
         await runtime.stop()
     }
     @Test func testSlowHandlerDoesNotDelayOthers() async throws {
@@ -88,21 +90,24 @@ extension ControlTests {
         defer { server.stop() }
         let runtime = try AgentRuntime(paths: paths)
         try await runtime.start()
+        // The slow request stays open until the test lets it go, so a status reply that
+        // arrives first did not wait for it, however busy the machine is.
         let (entered, continuation) = AsyncStream<Void>.makeStream()
+        let (letGo, release) = AsyncStream<Void>.makeStream()
+        defer { release.finish() }
         await runtime.register("slow") { _ in
             continuation.yield(())
-            try await Task.sleep(for: .seconds(2))
+            for await _ in letGo { break }
             return try ControlResponse(value: "slow reply")
         }
         let task = Task { await server.run { await runtime.handle($0) } }
         let slow = Task { try await ControlClient.requestAsync(.init("slow"), socket: paths.socket) }
         var iterator = entered.makeAsyncIterator()
         _ = await iterator.next()
-        let start = ContinuousClock.now
         let status = try await ControlClient.requestAsync(.init("status"), socket: paths.socket)
-        #expect(start.duration(to: .now) < .seconds(1))
         #expect(status.ok)
         #expect(try status.decode(AgentStatus.self).running)
+        release.yield(())
         let reply = try await slow.value
         #expect(reply.ok)
         #expect(try reply.decode(String.self) == "slow reply")

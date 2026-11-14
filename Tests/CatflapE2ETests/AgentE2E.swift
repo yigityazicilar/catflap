@@ -27,11 +27,10 @@ struct AgentE2E {
         let secondError = Pipe()
         secondAgent.standardOutput = FileHandle.nullDevice; secondAgent.standardError = secondError
         try secondAgent.run()
-        let deadline = Date().addingTimeInterval(5)
-        while secondAgent.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
-        if secondAgent.isRunning { secondAgent.terminate() }
-        secondAgent.waitUntilExit()
-        #expect(secondAgent.terminationStatus == 1)
+        var end = waitForEnd(of: secondAgent, limit: 5)
+        if end == .stillRunning { secondAgent.terminate(); end = waitForEnd(of: secondAgent, limit: 5) }
+        if end == .stillRunning { kill(secondAgent.processIdentifier, SIGKILL); end = waitForEnd(of: secondAgent, limit: 5) }
+        #expect(end == .ended(status: 1))
         let message = String(decoding: secondError.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         #expect(message == "An agent is already running for this data directory.\n")
         #expect(!message.contains("Usage:"))

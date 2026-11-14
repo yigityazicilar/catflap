@@ -35,7 +35,8 @@ jobs:
           pkg-config --modversion sqlite3 gtk4 libadwaita-1 gtk4-layer-shell-0 wayland-client
       - run: scripts/build-libtailcat.sh
       - run: swift build
-      - run: swift test
+      - name: Run tests
+        run: scripts/ci-test.py
       - name: Check loaded ABI
         run: swift run catflap version | tee build/version.txt && grep -Fx 'tailcat-abi 1' build/version.txt
   macos:
@@ -57,6 +58,7 @@ jobs:
           xcodebuild -version
       - run: scripts/build-libtailcat.sh
       - run: swift build
-      - run: swift test
+      - name: Run tests
+        run: scripts/ci-test.py
       - name: Check loaded ABI
         run: swift run catflap version | tee build/version.txt && grep -Fx 'tailcat-abi 1' build/version.txt

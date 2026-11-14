@@ -10,12 +10,63 @@ import Darwin
 private final class HarnessBundleMarker: NSObject {}
 #endif
 
-enum HarnessError: Error { case executableMissing, startupFailed, commandTimedOut }
+enum HarnessError: Error { case executableMissing, startupFailed, commandTimedOut, exitStatusLost, outputNotClosed }
 struct CommandResult {
     let code: Int32
     let output: Data
     let error: Data
     func decode<T: Decodable>(_ type: T.Type) throws -> T { try ControlJSON.decoder.decode(type, from: output) }
+}
+
+func harnessNote(_ text: String) { FileHandle.standardError.write(Data(("harness: " + text + "\n").utf8)) }
+
+/// Whether a child of the test process has ended. The exit status is nil when it could not be read.
+enum ChildEnd: Equatable { case stillRunning, ended(status: Int32?) }
+
+/// What the system says about a child, leaving its exit status in place for Foundation.
+/// `collected` means the status has already been taken, so the child is fully gone.
+private func systemView(of pid: pid_t) -> (ended: Bool, collected: Bool) {
+    var info = siginfo_t()
+    guard waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT) == 0 else { return (errno == ECHILD, true) }
+    #if os(Linux)
+    let reported = info._sifields._sigchld.si_pid
+    #else
+    let reported = info.si_pid
+    #endif
+    return (reported == pid, false)
+}
+
+/// Waits for a child to end, for at most `limit` seconds.
+///
+/// `Process.waitUntilExit()` is not used anywhere in the tests. On the macOS test machines it
+/// was seen waiting without end, in `AgentHarness.stop()`, for an agent that was no longer in
+/// the process table. Why that wait was never woken is not known, and neither is what
+/// `isRunning` said at the time. So every wait has a limit, and the system is asked too: a
+/// child it has reported as ended for a full second counts as ended, and the disagreement is
+/// written to standard error so the next occurrence leaves facts behind.
+func waitForEnd(of child: Process, limit: TimeInterval) -> ChildEnd {
+    let pid = child.processIdentifier
+    let start = ContinuousClock.now
+    var endedSince: ContinuousClock.Instant?
+    while true {
+        if !child.isRunning { return .ended(status: child.terminationStatus) }
+        let system = systemView(of: pid)
+        if system.ended {
+            let since = endedSince ?? .now
+            endedSince = since
+            if since.duration(to: .now) > .seconds(1) {
+                var status: Int32?
+                var raw: Int32 = 0
+                if !system.collected, waitpid(pid, &raw, WNOHANG) == pid { status = raw & 0x7f == 0 ? (raw >> 8) & 0xff : raw & 0x7f }
+                harnessNote("child \(pid) has ended (exit status \(system.collected ? "already collected" : "not yet collected")), but Foundation still reports it running a second later")
+                return .ended(status: status)
+            }
+        } else {
+            endedSince = nil
+        }
+        if start.duration(to: .now) >= .seconds(limit) { return .stillRunning }
+        Thread.sleep(forTimeInterval: 0.02)
+    }
 }
 
 /// Real subprocess harness shared by agent, pairing, transfer and clipboard scenarios.
@@ -66,11 +117,13 @@ final class AgentHarness {
     }
     func stop() {
         guard let child = process else { return }
-        if child.isRunning { child.terminate() }
-        let deadline = Date().addingTimeInterval(7)
-        while child.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
-        if child.isRunning { kill(child.processIdentifier, SIGKILL) }
-        child.waitUntilExit(); process = nil
+        process = nil
+        let pid = child.processIdentifier
+        if child.isRunning && !systemView(of: pid).ended { child.terminate() }
+        if waitForEnd(of: child, limit: 7) != .stillRunning { return }
+        harnessNote("agent \(pid) did not end within 7 s of SIGTERM; sending SIGKILL")
+        kill(pid, SIGKILL)
+        if waitForEnd(of: child, limit: 5) == .stillRunning { harnessNote("agent \(pid) is still running 5 s after SIGKILL") }
     }
     func restart() throws { stop(); try start() }
     func command(_ arguments: [String], timeout: TimeInterval = 10) throws -> CommandResult {
@@ -91,11 +144,14 @@ func runHarnessProcess(_ executable: URL, arguments: [String], timeout: TimeInte
     DispatchQueue.global().async { buffers.setOutput(output.fileHandleForReading.readDataToEndOfFile()); group.leave() }
     group.enter()
     DispatchQueue.global().async { buffers.setError(error.fileHandleForReading.readDataToEndOfFile()); group.leave() }
-    let deadline = Date().addingTimeInterval(timeout)
-    while child.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
-    if child.isRunning { kill(child.processIdentifier, SIGKILL); child.waitUntilExit(); group.wait(); throw HarnessError.commandTimedOut }
-    child.waitUntilExit(); group.wait()
-    return CommandResult(code: child.terminationStatus, output: buffers.output, error: buffers.error)
+    let end = waitForEnd(of: child, limit: timeout)
+    if end == .stillRunning { kill(child.processIdentifier, SIGKILL); _ = waitForEnd(of: child, limit: 5) }
+    // Both pipes close once the child has gone.
+    let drained = group.wait(timeout: .now() + 10) == .success
+    guard case .ended(let status) = end else { throw HarnessError.commandTimedOut }
+    guard drained else { throw HarnessError.outputNotClosed }
+    guard let status else { throw HarnessError.exitStatusLost }
+    return CommandResult(code: status, output: buffers.output, error: buffers.error)
 }
 private final class HarnessBuffers: @unchecked Sendable {
     private let lock = NSLock()
