@@ -35,7 +35,8 @@ public enum ClipboardFailure: String, Error, LocalizedError {
     case noPending = "No filtered item is available to Keep."
     case invalid = "Invalid clipboard content."
     // What `clip send --latest` says when it sends nothing.
-    case latestEmpty = "Clipboard history is empty."
+    case latestEmpty = "Nothing has been copied since Catflap started."
+    case latestReading = "The last copy is still being read. Try again in a moment."
     case latestPaused = "Clipboard history is paused, so there is no recorded copy to send."
     case latestCopiedWhilePaused = "The last copy was made while clipboard history was paused."
     case latestFiltered = "The last copy was skipped because it looks like a secret. Keep it in Catflap to send it."
@@ -54,8 +55,9 @@ public actor ClipboardHistory {
     public let store: Store
     private var paused: Bool
     /// What became of the newest copy this agent has seen, for `clip send --latest`. Nil
-    /// until a copy arrives after the agent starts.
-    private enum Latest { case stored(String), skipped(ClipboardFailure) }
+    /// until a copy arrives after the agent starts. `reading` while its outcome is not known
+    /// yet: its contents are being read, or have not arrived.
+    private enum Latest { case stored(String), skipped(ClipboardFailure), reading }
     private var latest: Latest?
     private var generation: UInt64 = 0
     private var pending: (id: String, content: ClipboardContent)?
@@ -74,6 +76,8 @@ public actor ClipboardHistory {
         generation &+= 1
         let ticket = generation
         pending = nil
+        // From here until its outcome is known, this copy is the newest one.
+        latest = .reading
         if SecretFilter.isMarked(offeredTypes: offeredTypes, passwordManagerFrontmost: passwordManagerFrontmost) {
             latest = .skipped(.latestMarked)
             return .init("marked")
@@ -139,23 +143,39 @@ public actor ClipboardHistory {
     }
     public func setPaused(_ value: Bool) async throws {
         try await store.setSetting("clipboard_paused", value: value ? "true" : "false")
+        guard value != paused else { return }
         paused = value; generation &+= 1; pending = nil
+        // A copy that was being read when history paused is not recorded.
+        if value, case .reading = latest { latest = .skipped(.latestCopiedWhilePaused) }
+    }
+    /// A capture adapter calls this when it sees a new copy whose contents have not arrived
+    /// yet, and then ingests it, or ingests nothing for it, which settles it. Until then
+    /// `latestItem` waits for it instead of returning the copy before it, and that copy's
+    /// Keep is gone, as for any new copy.
+    public func noteChange() {
+        generation &+= 1; pending = nil
+        latest = paused ? .skipped(.latestCopiedWhilePaused) : .reading
     }
     public func isPaused() -> Bool { paused }
     /// The item `clip send --latest` sends: the newest copy, and only if history recorded it.
     /// A copy that was skipped, made while paused, or deleted since is refused with the reason,
-    /// so the send-clipboard shortcut never sends an older item in its place. Until a copy
-    /// arrives in this agent's lifetime, the newest stored item stands in.
-    public func latestItem() async throws -> ClipboardItem {
+    /// so the send-clipboard shortcut never sends an older item in its place. A copy whose
+    /// outcome is not known yet is waited for, up to `wait`. After a start the agent does not
+    /// know what the clipboard holds, so until a copy arrives it sends nothing.
+    public func latestItem(wait: Duration = .seconds(5)) async throws -> ClipboardItem {
+        let deadline = ContinuousClock.now.advanced(by: wait)
+        while !paused, case .reading = latest {
+            guard ContinuousClock.now < deadline else { throw ClipboardFailure.latestReading }
+            try await Task.sleep(for: .milliseconds(10))
+        }
         if paused { throw ClipboardFailure.latestPaused }
         switch latest {
+        case .reading: throw ClipboardFailure.latestReading
         case .skipped(let reason): throw reason
         case .stored(let id):
             do { return try await item(id: id) }
             catch ClipboardFailure.missing { throw ClipboardFailure.latestDeleted }
-        case nil:
-            guard let newest = try await items().first else { throw ClipboardFailure.latestEmpty }
-            return newest
+        case nil: throw ClipboardFailure.latestEmpty
         }
     }
     public func delete(id: String) async throws {
