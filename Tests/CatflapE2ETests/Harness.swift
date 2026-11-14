@@ -16,7 +16,34 @@ struct CommandResult {
     let code: Int32
     let output: Data
     let error: Data
-    func decode<T: Decodable>(_ type: T.Type) throws -> T { try ControlJSON.decoder.decode(type, from: output) }
+    /// The subcommand's name only (`clip send`), never its arguments: a pairing code is one.
+    var command = ""
+    func decode<T: Decodable>(_ type: T.Type) throws -> T {
+        do { return try ControlJSON.decoder.decode(type, from: output) }
+        catch { throw CommandOutputError(command: command, code: code, output: output.count, error: error, standardError: self.error) }
+    }
+}
+
+/// A command whose output was not what the test expected, with what is needed to see why: the
+/// exit status and standard error. Catflap never prints an address or key there.
+struct CommandOutputError: Error, CustomStringConvertible {
+    let command: String
+    let code: Int32
+    let output: Int
+    let error: any Error
+    let standardError: Data
+    var description: String {
+        let said = String(decoding: standardError.prefix(1200), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return "`catflap \(command)` exited with status \(code) and printed \(output) bytes on standard output; "
+            + "standard error: \(said.isEmpty ? "(empty)" : said); decoding: \(error)"
+    }
+}
+
+/// The leading words of a command line, while they are short plain words.
+private func commandName(_ arguments: [String]) -> String {
+    arguments.prefix { word in
+        !word.hasPrefix("-") && word.count <= 16 && word.allSatisfy { $0.isLetter || $0 == "." }
+    }.joined(separator: " ")
 }
 
 func harnessNote(_ text: String) { FileHandle.standardError.write(Data(("harness: " + text + "\n").utf8)) }
@@ -163,7 +190,7 @@ func runHarnessProcess(_ executable: URL, arguments: [String], timeout: TimeInte
     guard case .ended(let status) = end else { throw HarnessError.commandTimedOut }
     guard drained else { throw HarnessError.outputNotClosed }
     guard let status else { throw HarnessError.exitStatusLost }
-    return CommandResult(code: status, output: buffers.output, error: buffers.error)
+    return CommandResult(code: status, output: buffers.output, error: buffers.error, command: commandName(arguments))
 }
 private final class HarnessBuffers: @unchecked Sendable {
     private let lock = NSLock()
