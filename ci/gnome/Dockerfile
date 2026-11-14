@@ -1,5 +1,7 @@
 FROM archlinux:latest
-RUN pacman -Syu --noconfirm --needed gnome-shell mutter dbus gjs glib2 gtk4 libadwaita gtk4-layer-shell wayland-utils wl-clipboard python python-gobject jq git go clang pkgconf sqlite libxml2 libedit ncurses curl gcc-libs \
+# Move this date only together with the tested Shell version and metadata.
+RUN printf 'Server = https://archive.archlinux.org/repos/2026/11/14/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist
+RUN pacman --disable-download-timeout -Syyuu --noconfirm --needed gnome-shell mutter dbus gjs glib2 gtk4 libadwaita gtk4-layer-shell wayland-utils wl-clipboard python python-gobject jq git go clang pkgconf sqlite libxml2 libedit ncurses curl gcc-libs \
  && pacman -Scc --noconfirm
 # Download to a file first: a connection reset in the middle of `curl | tar` cannot be retried.
 RUN mkdir -p /opt/swift \

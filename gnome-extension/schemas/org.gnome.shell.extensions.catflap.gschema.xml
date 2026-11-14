@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.catflap" path="/org/gnome/shell/extensions/catflap/">
+    <key name="catflap-toggle" type="as">
+      <default>['&lt;Control&gt;&lt;Alt&gt;space']</default>
+      <summary>Open or close the Catflap panel</summary>
+    </key>
+    <key name="catflap-send-latest" type="as">
+      <default>['&lt;Control&gt;&lt;Alt&gt;&lt;Shift&gt;space']</default>
+      <summary>Send the latest recorded clipboard item</summary>
+    </key>
+  </schema>
+</schemalist>

@@ -8,6 +8,7 @@ public struct AgentStatus: Codable, Sendable {
     public var serverRunning: Bool
     public var pairedDevices: Int
     public var desktop: String = "unsupported"
+    public var extensionState: String? = nil
     /// `active`, `unsupported` (the desktop offers no way to watch the clipboard), `off` (the
     /// agent runs without its platform module) or `failed`. See `PlatformStatus`.
     public var clipboardCapture: String = "unsupported"
@@ -15,6 +16,7 @@ public struct AgentStatus: Codable, Sendable {
     public var pasteboardAccess: String? = nil
     enum CodingKeys: String, CodingKey {
         case running, build, desktop
+        case extensionState = "extension"
         case deviceID = "device_id", schemaVersion = "schema_version"
         case serverRunning = "server_running", pairedDevices = "paired_devices"
         case clipboardCapture = "clipboard_capture", pasteboardAccess = "pasteboard_access"
@@ -26,6 +28,7 @@ public struct PlatformStatus: Sendable, Equatable {
     public var desktop: String
     public var clipboardCapture: String
     public var pasteboardAccess: String?
+    public var extensionState: String? = nil
     public init(desktop: String = "unsupported", clipboardCapture: String = "unsupported", pasteboardAccess: String? = nil) {
         self.desktop = desktop; self.clipboardCapture = clipboardCapture; self.pasteboardAccess = pasteboardAccess
     }
@@ -85,6 +88,7 @@ public actor AgentRuntime {
                 var status = AgentStatus(deviceID: await identityServer.identity.id,
                     serverRunning: await identityServer.isRunning, pairedDevices: devices.count)
                 status.desktop = platform.desktop
+                status.extensionState = platform.extensionState
                 status.clipboardCapture = platform.clipboardCapture
                 status.pasteboardAccess = platform.pasteboardAccess
                 return try ControlResponse(value: status)

@@ -8,14 +8,16 @@ if [ "$(id -u)" = 0 ]; then
   chown -R "$uid:$gid" /repo/.build /repo/build /run/gnome-home /run/gnome-test
   exec setpriv --reuid="$uid" --regid="$gid" --clear-groups env HOME=/run/gnome-home "$0" "$@"
 fi
-mkdir -p "$XDG_RUNTIME_DIR" "$HOME/.local/share/gnome-shell/extensions/catflap-probe@localhost"
+export XDG_DATA_HOME="$HOME/.local/share" XDG_CONFIG_HOME="$HOME/.config"
+mkdir -p "$XDG_RUNTIME_DIR" "$XDG_DATA_HOME/gnome-shell/extensions/catflap@yigityazicilar.github.io" "$XDG_DATA_HOME/gnome-shell/extensions/catflap-test@yigityazicilar.github.io" "$XDG_CONFIG_HOME"
 chmod 700 "$XDG_RUNTIME_DIR"
-cp /repo/spikes/gnome/extension/* "$HOME/.local/share/gnome-shell/extensions/catflap-probe@localhost/"
+python /repo/packaging/linux/extension.py --source /repo/gnome-extension --output "$XDG_RUNTIME_DIR/extension-zip" --install "$XDG_DATA_HOME/gnome-shell/extensions"
+cp /repo/ci/gnome/helper/* "$XDG_DATA_HOME/gnome-shell/extensions/catflap-test@yigityazicilar.github.io/"
 export XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland
 export DBUS_SYSTEM_BUS_ADDRESS=$(dbus-daemon --session --fork --print-address=1 --nopidfile)
 exec dbus-run-session -- bash -c '
 set -u
-gsettings set org.gnome.shell enabled-extensions "[\"catflap-probe@localhost\"]"
+gsettings set org.gnome.shell enabled-extensions "[\"catflap-test@yigityazicilar.github.io\",\"catflap@yigityazicilar.github.io\"]"
 gsettings set org.gnome.shell disable-user-extensions false
 gsettings set org.gnome.shell welcome-dialog-last-shown-version "999"
 gnome-shell --headless --wayland --no-x11 --virtual-monitor 1280x720 >"$XDG_RUNTIME_DIR/shell.log" 2>&1 &
@@ -26,7 +28,7 @@ for i in $(seq 1 80); do
   kill -0 "$pid" || { cat "$XDG_RUNTIME_DIR/shell.log"; exit 70; }
   sleep .25
 done
-export WAYLAND_DISPLAY=wayland-0
+export WAYLAND_DISPLAY=wayland-0 CATFLAP_GNOME_TEST=1
 export GOCACHE=/repo/build/go-cache GOPATH=/repo/build/go
 sleep 4
 if [ "${1:-}" = swift ] && [ "${2:-}" != --version ]; then

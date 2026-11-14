@@ -55,6 +55,9 @@ if ((uninstall)); then
     rm -rf "$libdir"
     rm -f "$prefix/bin/catflap" "$prefix/share/applications/$app.desktop" "$autostart_file" "$service_menu"
     rm -f "$icons/$app.svg" "$icons/$app"-*-symbolic.svg
+    rm -rf "$data_home/gnome-shell/extensions/catflap@yigityazicilar.github.io" "$prefix/share/catflap"
+    # This subfolder belongs to Catflap; other Nautilus scripts are untouched.
+    rm -rf "$data_home/nautilus/scripts/Catflap"
     echo "Removed Catflap from $prefix. The data folder was left in place."
     exit 0
 fi
@@ -106,6 +109,15 @@ fi
 
 command -v update-desktop-database >/dev/null && update-desktop-database -q "$prefix/share/applications" 2>/dev/null || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t "$prefix/share/icons/hicolor" 2>/dev/null || true
+
+desktop="${XDG_CURRENT_DESKTOP:-}"
+case ":${desktop^^}:" in
+    *:GNOME:*)
+        python3 "$here/extension.py" --source "$root/gnome-extension" --output "$prefix/share/catflap" \
+            --install "$data_home/gnome-shell/extensions"
+        echo 'GNOME extension installed. Enable catflap@yigityazicilar.github.io in GNOME Extensions after logging in again.'
+        ;;
+esac
 
 echo "Installed Catflap in $prefix."
 "$prefix/bin/catflap" version

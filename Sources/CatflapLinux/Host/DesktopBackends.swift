@@ -16,7 +16,12 @@ struct DesktopBackends: @unchecked Sendable {
     /// the compositor offers it, else none, and the agent goes on without a panel. Another
     /// desktop adds its backend here.
     static func select() -> DesktopBackends? {
-        LayerShellHost.isSupported ? layerShell() : nil
+        if LayerShellHost.isSupported { return layerShell() }
+        guard let bridge = GnomeBridge.current, bridge.connected else { return nil }
+        return DesktopBackends(host: GnomeHost(bridge: bridge),
+                               shortcut: GnomeShortcut(bridge: bridge, action: "toggle"),
+                               sendShortcut: GnomeShortcut(bridge: bridge, action: "send-latest"),
+                               clipboard: GnomeClipboard(bridge: bridge))
     }
 }
 

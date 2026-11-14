@@ -14,18 +14,31 @@ import Foundation
 /// should stop the agent. `stop()` ends every thread and connection `start(on:)` opened.
 public actor Platform {
     private var clipboard: DataControlWatcher?
+    private var gnome: GnomeBridge?
     private var panel: Task<PanelController?, Never>?
 
     public static func start(on runtime: AgentRuntime) async throws -> Platform {
         let platform = Platform()
         await platform.install(on: runtime)
-        await platform.installPanel(on: runtime)
+        if await platform.gnome == nil { await platform.installPanel(on: runtime) }
         return platform
     }
 
     private func install(on runtime: AgentRuntime) async {
         guard let history = await runtime.service(ClipboardHistory.self) else {
             await runtime.updatePlatformStatus { $0.clipboardCapture = "failed" }
+            return
+        }
+        if ProcessInfo.processInfo.environment["XDG_CURRENT_DESKTOP"]?.uppercased().split(separator: ":").contains("GNOME") == true,
+           ProcessInfo.processInfo.environment["WAYLAND_DISPLAY"] != nil {
+            do {
+                let directory = await runtime.store.paths.directory
+                let bridge = try GnomeBridge(runtime: runtime, directory: directory, history: history) { [weak self] in
+                    await self?.sessionConnected(on: runtime)
+                }
+                gnome = bridge
+                await bridge.start()
+            } catch { await runtime.updatePlatformStatus { $0.extensionState = "missing"; $0.clipboardCapture = "failed" } }
             return
         }
         let watcher = DataControlWatcher(history: history, runtime: runtime)
@@ -41,6 +54,10 @@ public actor Platform {
         panel = Task { await PanelController.start(on: runtime) }
     }
 
+    private func sessionConnected(on runtime: AgentRuntime) {
+        if panel == nil { installPanel(on: runtime) }
+    }
+
     public func stop() async {
         let panel = self.panel
         self.panel = nil
@@ -48,6 +65,8 @@ public actor Platform {
             panel.cancel()
             await Self.value(of: panel, within: .seconds(2))?.stop()
         }
+        await gnome?.stop()
+        gnome = nil
         let watcher = clipboard
         clipboard = nil
         await watcher?.stop()

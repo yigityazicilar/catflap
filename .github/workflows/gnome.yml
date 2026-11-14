@@ -15,5 +15,5 @@ jobs:
         run: ci/gnome/run.sh gnome-shell --version
       - name: Swift version
         run: ci/gnome/run.sh swift --version
-      - name: Decision prototype
-        run: ci/gnome/run.sh spikes/gnome/check.sh
+      - name: GNOME integration
+        run: ci/gnome/run.sh swift test --filter GnomeE2E
