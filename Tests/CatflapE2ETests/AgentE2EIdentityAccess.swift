@@ -21,14 +21,6 @@ private struct IdentityProbeCommand {
     let error: Data
     let timedOut: Bool
 }
-private final class IdentityProbeOutput: @unchecked Sendable {
-    private let lock = NSLock()
-    private var stdout = Data()
-    private var stderr = Data()
-    func setOutput(_ data: Data) { lock.lock(); stdout = data; lock.unlock() }
-    func setError(_ data: Data) { lock.lock(); stderr = data; lock.unlock() }
-    func read() -> (Data, Data) { lock.lock(); defer { lock.unlock() }; return (stdout, stderr) }
-}
 /// Thread stacks of a process that ran past its limit, so that slow can be told from stuck.
 private func identityProbeStacks(of pid: pid_t) -> [String] {
     let file = FileManager.default.temporaryDirectory.appendingPathComponent("catflap-sample-" + UUID().uuidString + ".txt")
@@ -49,17 +41,12 @@ private func identityProbeStacks(of pid: pid_t) -> [String] {
 }
 private func identityProbeCommand(_ executable: URL, _ arguments: [String], timeout: TimeInterval, stacksOnTimeout: Bool = false) throws -> IdentityProbeCommand {
     let process = Process()
-    let stdout = Pipe(); let stderr = Pipe()
+    let stdout = harnessPipe(); let stderr = harnessPipe()
     process.executableURL = executable
     process.arguments = arguments
     process.standardOutput = stdout; process.standardError = stderr
     do { try process.run() } catch { throw IdentityProbeError.launchFailed }
-    let capture = IdentityProbeOutput()
-    let readers = DispatchGroup()
-    readers.enter()
-    DispatchQueue.global().async { capture.setOutput(stdout.fileHandleForReading.readDataToEndOfFile()); readers.leave() }
-    readers.enter()
-    DispatchQueue.global().async { capture.setError(stderr.fileHandleForReading.readDataToEndOfFile()); readers.leave() }
+    let readers = HarnessReaders(output: stdout, error: stderr)
     var end = waitForEnd(of: process, limit: timeout)
     let timedOut = end == .stillRunning
     if timedOut {
@@ -68,9 +55,8 @@ private func identityProbeCommand(_ executable: URL, _ arguments: [String], time
         }
         kill(process.processIdentifier, SIGKILL); end = waitForEnd(of: process, limit: 5)
     }
-    guard readers.wait(timeout: .now() + 10) == .success else { throw HarnessError.outputNotClosed }
+    guard let (output, error) = readers.finish(limit: 30, command: executable.lastPathComponent) else { throw HarnessError.outputNotClosed }
     guard case .ended(let status?) = end else { throw HarnessError.exitStatusLost }
-    let (output, error) = capture.read()
     return IdentityProbeCommand(code: status, output: output, error: error, timedOut: timedOut)
 }
 private func identityProbeSafeLine(_ line: String) -> String {
@@ -111,7 +97,7 @@ private func identityProbeFreshProcessReader(disableInteraction: Bool = false) t
         // and nothing showed whether it was slow or stuck. The limit only keeps a stuck reader
         // from holding the run, and a reader that reaches it prints where it was.
         result = try identityProbeCommand(URL(fileURLWithPath: "/usr/bin/python3"), ["-c", script], timeout: 30, stacksOnTimeout: true)
-    } catch { throw IdentityProbeError.python3LaunchFailed }
+    } catch IdentityProbeError.launchFailed { throw IdentityProbeError.python3LaunchFailed }
     if result.timedOut || result.code != 0 {
         print("fresh-process reader failed: exit=\(result.code); timed out=\(result.timedOut); first stderr=\(identityProbeLines(result.error).first ?? "<none>")")
     }
