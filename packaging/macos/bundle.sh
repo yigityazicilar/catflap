@@ -1,6 +1,7 @@
 #!/bin/bash
-# Builds build/Catflap.app: the catflap executable, libtailcat beside it, and an Info.plist
-# for an agent app with no Dock or app-switcher entry, signed under one fixed identifier.
+# Builds build/Catflap.app: the catflap executable, libtailcat beside it, an Info.plist for an
+# agent app with no Dock or app-switcher entry (and a Services item for Finder), and the
+# launch agent that starts it at login, signed under one fixed identifier.
 #
 #   packaging/macos/bundle.sh [--binary PATH] [--output DIR] [--configuration release|debug]
 #
@@ -49,10 +50,29 @@ cp "$library" "$app/Contents/Frameworks/libtailcat.dylib"
 for resources in "$(dirname "$binary")"/*.bundle; do
     if [[ -d "$resources" ]]; then cp -R "$resources" "$app/Contents/Resources/"; fi
 done
+# A development build finds libtailcat in the checkout through an absolute rpath, and the
+# toolchain may add its own. The app must not depend on either: drop every absolute rpath
+# outside the system, so libtailcat comes only from the bundle's Frameworks.
+executable="$app/Contents/MacOS/catflap"
+rpaths="$(otool -l "$executable" | awk '/cmd LC_RPATH/ { getline; getline; sub(/^ *path /, ""); sub(/ \(offset [0-9]+\)$/, ""); print }' | sort -u)"
+while IFS= read -r path; do
+    case "$path" in
+        /usr/lib/*|/System/*|"") ;;
+        # The linker can record one path twice; remove every copy.
+        /*) while [[ "$(otool -l "$executable")" == *"path $path (offset"* ]]; do
+                install_name_tool -delete_rpath "$path" "$executable"
+            done ;;
+    esac
+done <<< "$rpaths"
 # The library's install name is @rpath/libtailcat.dylib; find it inside the bundle.
-install_name_tool -add_rpath "@executable_path/../Frameworks" "$app/Contents/MacOS/catflap"
+install_name_tool -add_rpath "@executable_path/../Frameworks" "$executable"
 sed -e "s/@IDENTIFIER@/$identifier/" -e "s/@VERSION@/$version/" "$root/packaging/macos/Info.plist" > "$app/Contents/Info.plist"
 plutil -lint -s "$app/Contents/Info.plist"
+# Start at login: the launch agent SMAppService registers when the person switches it on.
+mkdir -p "$app/Contents/Library/LaunchAgents"
+agent="$app/Contents/Library/LaunchAgents/$identifier.agent.plist"
+sed -e "s/@IDENTIFIER@/$identifier/g" "$root/packaging/macos/$identifier.agent.plist" > "$agent"
+plutil -lint -s "$agent"
 
 identity="${CATFLAP_SIGN_IDENTITY:-}"
 if [[ -z "$identity" ]]; then
