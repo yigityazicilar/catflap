@@ -1,7 +1,8 @@
 import CatflapCore
 import Foundation
 
-/// The desktop side of the agent on Linux: clipboard capture (T7) and the panel (T10).
+/// The desktop side of the agent on Linux: clipboard capture (T7), and the panel with its actions,
+/// pairing, settings, notifications and tray item (T10, T12).
 ///
 /// The agent calls `start(on:)` once the core features are installed, the runtime is running
 /// and the control socket is bound, and `stop()` after the control socket is closed and
@@ -13,7 +14,7 @@ import Foundation
 /// should stop the agent. `stop()` ends every thread and connection `start(on:)` opened.
 public actor Platform {
     private var clipboard: DataControlWatcher?
-    private var panel: Task<PanelApp?, Never>?
+    private var panel: Task<PanelController?, Never>?
 
     public static func start(on runtime: AgentRuntime) async throws -> Platform {
         let platform = Platform()
@@ -37,7 +38,7 @@ public actor Platform {
     /// should answer meanwhile. Without a display or layer-shell the agent runs without a
     /// panel and `desktop` stays `unsupported`.
     private func installPanel(on runtime: AgentRuntime) {
-        panel = Task { await PanelApp.start(on: runtime) }
+        panel = Task { await PanelController.start(on: runtime) }
     }
 
     public func stop() async {
@@ -55,9 +56,9 @@ public actor Platform {
     /// The started panel, or nil if its start is still waiting after `limit`: GTK can sit in
     /// a D-Bus call while it starts, and the agent must stop within seconds. A start that
     /// finishes later sees the cancellation and closes what it opened.
-    private static func value(of start: Task<PanelApp?, Never>, within limit: Duration) async -> PanelApp? {
+    private static func value(of start: Task<PanelController?, Never>, within limit: Duration) async -> PanelController? {
         let once = Once()
-        return await withCheckedContinuation { (result: CheckedContinuation<PanelApp?, Never>) in
+        return await withCheckedContinuation { (result: CheckedContinuation<PanelController?, Never>) in
             Task {
                 let app = await start.value
                 if !once.claim() { await app?.stop(); return }
