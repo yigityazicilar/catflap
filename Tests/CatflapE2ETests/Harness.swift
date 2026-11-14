@@ -1,5 +1,6 @@
 import CatflapCore
 import Foundation
+import Testing
 #if os(Linux)
 import Glibc
 #else
@@ -19,6 +20,15 @@ struct CommandResult {
 }
 
 func harnessNote(_ text: String) { FileHandle.standardError.write(Data(("harness: " + text + "\n").utf8)) }
+
+/// Something the harness had to do that means the program under test is at fault. It is
+/// called from `defer` and `deinit` too, where no test can be failed, so the fault is written
+/// as a line starting `harness-error:`, and `scripts/ci-test.py` fails a run that prints one.
+/// Inside a test it is recorded against that test as well.
+func harnessError(_ text: String) {
+    FileHandle.standardError.write(Data(("harness-error: " + text + "\n").utf8))
+    if Test.current != nil { Issue.record(Comment(rawValue: text)) }
+}
 
 /// Whether a child of the test process has ended. The exit status is nil when it could not be read.
 enum ChildEnd: Equatable { case stillRunning, ended(status: Int32?) }
@@ -115,15 +125,17 @@ final class AgentHarness {
         }
         stop(); throw HarnessError.startupFailed
     }
+    /// Stops the agent. One that has to be killed has failed to stop, and that is reported
+    /// as a fault: a bounded wait must not let it pass for a clean stop.
     func stop() {
         guard let child = process else { return }
         process = nil
         let pid = child.processIdentifier
         if child.isRunning && !systemView(of: pid).ended { child.terminate() }
         if waitForEnd(of: child, limit: 7) != .stillRunning { return }
-        harnessNote("agent \(pid) did not end within 7 s of SIGTERM; sending SIGKILL")
+        harnessError("agent \(pid) did not end within 7 s of SIGTERM; sending SIGKILL")
         kill(pid, SIGKILL)
-        if waitForEnd(of: child, limit: 5) == .stillRunning { harnessNote("agent \(pid) is still running 5 s after SIGKILL") }
+        if waitForEnd(of: child, limit: 5) == .stillRunning { harnessError("agent \(pid) is still running 5 s after SIGKILL") }
     }
     func restart() throws { stop(); try start() }
     func command(_ arguments: [String], timeout: TimeInterval = 10) throws -> CommandResult {

@@ -6,7 +6,9 @@ run ends, so a run that stops making progress shows nothing until the job is can
 script gives swift test a terminal, so each line appears as it happens. Past the limit it
 lists the tests that started and did not finish, the processes of the run that are still
 alive and where their threads are, then ends them and fails. A run that leaves a process
-behind fails too.
+behind fails too, and so does one in which the test harness reports a fault of the program
+under test: a line starting "harness-error:", which the harness writes where it cannot fail a
+test itself.
 
   CATFLAP_TEST_LIMIT   seconds allowed for one run of the suite (default 600)
   CATFLAP_TEST_REPEAT  times to run the suite, stopping at the first failure (default 1)
@@ -35,6 +37,7 @@ TOOLING = {
 }
 STARTED = re.compile(r"^\S+ +Test (?!run started)(.+) started\.\s*$")
 ENDED = re.compile(r"^\S+ +Test (?!run with )(.+) (?:(?:passed|failed) after \d|skipped[.:])")
+FAULT = re.compile(r"harness-error: (.*?)\s*$")
 STACK_LINES = 1200
 
 
@@ -107,17 +110,22 @@ class Family:
 
 
 class Tests:
-    """Which tests have started and finished, read from the lines swift test prints."""
+    """Which tests have started and finished, and the faults the test harness reported,
+    read from the lines swift test prints."""
 
     def __init__(self):
         self.started = {}
         self.ended = {}
+        self.faults = []
 
     def read(self, line):
         for pattern, counts in ((STARTED, self.started), (ENDED, self.ended)):
             match = pattern.match(line)
             if match:
                 counts[match.group(1)] = counts.get(match.group(1), 0) + 1
+        fault = FAULT.search(line)
+        if fault:
+            self.faults.append(fault.group(1))
 
     def report(self):
         if not self.started:
@@ -247,6 +255,8 @@ def run_once(arguments, limit, scratch):
             if now >= deadline:
                 report(limit, tests, family, scratch)
                 return 124
+        if unread:
+            tests.read(unread.decode("utf-8", "replace"))
         left = {}
         for _ in range(6):  # a process that is on its way out is not left behind
             left = {pid: entry for pid, entry in family.alive().items() if entry[2] not in TOOLING}
@@ -257,6 +267,11 @@ def run_once(arguments, limit, scratch):
             say("\nerror: the tests left processes running:")
             for pid, (parent, start, program) in left.items():
                 say(f"  pid {pid}, parent {parent}, started {start}: {program}")
+        if tests.faults:
+            say("\nerror: the test harness reported a fault of the program under test:")
+            for fault in tests.faults:
+                say(f"  {fault}")
+        if left or tests.faults:
             return runner.returncode or 1
         return runner.returncode
     finally:
