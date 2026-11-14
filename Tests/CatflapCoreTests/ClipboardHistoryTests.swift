@@ -118,6 +118,41 @@ struct ClipboardFixture {
         #expect(kept.status == "paused")
         #expect(try await f.history.items().isEmpty)
     }
+    /// `clip send --latest` sends the newest copy only when history recorded it: a skipped
+    /// copy must never be replaced by an older item.
+    @Test func testLatestIsTheNewestCopyOnlyWhenRecorded() async throws {
+        let f = try ClipboardFixture(); defer { f.cleanup() }
+        await #expect(throws: ClipboardFailure.latestEmpty) { try await f.history.latestItem() }
+        let first = try await f.history.ingest(offeredTypes: ["text/plain"]) { .text("an ordinary note") }
+        #expect(try await f.history.latestItem().id == first.id)
+        let token = "ghp_" + String(repeating: "q", count: 36)
+        let filtered = try await f.history.ingest(offeredTypes: ["text/plain"]) { .text(token) }
+        #expect(filtered.status == "filtered")
+        await #expect(throws: ClipboardFailure.latestFiltered) { try await f.history.latestItem() }
+        let kept = try await f.history.keep(id: try #require(filtered.id))
+        #expect(try await f.history.latestItem().id == kept.id)
+        _ = try await f.history.ingest(offeredTypes: ["text/plain", try #require(SecretFilter.markers.first)]) { .text("unread") }
+        await #expect(throws: ClipboardFailure.latestMarked) { try await f.history.latestItem() }
+        // The same text again folds onto the first item, which is then the newest copy.
+        let again = try await f.history.ingest(offeredTypes: ["text/plain"]) { .text("an ordinary note") }
+        #expect(again.id == first.id)
+        #expect(try await f.history.latestItem().id == first.id)
+        try await f.history.setPaused(true)
+        await #expect(throws: ClipboardFailure.latestPaused) { try await f.history.latestItem() }
+        _ = try await f.history.ingest(offeredTypes: ["text/plain"]) { .text("copied while paused") }
+        try await f.history.setPaused(false)
+        await #expect(throws: ClipboardFailure.latestCopiedWhilePaused) { try await f.history.latestItem() }
+        await #expect(throws: ClipboardFailure.invalid) {
+            try await f.history.ingest(offeredTypes: ["text/plain"]) { throw ClipboardFailure.invalid }
+        }
+        await #expect(throws: ClipboardFailure.latestUnreadable) { try await f.history.latestItem() }
+        let last = try await f.history.ingest(offeredTypes: ["text/plain"]) { .text("the last note") }
+        try await f.history.delete(id: try #require(last.id))
+        await #expect(throws: ClipboardFailure.latestDeleted) { try await f.history.latestItem() }
+        // An agent that has seen no copy yet falls back to the newest stored item.
+        let restarted = ClipboardHistory(store: f.store)
+        #expect(try await restarted.latestItem().id == first.id)
+    }
     @Test func testOversizeItemIsSkipped() async throws {
         let f = try ClipboardFixture(); defer { f.cleanup() }
         let reads = Mutex(0)

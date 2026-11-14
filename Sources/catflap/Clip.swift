@@ -14,6 +14,7 @@ struct Clip: AsyncParsableCommand, AgentFeature {
     @Option(name: .long) var search: String?
     @Option(name: .long) var to: String?
     @Flag(name: .long) var dontKeep = false
+    @Flag(name: .long, help: "With send: the newest copy, only if clipboard history recorded it.") var latest = false
 
     static func install(on runtime: AgentRuntime) async throws {
         guard let transfers = await runtime.service(TransferService.self) else { throw AgentError.invalidRequest }
@@ -27,6 +28,7 @@ struct Clip: AsyncParsableCommand, AgentFeature {
         guard let action, ["list", "add", "keep", "delete", "pause", "send"].contains(action) else {
             try fail("Use clip list, add, keep, delete, pause, or send.", code: 64)
         }
+        if latest && action != "send" { try fail("--latest goes with clip send.", code: 64) }
         var arguments: [String: String] = [:]
         switch action {
         case "list": arguments["search"] = search
@@ -55,8 +57,13 @@ struct Clip: AsyncParsableCommand, AgentFeature {
                 } else { arguments["text"] = text }
             }
         case "keep", "delete", "send":
-            guard let id else { try fail("An item id is required.", code: 64) }
-            arguments["id"] = id
+            if latest {
+                guard id == nil else { try fail("Use an item id or --latest, not both.", code: 64) }
+                arguments["latest"] = "true"
+            } else {
+                guard let id else { try fail("An item id is required.", code: 64) }
+                arguments["id"] = id
+            }
         case "pause":
             if let id {
                 guard ["on", "off"].contains(id) else { try fail("Use clip pause on or off.", code: 64) }
@@ -68,16 +75,17 @@ struct Clip: AsyncParsableCommand, AgentFeature {
             let response = try await request(.init("clip." + action, arguments: arguments))
             print(String(decoding: response.payload, as: UTF8.self)); return
         }
-        let device: String
-        if let to { device = to }
-        else {
+        // With --latest and no --to, the agent picks the most recently used device.
+        if let to { arguments["device_id"] = to }
+        else if !latest {
             guard let first = try await request(.init("devices")).decode([DeviceSummary].self).first else {
                 try fail("No paired device. Pair one first with `catflap pair start`.", code: 1)
             }
-            device = first.id
+            arguments["device_id"] = first.id
         }
-        arguments["device_id"] = device; arguments["keep"] = dontKeep ? "false" : "true"
+        arguments["keep"] = dontKeep ? "false" : "true"
         var row = try await request(.init("clip.send", arguments: arguments)).decode(TransferRecord.self)
+        let device = row.deviceID
         let deadline = ContinuousClock.now + .seconds(3600)
         while row.status == "sending", ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(200))

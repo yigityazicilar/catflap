@@ -63,6 +63,14 @@ private final class ClipAgents: @unchecked Sendable {
         #expect(listed.count == 1 && listed[0].id == id)
         try await clipOffPool { try agents.first.restart() }
         #expect(try await clipOffPool { try agents.first.command(["clip", "list"]) }.decode([ClipboardItem].self).first?.id == id)
+        // The send-clipboard shortcut: the newest copy, to the most recently used device.
+        let newest = "latest clipboard note"
+        #expect(try await clipOffPool { try agents.first.command(["clip", "add", "--text", newest]) }.decode(ClipboardIngestResult.self).status == "stored")
+        let latestSent = try await clipOffPool { try agents.first.command(["clip", "send", "--latest"], timeout: 90) }
+        #expect(latestSent.code == 0)
+        #expect(try latestSent.decode(TransferRecord.self).status == "ok")
+        let latestReceived = try await clipOffPool { try agents.second.command(["history", "--search", newest]) }.decode([TransferRecord].self)
+        #expect(latestReceived.count == 1 && latestReceived[0].text == newest)
         #expect(try await clipOffPool { try agents.first.command(["clip", "pause", "on"]) }.code == 0)
         let paused = try await clipOffPool { try agents.first.command(["clip", "add", "--text", "paused note"]) }.decode(ClipboardIngestResult.self)
         #expect(paused.status == "paused")
@@ -71,6 +79,12 @@ private final class ClipAgents: @unchecked Sendable {
         #expect(marked.status == "marked" && !marked.canKeep)
         let filtered = try await clipOffPool { try agents.first.command(["clip", "add", "--text", "ghp_" + String(repeating: "z", count: 36)]) }.decode(ClipboardIngestResult.self)
         #expect(filtered.status == "filtered" && filtered.canKeep)
+        // A skipped copy is refused, never replaced by the older item before it.
+        let refused = try await clipOffPool { try agents.first.command(["clip", "send", "--latest"], timeout: 30) }
+        #expect(refused.code == 1)
+        let refusal = try JSONSerialization.jsonObject(with: refused.output) as? [String: Any]
+        #expect(refusal?["error"] as? String == ClipboardFailure.latestFiltered.rawValue)
+        #expect(try await clipOffPool { try agents.second.command(["history"]) }.decode([TransferRecord].self).count == 2)
         #expect(try await clipOffPool { try agents.first.command(["clip", "keep", filtered.id!]) }.code == 0)
         #expect(try await clipOffPool { try agents.first.command(["clip", "delete", id]) }.code == 0)
         let imageFile = agents.first.dataDirectory.appendingPathComponent("capture.png")

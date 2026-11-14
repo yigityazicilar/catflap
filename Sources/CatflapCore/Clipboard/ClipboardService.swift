@@ -54,8 +54,18 @@ public actor ClipboardService {
             }
             return try ControlResponse(value: ["paused": await history.isPaused()])
         case "clip.send":
+            let keep = a["keep"] != "false"
+            if a["latest"] == "true" {
+                // The send-clipboard shortcut: the newest copy if history recorded it, to the named
+                // device or else the most recently used one, which `devices` lists first.
+                let item = try await history.latestItem()
+                var device = a["device_id"]
+                if device == nil { device = try await store.devices().first?.id }
+                guard let device else { throw ClipboardFailure.latestNoDevice }
+                return try await ControlResponse(value: send(item: item, deviceID: device, keep: keep))
+            }
             guard let id = a["id"], let device = a["device_id"] else { throw ClipboardFailure.missing }
-            return try await ControlResponse(value: send(id: id, deviceID: device, keep: a["keep"] != "false"))
+            return try await ControlResponse(value: send(id: id, deviceID: device, keep: keep))
         case "clip.send.status":
             guard let id = a["id"], let device = a["device_id"],
                   let row = try await transfers.status(deviceID: device, id: id) else { throw ClipboardFailure.missing }
@@ -65,7 +75,9 @@ public actor ClipboardService {
         }
     }
     public func send(id: String, deviceID: String, keep: Bool = true) async throws -> TransferRecord {
-        let item = try await history.item(id: id)
+        try await send(item: history.item(id: id), deviceID: deviceID, keep: keep)
+    }
+    public func send(item: ClipboardItem, deviceID: String, keep: Bool = true) async throws -> TransferRecord {
         switch item.kind {
         case .text, .url:
             return try await transfers.start(deviceID: deviceID, payload: .text(String(decoding: item.content, as: UTF8.self)), keep: keep)

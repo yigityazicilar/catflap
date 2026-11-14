@@ -34,6 +34,16 @@ public enum ClipboardFailure: String, Error, LocalizedError {
     case missing = "Clipboard item not found."
     case noPending = "No filtered item is available to Keep."
     case invalid = "Invalid clipboard content."
+    // What `clip send --latest` says when it sends nothing.
+    case latestEmpty = "Clipboard history is empty."
+    case latestPaused = "Clipboard history is paused, so there is no recorded copy to send."
+    case latestCopiedWhilePaused = "The last copy was made while clipboard history was paused."
+    case latestFiltered = "The last copy was skipped because it looks like a secret. Keep it in Catflap to send it."
+    case latestMarked = "The last copy came from a password manager and was not recorded."
+    case latestOversize = "The last copy was too large to record."
+    case latestUnreadable = "The last copy was not something Catflap records."
+    case latestDeleted = "The last copy was deleted from clipboard history."
+    case latestNoDevice = "No paired device. Pair one first with `catflap pair start`."
     public var errorDescription: String? { rawValue }
 }
 
@@ -43,6 +53,10 @@ public actor ClipboardHistory {
     public static let lifetime: TimeInterval = 30 * 24 * 60 * 60
     public let store: Store
     private var paused: Bool
+    /// What became of the newest copy this agent has seen, for `clip send --latest`. Nil
+    /// until a copy arrives after the agent starts.
+    private enum Latest { case stored(String), skipped(ClipboardFailure) }
+    private var latest: Latest?
     private var generation: UInt64 = 0
     private var pending: (id: String, content: ClipboardContent)?
     public init(store: Store, paused: Bool = false) { self.store = store; self.paused = paused }
@@ -61,22 +75,41 @@ public actor ClipboardHistory {
         let ticket = generation
         pending = nil
         if SecretFilter.isMarked(offeredTypes: offeredTypes, passwordManagerFrontmost: passwordManagerFrontmost) {
+            latest = .skipped(.latestMarked)
             return .init("marked")
         }
-        if paused { return .init("paused") }
-        if let declaredSize, declaredSize < 0 || declaredSize > Self.limit(kind) { return .init("oversize") }
-        let content = try await read()
+        if paused { latest = .skipped(.latestCopiedWhilePaused); return .init("paused") }
+        if let declaredSize, declaredSize < 0 || declaredSize > Self.limit(kind) {
+            latest = .skipped(.latestOversize)
+            return .init("oversize")
+        }
+        let content: ClipboardContent
+        do { content = try await read() }
+        catch {
+            if ticket == generation { latest = .skipped(.latestUnreadable) }
+            throw error
+        }
         // A newer copy or pause must not resurrect this copy after an asynchronous read.
         guard ticket == generation, !paused else { return .init("superseded") }
-        guard content.data.count <= Self.limit(content.kind) else { return .init("oversize") }
-        try Self.validate(content)
+        guard content.data.count <= Self.limit(content.kind) else {
+            latest = .skipped(.latestOversize)
+            return .init("oversize")
+        }
+        do { try Self.validate(content) }
+        catch { latest = .skipped(.latestUnreadable); throw error }
         if content.kind != .image, SecretFilter.rejects(String(decoding: content.data, as: UTF8.self)) {
             let id = UUID().uuidString
             pending = (id, content)
+            latest = .skipped(.latestFiltered)
             return .init("filtered", id: id, canKeep: true, message: "Skipped, looks like a secret")
         }
         let id = try await save(content, kept: false, now: now)
-        guard let id else { return .init("paused") }
+        // Another copy may have arrived while this one was written; its outcome stands.
+        guard let id else {
+            if ticket == generation { latest = .skipped(.latestCopiedWhilePaused) }
+            return .init("paused")
+        }
+        if ticket == generation { latest = .stored(id) }
         return .init("stored", id: id)
     }
     private static func limit(_ kind: ClipboardKind) -> Int { kind == .image ? imageLimit : textLimit }
@@ -98,7 +131,10 @@ public actor ClipboardHistory {
     public func keep(id: String, now: Date = Date()) async throws -> ClipboardIngestResult {
         guard let candidate = pending, candidate.id == id else { throw ClipboardFailure.noPending }
         pending = nil
+        // Only the newest copy can be pending, so a kept copy is the newest one.
+        let ticket = generation
         guard let saved = try await save(candidate.content, kept: true, now: now) else { return .init("paused") }
+        if ticket == generation { latest = .stored(saved) }
         return .init("stored", id: saved)
     }
     public func setPaused(_ value: Bool) async throws {
@@ -106,6 +142,22 @@ public actor ClipboardHistory {
         paused = value; generation &+= 1; pending = nil
     }
     public func isPaused() -> Bool { paused }
+    /// The item `clip send --latest` sends: the newest copy, and only if history recorded it.
+    /// A copy that was skipped, made while paused, or deleted since is refused with the reason,
+    /// so the send-clipboard shortcut never sends an older item in its place. Until a copy
+    /// arrives in this agent's lifetime, the newest stored item stands in.
+    public func latestItem() async throws -> ClipboardItem {
+        if paused { throw ClipboardFailure.latestPaused }
+        switch latest {
+        case .skipped(let reason): throw reason
+        case .stored(let id):
+            do { return try await item(id: id) }
+            catch ClipboardFailure.missing { throw ClipboardFailure.latestDeleted }
+        case nil:
+            guard let newest = try await items().first else { throw ClipboardFailure.latestEmpty }
+            return newest
+        }
+    }
     public func delete(id: String) async throws {
         try await store.execute("DELETE FROM clipboard WHERE id=?", bindings: [.text(id)])
     }
