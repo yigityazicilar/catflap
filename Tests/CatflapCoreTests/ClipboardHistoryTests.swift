@@ -91,6 +91,33 @@ struct ClipboardFixture {
         try await reopened.setPaused(false)
         #expect(try await reopened.ingest(offeredTypes: []) { .text("resumed copy") }.status == "stored")
     }
+    /// `setPaused` writes the setting, then sets its flag. A copy that passed the flag check in
+    /// between is still on its way to the store, and must not be written once the pause is.
+    /// The setting is written here directly, while the copy is being read, which is that window.
+    @Test func testACopyInFlightWhenThePauseIsWrittenIsNotStored() async throws {
+        let f = try ClipboardFixture(); defer { f.cleanup() }
+        let store = f.store
+        let result = try await f.history.ingest(offeredTypes: []) {
+            try await store.setSetting("clipboard_paused", value: "true")
+            return .text("copied as the pause was written")
+        }
+        #expect(result.status == "paused")
+        #expect(result.id == nil)
+        #expect(try await f.history.items().isEmpty)
+    }
+    /// The same window for Keep: a pause written while Keep is on its way to the store wins.
+    @Test func testKeepInFlightWhenThePauseIsWrittenIsNotStored() async throws {
+        let f = try ClipboardFixture(); defer { f.cleanup() }
+        let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#%")
+        let filtered = try await f.history.ingest(offeredTypes: []) {
+            .text(String((0..<40).map { _ in alphabet.randomElement()! }))
+        }
+        let id = try #require(filtered.id)
+        try await f.store.setSetting("clipboard_paused", value: "true")
+        let kept = try await f.history.keep(id: id)
+        #expect(kept.status == "paused")
+        #expect(try await f.history.items().isEmpty)
+    }
     @Test func testOversizeItemIsSkipped() async throws {
         let f = try ClipboardFixture(); defer { f.cleanup() }
         let reads = Mutex(0)

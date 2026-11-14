@@ -12,22 +12,41 @@ public enum SecretFilter {
     public static func isMarked(offeredTypes: [String], passwordManagerFrontmost: Bool = false) -> Bool {
         passwordManagerFrontmost || offeredTypes.contains { markers.contains($0) }
     }
+    /// Known shapes, compiled once. `String.range(of:options:)` compiles its pattern again on
+    /// every call, which is eight compilations for every copy. NSRegularExpression objects are
+    /// immutable and safe to share between threads, as Apple's documentation says.
+    nonisolated(unsafe) private static let shapes: [NSRegularExpression] = [
+        // PEM blocks, and the PGP armour, whose header ends in "KEY BLOCK".
+        #"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE"# + #" KEY(?: BLOCK)?-----"#,
+        #"catflap-pair-1\.[A-Za-z0-9_-]+"#,
+        // A tailcat address is "tc" and the base64url of a small CBOR record; the shortest,
+        // a 32-byte key and a region number, is about 56 characters long.
+        #"\btc[A-Za-z0-9_-]{50,}\b"#,
+        #"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"#,
+        #"\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{20,}|sk_live_[A-Za-z0-9]{16,}|rk_live_[A-Za-z0-9]{16,})\b"#,
+        #"\bxox[baprs]-[A-Za-z0-9-]{16,}\b"#,
+        #"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"#,
+        #"\bAIza[A-Za-z0-9_-]{35}\b"#
+    ].map { pattern in
+        do { return try NSRegularExpression(pattern: pattern) }
+        catch { preconditionFailure("A secret pattern does not compile.") }
+    }
+    /// Whether one of the known shapes is in the text.
+    static func matchesShape(_ content: String) -> Bool {
+        #if canImport(Darwin)
+        // One contiguous UTF-16 copy, which the regex engine reads in place. Given a native
+        // Swift string, it reads through the bridge to it for every pattern.
+        let units = Array(content.utf16)
+        let text = NSString(characters: units, length: units.count) as String
+        let range = NSRange(location: 0, length: units.count)
+        #else
+        let text = content
+        let range = NSRange(location: 0, length: content.utf16.count)
+        #endif
+        return shapes.contains { $0.firstMatch(in: text, range: range) != nil }
+    }
     public static func rejects(_ content: String) -> Bool {
-        let patterns = [
-            // PEM blocks, and the PGP armour, whose header ends in "KEY BLOCK".
-            #"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE"# + #" KEY(?: BLOCK)?-----"#,
-            #"catflap-pair-1\.[A-Za-z0-9_-]+"#,
-            // A tailcat address is "tc" and the base64url of a small CBOR record; the shortest,
-            // a 32-byte key and a region number, is about 56 characters long.
-            #"\btc[A-Za-z0-9_-]{50,}\b"#,
-            #"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"#,
-            #"\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{20,}|sk_live_[A-Za-z0-9]{16,}|rk_live_[A-Za-z0-9]{16,})\b"#,
-            #"\bxox[baprs]-[A-Za-z0-9-]{16,}\b"#,
-            #"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"#,
-            #"\bAIza[A-Za-z0-9_-]{35}\b"#,
-            #"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"#
-        ]
-        if patterns.contains(where: { content.range(of: $0, options: .regularExpression) != nil }) { return true }
+        if matchesShape(content) || containsJWT(content) { return true }
         let text = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard text.utf8.count >= 20, text.utf8.count <= 8192,
               text.range(of: #"^[A-Za-z0-9+/=_!@#$%^&*().:?-]+$"#, options: .regularExpression) != nil,
@@ -39,11 +58,70 @@ public enum SecretFilter {
             let p = Double(count) / size
             return total - p * log2(p)
         }
-        // Short ordinary words and repetitive identifiers are intentionally accepted, and so are
-        // words joined by "_" or "-" (snake_case, kebab-case): a token has digits or symbols.
-        let joiners = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-"))
-        let mixed = text.rangeOfCharacter(from: .decimalDigits) != nil
-            || text.rangeOfCharacter(from: joiners.inverted) != nil
-        return mixed && entropy >= (text.utf8.count >= 32 ? 3.5 : 4.0)
+        if readsAsWords(text) { return false }
+        return entropy >= (text.utf8.count >= 32 ? 3.5 : 4.0)
+    }
+
+    /// Letters alone, or words joined by "_" or "-", that read as words: snake_case,
+    /// kebab-case and SCREAMING_CASE are in one case throughout, and camelCase or Capitalized
+    /// words have few capitals. Random letters switch case at about every other character,
+    /// so a token made of letters and joiners (base64url with no digit in it) does not pass.
+    /// Anything with a digit or another symbol goes to the entropy test.
+    static func readsAsWords(_ text: String) -> Bool {
+        var letters = 0, capitals = 0
+        for byte in text.utf8 {
+            switch byte {
+            case UInt8(ascii: "a")...UInt8(ascii: "z"): letters += 1
+            case UInt8(ascii: "A")...UInt8(ascii: "Z"): letters += 1; capitals += 1
+            case UInt8(ascii: "_"), UInt8(ascii: "-"): continue
+            default: return false
+            }
+        }
+        guard letters > 0 else { return false }
+        return capitals == 0 || capitals == letters || Double(capitals) <= 0.3 * Double(letters)
+    }
+
+    /// A JWT: "eyJ" where a word starts, then three runs of base64url characters joined by
+    /// single dots, as `\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+` finds it. Found in
+    /// one pass: as a regex it restarts at every "eyJ" after a "-" and reads to the end of the
+    /// run each time, which took 22 s on 128 KiB and would take hours on a 4 MiB copy, holding
+    /// the clipboard actor. Without the regex's closing word boundary, which only ever let a
+    /// JWT through.
+    static func containsJWT(_ text: String) -> Bool {
+        let bytes = Array(text.utf8)
+        let count = bytes.count
+        func inRun(_ byte: UInt8) -> Bool {
+            switch byte {
+            case UInt8(ascii: "0")...UInt8(ascii: "9"), UInt8(ascii: "A")...UInt8(ascii: "Z"),
+                 UInt8(ascii: "a")...UInt8(ascii: "z"), UInt8(ascii: "_"), UInt8(ascii: "-"): return true
+            default: return false
+            }
+        }
+        // The two runs before the current one: where each began and ended, and whether the
+        // older holds "eyJ" at a word start with at least one more character before its end.
+        var older: (start: Int, end: Int, jwt: Bool)?
+        var newer: (start: Int, end: Int, jwt: Bool)?
+        func joined(_ first: (start: Int, end: Int, jwt: Bool), _ second: (start: Int, end: Int, jwt: Bool)) -> Bool {
+            second.start == first.end + 1 && bytes[first.end] == UInt8(ascii: ".")
+        }
+        var index = 0
+        while index < count {
+            guard inRun(bytes[index]) else { index += 1; continue }
+            let start = index
+            var jwt = false
+            while index < count, inRun(bytes[index]) {
+                if !jwt, bytes[index] == UInt8(ascii: "e"), index + 3 < count,
+                   bytes[index + 1] == UInt8(ascii: "y"), bytes[index + 2] == UInt8(ascii: "J"), inRun(bytes[index + 3]),
+                   index == start || bytes[index - 1] == UInt8(ascii: "-") {
+                    jwt = true
+                }
+                index += 1
+            }
+            let run = (start: start, end: index, jwt: jwt)
+            if let first = older, let second = newer, first.jwt, joined(first, second), joined(second, run) { return true }
+            older = newer
+            newer = run
+        }
+        return false
     }
 }

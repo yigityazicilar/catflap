@@ -76,6 +76,7 @@ public actor ClipboardHistory {
             return .init("filtered", id: id, canKeep: true, message: "Skipped, looks like a secret")
         }
         let id = try await save(content, kept: false, now: now)
+        guard let id else { return .init("paused") }
         return .init("stored", id: id)
     }
     private static func limit(_ kind: ClipboardKind) -> Int { kind == .image ? imageLimit : textLimit }
@@ -97,7 +98,7 @@ public actor ClipboardHistory {
     public func keep(id: String, now: Date = Date()) async throws -> ClipboardIngestResult {
         guard let candidate = pending, candidate.id == id else { throw ClipboardFailure.noPending }
         pending = nil
-        let saved = try await save(candidate.content, kept: true, now: now)
+        guard let saved = try await save(candidate.content, kept: true, now: now) else { return .init("paused") }
         return .init("stored", id: saved)
     }
     public func setPaused(_ value: Bool) async throws {
@@ -115,8 +116,16 @@ public actor ClipboardHistory {
         try tx.execute("DELETE FROM clipboard WHERE timestamp < ?", bindings: [.real(now.timeIntervalSince1970 - lifetime)])
         try tx.execute("DELETE FROM clipboard WHERE id NOT IN (SELECT id FROM clipboard ORDER BY timestamp DESC,rowid DESC LIMIT 500)")
     }
-    private func save(_ content: ClipboardContent, kept: Bool, now: Date) async throws -> String {
+    /// Writes the copy, unless capture is paused by the time this transaction runs; then it
+    /// returns nil. The pause is read here, in the same transaction as the write, because
+    /// `setPaused` sets its flag only after its own write: a copy that passed the flag check
+    /// in `ingest` or `keep` while that write was queued would otherwise be stored after the
+    /// pause had returned. Transactions run one at a time, so the write is either before the
+    /// pause is written or sees it.
+    private func save(_ content: ClipboardContent, kept: Bool, now: Date) async throws -> String? {
         try await store.transaction { tx in
+            let paused = try tx.query("SELECT value FROM settings WHERE key='clipboard_paused'")
+            if paused.first?["value"] == .text("true") { return nil }
             let duplicate = try tx.query("SELECT id FROM clipboard WHERE kind=? AND content=? AND mime IS ? LIMIT 1",
                 bindings: [.text(content.kind.rawValue), .blob(content.data), content.mime.map(SQLValue.text) ?? .null])
             let id: String
