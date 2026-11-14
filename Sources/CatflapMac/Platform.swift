@@ -1,13 +1,15 @@
 #if os(macOS)
 import CatflapCore
 
-/// Owns capture and the panel for exactly the agent's platform lifetime.
+/// Owns capture, the panel and its actions for exactly the agent's platform lifetime.
 public actor Platform {
     private var watcherTask: Task<Void, Never>?
     private var panel: PanelController?
-    private init(watcherTask: Task<Void, Never>, panel: PanelController) {
+    private var actions: PanelActions?
+    private init(watcherTask: Task<Void, Never>, panel: PanelController, actions: PanelActions) {
         self.watcherTask = watcherTask
         self.panel = panel
+        self.actions = actions
     }
     public static func start(on runtime: AgentRuntime) async throws -> Platform {
         guard let history = await runtime.service(ClipboardHistory.self) else { throw ClipboardFailure.missing }
@@ -16,10 +18,17 @@ public actor Platform {
         let task = Task { @MainActor in await watcher.run() }
         // The panel starts AppKit's event loop and takes over `toggle`, `ui state` and `ui invoke`.
         let panel = await PanelController.start(runtime: runtime)
-        return Platform(watcherTask: task, panel: panel)
+        // The actions answer the panel's send hook and the controls it leaves to them, and
+        // take `ui state` and `ui invoke` over again, passing the panel's own actions on.
+        let actions = await PanelActions.start(runtime: runtime, controller: panel, pollClipboard: { @MainActor in await watcher.poll() })
+        return Platform(watcherTask: task, panel: panel, actions: actions)
     }
     public func stop() async {
-        // The panel goes first, before the clipboard watcher.
+        // The actions go first, then the panel, then the clipboard watcher.
+        if let actions {
+            self.actions = nil
+            await actions.stop()
+        }
         if let panel {
             self.panel = nil
             await panel.stop()
