@@ -19,6 +19,8 @@ protocol PanelViewActions: AnyObject {
     func viewSend()
     func viewRetry(_ rowID: String)
     func viewReveal(_ rowID: String)
+    func viewCopy(_ rowID: String)
+    func viewDelete(_ rowID: String)
     func viewDrag(inside: Bool)
     func viewDrop(_ urls: [URL])
 }
@@ -52,6 +54,9 @@ final class PanelView: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTab
     private let emptyDetail = NSTextField(labelWithString: "")
     private let resume = NSButton(title: "Resume", target: nil, action: nil)
     let send = NSButton(title: "", target: nil, action: nil)
+    /// How the last send went.
+    private let sendLine = NSTextField(wrappingLabelWithString: "")
+    private let pair = NSButton(title: "Pair a device\u{2026}", target: nil, action: nil)
     private let connectionDot = NSImageView()
     private let connection = NSTextField(labelWithString: "")
     private let dontKeep = NSSwitch()
@@ -132,7 +137,8 @@ final class PanelView: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTab
         deviceStrip.setAccessibilityLabel("Send to")
         let pairLine = NSTextField(labelWithString: "Pair a device to start sending")
         pairLine.textColor = .secondaryLabelColor
-        let pair = NSButton(title: "Pair a device\u{2026}", target: self, action: #selector(pairPressed))
+        pair.target = self
+        pair.action = #selector(pairPressed)
         pair.bezelStyle = .push
         pair.setAccessibilityLabel("Pair a device")
         noDevices.orientation = .horizontal
@@ -209,6 +215,12 @@ final class PanelView: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTab
         // Return is handled by the field and the window, not as a key equivalent, so that
         // Return while an input method is composing only commits the composition.
         send.toolTip = "Return"
+        sendLine.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        sendLine.textColor = .secondaryLabelColor
+        sendLine.maximumNumberOfLines = 2
+        sendLine.lineBreakMode = .byTruncatingTail
+        sendLine.cell?.truncatesLastVisibleLine = true
+        sendLine.isHidden = true
 
         connectionDot.image = Self.symbol("circle.fill", label: nil, size: 7)
         connectionDot.contentTintColor = .tertiaryLabelColor
@@ -232,7 +244,7 @@ final class PanelView: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTab
         footer.orientation = .horizontal
         footer.spacing = 6
 
-        let stack = NSStackView(views: [top, attachmentRow, deviceStrip, noDevices, listSwitch, listArea, send, footer])
+        let stack = NSStackView(views: [top, attachmentRow, deviceStrip, noDevices, listSwitch, listArea, send, sendLine, footer])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
@@ -244,7 +256,7 @@ final class PanelView: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTab
             stack.leadingAnchor.constraint(equalTo: leadingAnchor), stack.trailingAnchor.constraint(equalTo: trailingAnchor),
             widthAnchor.constraint(equalToConstant: Self.width),
         ])
-        for row in [top, attachmentRow, deviceStrip, noDevices, listSwitch, listArea, send, footer] as [NSView] {
+        for row in [top, attachmentRow, deviceStrip, noDevices, listSwitch, listArea, send, sendLine, footer] as [NSView] {
             row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24).isActive = true
         }
 
@@ -354,6 +366,42 @@ final class PanelView: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTab
         pause.setAccessibilityLabel(model.paused ? "Resume clipboard history" : "Pause clipboard history")
     }
 
+    /// The line under the send button: how the last send went, in orange when it failed.
+    func renderSendLine(_ text: String, failed: Bool) {
+        if sendLine.stringValue != text { sendLine.stringValue = text }
+        sendLine.isHidden = text.isEmpty
+        sendLine.textColor = failed ? .systemOrange : .secondaryLabelColor
+    }
+
+    /// Clicks one of the panel's controls as a person would: `rowID` names the row of Copy,
+    /// Delete, Retry and Reveal. Returns the control's spoken label, or nil when the panel does
+    /// not show it or it is disabled.
+    func press(_ control: String, rowID: String?) -> String? {
+        let button: NSButton?
+        switch control {
+        case "attach": button = attach
+        case "pair": button = pair
+        case "settings": button = settings
+        case "send": button = send
+        case "pause": button = pause
+        case "remove-attachments": button = removeAttachments
+        case "copy", "delete", "retry", "reveal":
+            guard let rowID, let index = rows.firstIndex(where: { $0.id == rowID }),
+                  let cell = table.view(atColumn: 0, row: index, makeIfNecessary: true) as? PanelRowView else { return nil }
+            button = switch control {
+            case "copy": cell.copyButton
+            case "delete": cell.deleteButton
+            case "retry": cell.retry
+            default: cell.reveal
+            }
+        default: button = nil
+        }
+        guard let button, button.isEnabled, button.superview != nil, !button.isHiddenOrHasHiddenAncestor else { return nil }
+        let label = button.accessibilityLabel() ?? button.title
+        button.performClick(nil)
+        return label
+    }
+
     private func renderDevices(_ model: PanelModel) {
         shownDevices = model.devices
         shownTarget = model.target?.id
@@ -411,6 +459,10 @@ final class PanelView: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTab
         cell.retry.action = #selector(retryPressed(_:))
         cell.reveal.target = self
         cell.reveal.action = #selector(revealPressed(_:))
+        cell.copyButton.target = self
+        cell.copyButton.action = #selector(copyPressed(_:))
+        cell.deleteButton.target = self
+        cell.deleteButton.action = #selector(deletePressed(_:))
         return cell
     }
 
@@ -467,6 +519,8 @@ final class PanelView: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTab
     @objc private func devicePressed(_ sender: DeviceChip) { actions?.viewSelectDevice(sender.deviceID) }
     @objc private func retryPressed(_ sender: NSButton) { if let id = sender.identifier?.rawValue { actions?.viewRetry(id) } }
     @objc private func revealPressed(_ sender: NSButton) { if let id = sender.identifier?.rawValue { actions?.viewReveal(id) } }
+    @objc private func copyPressed(_ sender: NSButton) { if let id = sender.identifier?.rawValue { actions?.viewCopy(id) } }
+    @objc private func deletePressed(_ sender: NSButton) { if let id = sender.identifier?.rawValue { actions?.viewDelete(id) } }
 }
 
 /// A paired device: a computer glyph, the name and a status dot. The first is the default
@@ -503,10 +557,16 @@ final class DeviceChip: NSButton {
     required init?(coder: NSCoder) { fatalError("not used") }
 }
 
-/// One list row: a kind glyph, up to two lines of preview, secondary text and a quiet time.
+/// One list row: a kind glyph, up to two lines of preview, secondary text, Retry and Reveal
+/// where they apply, Copy and Delete, and a quiet time. Copy and Delete are also ⌘C and ⌘⌫ on
+/// the selected row, and every button is also an action VoiceOver offers on the row.
 final class PanelRowView: NSTableCellView {
     let retry = NSButton(title: "Retry", target: nil, action: nil)
     let reveal = NSButton(title: "Reveal", target: nil, action: nil)
+    let copyButton = NSButton()
+    let deleteButton = NSButton()
+    /// The row's buttons by the names VoiceOver offers them under.
+    private var spokenButtons: [String: NSButton] = [:]
 
     init(row: PanelRow, now: Date) {
         super.init(frame: .zero)
@@ -554,6 +614,19 @@ final class PanelRowView: NSTableCellView {
             button.identifier = .init(row.id)
             button.setAccessibilityLabel(button.title + " " + row.title)
             parts.append(button)
+            spokenButtons[button.title] = button
+        }
+        for (button, name, symbol, key) in [(copyButton, "Copy", "doc.on.doc", "\u{2318}C"), (deleteButton, "Delete", "trash", "\u{2318}\u{232B}")] {
+            button.image = PanelView.symbol(symbol, label: name)
+            button.imagePosition = .imageOnly
+            button.isBordered = false
+            button.bezelStyle = .accessoryBarAction
+            button.contentTintColor = .secondaryLabelColor
+            button.identifier = .init(row.id)
+            button.setAccessibilityLabel(name + " " + row.title)
+            button.toolTip = "\(name) (\(key))"
+            parts.append(button)
+            spokenButtons[name] = button
         }
         parts.append(time)
         let line = NSStackView(views: parts)
@@ -568,6 +641,15 @@ final class PanelRowView: NSTableCellView {
         ])
         setAccessibilityElement(true)
         setAccessibilityLabel(spoken + ", " + time.stringValue)
+        setAccessibilityCustomActions(["Retry", "Reveal", "Copy", "Delete"].filter { spokenButtons[$0] != nil }.map {
+            NSAccessibilityCustomAction(name: $0, target: self, selector: #selector(performSpokenAction(_:)))
+        })
+    }
+
+    @objc private func performSpokenAction(_ action: NSAccessibilityCustomAction) -> Bool {
+        guard let button = spokenButtons[action.name] else { return false }
+        button.performClick(nil)
+        return true
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }

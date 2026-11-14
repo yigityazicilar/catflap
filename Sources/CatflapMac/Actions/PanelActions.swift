@@ -12,9 +12,10 @@ struct ActionRefusal: Error, Sendable {
 /// and the Services menu; the send-clipboard shortcut; notifications on arrival and on a
 /// failed send; pairing, removing a device, and settings.
 ///
-/// The panel (PanelController) owns the window, its states and its lists. This object answers
-/// the panel's send hook and the view actions the panel leaves to it, and adds its own
-/// `ui invoke` actions and `ui state` fields (see ActionCommands.swift).
+/// The panel (PanelController) owns the window, its states, its lists, the menu bar glyph and
+/// the line saying how the last send went. It calls this object for what its controls do beyond
+/// that; this object tells it how sends go, and adds its own `ui invoke` actions and `ui state`
+/// fields (see ActionCommands.swift).
 @MainActor
 final class PanelActions {
     let runtime: AgentRuntime
@@ -32,8 +33,8 @@ final class PanelActions {
     private(set) var settingsMessage = ""
     /// The last sentence an action ended with: a refusal, or what happened.
     private(set) var message = ""
-    /// Whether the panel's own controls reach this object (see PanelWiring.swift).
-    private(set) var wired = false
+    /// Whether the panel's own controls reach this object.
+    var wired: Bool { controller.actions === self }
     /// The panel's Don't keep switch, as last set.
     var dontKeep = false
     /// The device chosen in the panel, when the person chose one.
@@ -42,8 +43,9 @@ final class PanelActions {
     /// have moved without this object seeing where (arrow keys, typing, another list).
     var selectedRow: String?
     private let pollClipboard: @MainActor () async -> Void
-    private var wiring: PanelWiring?
     private var lastPanelSend: Task<Result<[TransferRecord], ActionRefusal>, Never>?
+    /// The row action (Copy, Delete, Reveal) the panel started most recently.
+    private var lastRowAction: Task<Void, Never>?
     private var deviceNames: [String: String] = [:]
     private var stopped = false
 
@@ -67,11 +69,7 @@ final class PanelActions {
     private func install() async {
         settings = await MacSettings.load(from: runtime.store)
         await refreshDevices()
-        controller.sendHandler = { [weak self] payload, device, keep in
-            self?.panelSend(payload, to: device.id, keep: keep)
-        }
-        wiring = PanelWiring(actions: self)
-        wired = wiring?.attach() ?? false
+        controller.actions = self
         sendShortcut = ShortcutBinding(name: ShortcutBinding.sendClipboardName, default: ShortcutBinding.sendClipboardDefault) { [weak self] in
             guard let self else { return }
             Task { _ = await self.sendLatest() }
@@ -81,6 +79,7 @@ final class PanelActions {
         NSApplication.shared.servicesProvider = services
         pairing.onChange = { [weak self] in self?.pairingChanged() }
         history.onChange = { [weak self] change in self?.historyChanged(change) }
+        history.onRead = { [weak self] in self?.updateMoving() }
         await history.start()
         await registerCommands()
     }
@@ -93,8 +92,7 @@ final class PanelActions {
         sendShortcut?.stop()
         settingsWindow?.close()
         pairingWindow?.close()
-        wiring?.detach()
-        controller.sendHandler = nil
+        if controller.actions === self { controller.actions = nil }
         NSApplication.shared.servicesProvider = nil
     }
 
@@ -125,7 +123,7 @@ final class PanelActions {
     // MARK: Sending
 
     /// Return or the send button in the panel.
-    private func panelSend(_ payload: PanelPayload, to deviceID: String, keep: Bool) {
+    func panelSend(_ payload: PanelPayload, to deviceID: String, keep: Bool) {
         let task = Task { [weak self] () -> Result<[TransferRecord], ActionRefusal> in
             guard let self else { return .failure(ActionRefusal(message: "Catflap is stopping.")) }
             let outcome = await self.send(payload, to: deviceID, keep: keep)
@@ -138,11 +136,62 @@ final class PanelActions {
                 case .row: self.selectedRow = nil; self.controller.viewSelectRow(nil)
                 }
             case .failure(let refusal):
-                self.notifier.problem(title: "Not sent to \(self.name(of: deviceID))", body: refusal.message)
+                self.sendFailed(title: "Not sent to \(self.name(of: deviceID))", body: refusal.message)
             }
             return outcome
         }
         lastPanelSend = task
+    }
+
+    /// Retry on a history row in the panel.
+    func panelRetry(_ rowID: String) {
+        let (device, id) = Self.split(rowID)
+        lastPanelSend = Task { [weak self] () -> Result<[TransferRecord], ActionRefusal> in
+            guard let self else { return .failure(ActionRefusal(message: "Catflap is stopping.")) }
+            let outcome = await self.retry(deviceID: device, id: id)
+            if case .failure(let refusal) = outcome { self.sendFailed(title: "Not sent to \(self.name(of: device))", body: refusal.message) }
+            return outcome
+        }
+    }
+
+    /// Copy, Delete and Reveal on a row in the panel. A refusal says why in a notification.
+    func panelCopy(_ rowID: String) { rowAction("Cannot copy it") { await $0.copy(rowID: rowID) } }
+    func panelDelete(_ rowID: String) { rowAction("Cannot delete it") { await $0.delete(rowID: rowID) } }
+    func panelReveal(_ rowID: String) { rowAction("Cannot show the file") { await $0.reveal(rowID: rowID) } }
+
+    private func rowAction(_ title: String, _ body: @escaping @Sendable @MainActor (PanelActions) async -> ActionRefusal?) {
+        lastRowAction = Task { [weak self] in
+            guard let self, let refusal = await body(self) else { return }
+            self.notifier.problem(title: title, body: refusal.message)
+        }
+    }
+
+    /// The row action the panel started most recently, for `ui invoke press`.
+    func takeRowAction() -> Task<Void, Never>? {
+        defer { lastRowAction = nil }
+        return lastRowAction
+    }
+
+    /// A send that did not start or did not end well: the panel's line, and cf-problem until
+    /// the panel next opens. With the panel closed a notification says it too.
+    func sendFailed(title: String, body: String, retry: (deviceID: String, id: String)? = nil) {
+        message = body
+        controller.showSendLine(title + ". " + body, failed: true)
+        controller.showProblem()
+        if !controller.isVisible { notifier.problem(title: title, body: body, retry: retry) }
+    }
+
+    /// A send started: the panel's line, and cf-moving until history shows it ended.
+    private func started(_ rows: [TransferRecord], to deviceID: String) {
+        message = "Sending to \(name(of: deviceID))\u{2026}"
+        controller.showSendLine(message, failed: false)
+        for row in rows { history.markSending(row.deviceID + "/" + row.id) }
+        updateMoving()
+    }
+
+    /// cf-moving while history shows anything sending or being received.
+    private func updateMoving() {
+        controller.showMoving(history.statuses.values.contains { $0 == "sending" || $0 == "receiving" })
     }
 
     /// The send the panel started most recently, for `ui invoke send`.
@@ -191,8 +240,7 @@ final class PanelActions {
         } catch {
             return .failure(ActionRefusal(message: Self.sentence(error)))
         }
-        message = "Sending to \(name(of: deviceID))\u{2026}"
-        history.refresh()
+        started(rows, to: deviceID)
         return .success(rows)
     }
 
@@ -204,12 +252,10 @@ final class PanelActions {
         let response = await runtime.handle(ControlRequest("clip.send", arguments: ["latest": "true"]))
         guard response.ok, let row = try? response.decode(TransferRecord.self) else {
             let sentence = response.error ?? "Not sent."
-            message = sentence
-            notifier.problem(title: "Clipboard not sent", body: sentence)
+            sendFailed(title: "Clipboard not sent", body: sentence)
             return .failure(ActionRefusal(message: sentence))
         }
-        message = "Sending to \(name(of: row.deviceID))\u{2026}"
-        history.refresh()
+        started([row], to: row.deviceID)
         return .success([row])
     }
 
@@ -219,7 +265,7 @@ final class PanelActions {
         }
         do {
             let row = try await transfers.retry(deviceID: deviceID, id: id)
-            history.refresh()
+            started([row], to: deviceID)
             return .success([row])
         } catch {
             return .failure(ActionRefusal(message: Self.sentence(error)))
@@ -297,6 +343,7 @@ final class PanelActions {
             return ActionRefusal(message: "That file is not on this Mac any more.")
         }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        message = "Shown in Finder."
         return nil
     }
 
@@ -341,7 +388,7 @@ final class PanelActions {
     }
 
     /// What the panel's field holds.
-    var fieldText: String { wiring?.fieldText ?? "" }
+    var fieldText: String { controller.fieldText }
 
     // MARK: Pause, Don't keep
 
@@ -451,19 +498,21 @@ final class PanelActions {
             let from = name(of: row.deviceID)
             let fileName = row.path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? row.targetName
             notifier.arrived(kind: row.kind, text: row.text, fileName: fileName, path: row.path, deviceID: row.deviceID, id: row.id, from: from)
+            controller.showArrived()
             // Received text goes on the clipboard only when the person turned that on.
             if row.kind == "text" && settings.receivedTextToClipboard {
                 Task { _ = await self.copy(rowID: row.deviceID + "/" + row.id) }
             }
         case .sent(let row):
             message = "Sent to \(name(of: row.deviceID))."
+            controller.showSendLine(message, failed: false)
+            controller.showArrived()
         case .notSent(let row, let reason):
             let to = name(of: row.deviceID)
             var body = reason ?? (row.status == "unconfirmed" ? "\(to) may not have it." : "Not sent.")
             // After the other device removed this one, it still lists it here.
             if body.hasPrefix("Cannot reach") { body += " If \(to) removed this Mac, remove \(to) in Catflap's settings." }
-            message = body
-            notifier.problem(title: "Not sent to \(to)", body: body, retry: (row.deviceID, row.id))
+            sendFailed(title: "Not sent to \(to)", body: body, retry: (row.deviceID, row.id))
         }
         Task { await refreshDevices() }
     }

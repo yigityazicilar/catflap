@@ -19,6 +19,18 @@ struct Catflap: AsyncParsableCommand {
         commandName: "catflap", abstract: "Local Catflap agent and control client.",
         subcommands: [Agent.self, Status.self, Devices.self, History.self, Toggle.self, UI.self,
                       Pair.self, Unpair.self, Send.self, Clip.self, Audit.self, Version.self, EraseIdentity.self])
+
+    static func main() async {
+        #if os(macOS)
+        // Finder, `open` and a double click start Catflap.app with no arguments: that is the
+        // agent. A bare `catflap` with no arguments still prints its help.
+        if CommandLine.arguments.count == 1, Bundle.main.bundleIdentifier != nil, Bundle.main.bundleURL.pathExtension == "app" {
+            await main(["agent"])
+            return
+        }
+        #endif
+        await main(nil)
+    }
 }
 
 struct ClientErrorOutput: Encodable {

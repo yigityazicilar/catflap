@@ -18,7 +18,7 @@ public actor Platform {
         let task = Task { @MainActor in await watcher.run() }
         // The panel starts AppKit's event loop and takes over `toggle`, `ui state` and `ui invoke`.
         let panel = await PanelController.start(runtime: runtime)
-        // The actions answer the panel's send hook and the controls it leaves to them, and
+        // The actions attach themselves to the panel, which calls them for its controls, and
         // take `ui state` and `ui invoke` over again, passing the panel's own actions on.
         let actions = await PanelActions.start(runtime: runtime, controller: panel, pollClipboard: { @MainActor in await watcher.poll() })
         return Platform(watcherTask: task, panel: panel, actions: actions)

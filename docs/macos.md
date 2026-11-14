@@ -50,14 +50,11 @@ Catflap is not notarised. The first time you open it, macOS says it cannot check
 malicious software. Open System Settings, Privacy & Security, and choose Open Anyway for
 Catflap, or Control-click the app in Finder and choose Open.
 
-Start the agent once from Terminal:
-
-```sh
-open /Applications/Catflap.app --args agent
-```
-
-Then switch on Start Catflap at login in its settings (below), and it starts by itself from
-then on. Opening the app from Finder without `--args agent` does not start the agent yet.
+Open Catflap.app from Finder (or `open /Applications/Catflap.app`): opened with no arguments,
+the app runs the agent. Then switch on Start Catflap at login in its settings (below), and it
+starts by itself from then on. The bare executable run with no arguments from Terminal prints
+its help instead; `catflap agent` runs the agent there. While the agent runs, opening the app
+again does not open the panel or start a second agent; use the menu bar item or the shortcut.
 
 macOS asks once whether Catflap may show notifications, and may ask whether Catflap may read
 the clipboard. Clipboard history needs that; without it everything else works.
@@ -78,7 +75,14 @@ outside closes it.
 - **Don't keep** (⌘D): the next sends are recorded in history on both sides without their
   content. A received text that was not kept can be copied for ten minutes.
 - **Pause** (⌘⇧P): clipboard history records nothing until you resume it.
+- **Copy** and **Delete** are on every row of both lists. With a row selected, ⌘C copies it
+  and ⌘⌫ deletes it; with no row selected they act on the field as usual. Deleting a history row
+  removes the row only: a received file stays in its folder.
 - **Retry** and **Reveal** appear on history rows that failed or that hold a received file.
+- VoiceOver reads each row's buttons with the row they act on ("Copy meeting notes…"), and
+  offers them as actions on the row.
+- Under the send button a line says how the last send went: Sending to studio…, Sent to studio.,
+  or Not sent to studio. with the reason, in orange.
 - The footer says whether the selected device answered when the panel opened: Reachable, Not
   reachable or Checking…. It cannot say whether the connection is direct or relayed: the
   tailcat library Catflap uses does not report the path.
@@ -118,10 +122,25 @@ To remove a device, choose Remove next to it in settings. It is cut off at once.
 
 All of them survive a restart. Catflap's data lives in `~/Library/Application Support/Catflap/`.
 
+## The menu bar item
+
+| Glyph | When |
+| --- | --- |
+| `cf-idle` | Nothing happening |
+| `cf-moving` | A send or a receive is under way |
+| `cf-arrived` | For 3 seconds after something arrives or a send gets there |
+| `cf-problem` | A send failed; it stays until you next open the panel |
+| `cf-paused` | Clipboard history is paused |
+
+`catflap ui state --json` reports the current one as `glyph`, and the panel's line as
+`send_line`.
+
 ## Notifications
 
 Something arriving raises a notification without sound: Copy for text, Reveal for a file.
-Received text goes on the clipboard only when you switch that on.
+Received text goes on the clipboard only when you switch that on. A send that fails while the
+panel is closed raises a notification with Retry; while the panel is open its line says it
+instead.
 
 ## Command line
 
@@ -137,6 +156,8 @@ catflap version
 control in it does: `type`, `select`, `send-text`, `send-clip`, `send`, `send-latest`,
 `attach`, `paste`, `copy`, `delete`, `retry`, `reveal`, `dont-keep`, `pause`, `pair`,
 `pair-start`, `pair-join`, `pair-copy-code`, `pair-confirm`, `pair-decline`, `settings`, `set`,
-`remove`, besides the panel's own `toggle`, `hide` and `simulate-*`. Without arguments an action
+`remove`, besides the panel's own `toggle`, `hide` and `simulate-*`. `press` clicks one of the
+panel's controls by name (`control`, and `id` for a row's Copy, Delete, Retry or Reveal), and
+`simulate-key` presses a key equivalent in the open panel (`key`, `modifiers`). Without arguments an action
 uses what the panel shows; scripts that need arguments (`text`, `id`, `files`, `key`, `value`)
 send them over the control socket.

@@ -41,12 +41,17 @@ struct MacUIState: Codable, Sendable {
     var devices: Int
     var attachments: Int
     var sendLabel: String
+    /// The menu bar glyph: `cf-idle`, `cf-moving`, `cf-arrived`, `cf-paused` or `cf-problem`.
+    /// Reported also when the agent shows no menu bar item.
+    var glyph: String
+    /// The panel's line saying how the last send went; empty before the first.
+    var sendLine: String
     enum CodingKeys: String, CodingKey {
-        case visible, mode, display, shortcut, frame, level, background, motion, list, rows, devices, attachments
+        case visible, mode, display, shortcut, frame, level, background, motion, list, rows, devices, attachments, glyph
         case hasFocus = "has_focus", shortcutKeys = "shortcut_keys", displayFrame = "display_frame", visibleFrame = "visible_frame"
         case appActive = "app_active", appFrontmost = "app_frontmost", activations, activationPolicy = "activation_policy", eventLoop = "event_loop"
         case statusItem = "status_item", clipboardRows = "clipboard_rows", historyRows = "history_rows"
-        case sendLabel = "send_label"
+        case sendLabel = "send_label", sendLine = "send_line"
     }
 }
 
@@ -65,8 +70,9 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
         }
     }
 
-    /// Set by the actions task (T13): sends `payload` to `device`; `keep` is false with Don't keep.
-    var sendHandler: ((PanelPayload, PanelDevice, Bool) -> Void)?
+    /// What the panel does beyond appearing and leaving: sending, Attach, pairing, settings and
+    /// the row actions. Set by PanelActions when it starts, cleared when it stops.
+    weak var actions: PanelActions?
 
     private let feed: PanelFeed
     private let shell: AppShell
@@ -83,6 +89,16 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
     private var refresher: Task<Void, Never>?
     private var hiding: Task<Void, Never>?
     private var observers: [NSObjectProtocol] = []
+    // The menu bar glyph's inputs: sends in flight, a recent arrival or send, a failure the
+    // person has not seen yet.
+    private var moving = false
+    private var problem = false
+    private var arrivedUntil: Date?
+    private var arrivedEnd: Task<Void, Never>?
+    private var sendLine = ""
+    private var sendLineFailed = false
+    /// How long cf-arrived stays after something arrives or is sent.
+    static let arrivedSeconds: TimeInterval = 3
 
     private init(runtime: AgentRuntime) {
         feed = PanelFeed(runtime: runtime)
@@ -143,7 +159,7 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
 
     func stop() {
         machine.handle(.hide, now: Date())
-        for task in [deadline, refresher, hiding] { task?.cancel() }
+        for task in [deadline, refresher, hiding, arrivedEnd] { task?.cancel() }
         window.orderOut(nil)
         band.stop()
         shortcut?.stop()
@@ -205,7 +221,69 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
             motion: accessibility.accessibilityDisplayShouldReduceMotion ? "fade" : "flap",
             statusItem: statusItem != nil, list: model.list.rawValue, rows: model.rows.count,
             clipboardRows: model.clipboard.count, historyRows: model.history.count, devices: model.devices.count,
-            attachments: model.attachments.count, sendLabel: model.sendLabel())
+            attachments: model.attachments.count, sendLabel: model.sendLabel(), glyph: "cf-" + glyph.rawValue, sendLine: sendLine)
+    }
+
+    // MARK: Glyph and the send line
+
+    var isVisible: Bool { machine.mode != .hidden }
+
+    /// What the menu bar item shows: a send in flight first, then a failure not yet seen, then
+    /// a recent arrival or send, then pause.
+    var glyph: CatflapGlyph {
+        if moving { return .moving }
+        if problem { return .problem }
+        if let until = arrivedUntil, until > Date() { return .arrived }
+        return model.paused ? .paused : .idle
+    }
+
+    func showMoving(_ on: Bool) {
+        guard on != moving else { return }
+        moving = on
+        render()
+    }
+
+    /// Something arrived or a send got there: cf-arrived for a few seconds.
+    func showArrived() {
+        arrivedUntil = Date().addingTimeInterval(Self.arrivedSeconds)
+        arrivedEnd?.cancel()
+        arrivedEnd = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int(Self.arrivedSeconds * 1000) + 10))
+            guard !Task.isCancelled else { return }
+            self?.render()
+        }
+        render()
+    }
+
+    /// A send failed: cf-problem until the panel next opens.
+    func showProblem() {
+        problem = true
+        render()
+    }
+
+    func showSendLine(_ text: String, failed: Bool) {
+        sendLine = text
+        sendLineFailed = failed
+        render()
+    }
+
+    /// What the field holds.
+    var fieldText: String { surface.field.stringValue }
+
+    /// Clicks one of the panel's controls, as a person would; returns the control's spoken
+    /// label, or nil when the panel shows no such control or it is disabled.
+    func press(_ control: String, rowID: String?) -> String? {
+        guard machine.mode != .hidden else { return nil }
+        return surface.press(control, rowID: rowID)
+    }
+
+    /// A key equivalent pressed while the panel has the keyboard. Returns whether the panel
+    /// took it.
+    func pressKey(_ characters: String, keyCode: UInt16, modifiers: NSEvent.ModifierFlags) -> Bool {
+        guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: ProcessInfo.processInfo.systemUptime,
+                                           windowNumber: window.windowNumber, context: nil, characters: characters,
+                                           charactersIgnoringModifiers: characters, isARepeat: false, keyCode: keyCode) else { return false }
+        return window.performKeyEquivalent(with: event)
     }
 
     // MARK: State
@@ -231,6 +309,8 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
     }
 
     private func transition(from before: PanelMode, to after: PanelMode) {
+        // The person sees the panel, and with it what went wrong.
+        if before == .hidden { problem = false }
         switch after {
         case .hidden:
             hideWindow()
@@ -343,7 +423,8 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
 
     private func render() {
         surface.render(model, mode: machine.mode)
-        statusItem?.glyph = model.paused ? .paused : .idle
+        surface.renderSendLine(sendLine, failed: sendLineFailed)
+        statusItem?.glyph = glyph
         if machine.mode != .hidden, let placement, abs(Self.surface(of: window.frame).height - surface.fittingSize.height) > 0.5 {
             layoutWindow(placement)
         }
@@ -376,8 +457,17 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
     func panelKeyEquivalent(_ event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         guard let key = event.charactersIgnoringModifiers else { return false }
+        if flags == .command, event.keyCode == 51, let row = model.selectedRow {
+            // ⌘⌫ deletes the selected row; without one it stays the field's.
+            viewDelete(row.id)
+            return true
+        }
         if flags == .command {
             switch key {
+            // ⌘C copies the selected row; without one the field copies its text.
+            case "c" where model.selectedRow != nil: viewCopy(model.selectedRow?.id ?? ""); return true
+            // ⌘V with files on the clipboard attaches them; otherwise the field pastes.
+            case "v" where actions?.pasteFiles() == true: return true
             case "1": viewSelectList(.clipboard); return true
             case "2": viewSelectList(.history); return true
             case "[": model.moveTarget(by: -1); render(); return true
@@ -395,23 +485,52 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
 
     // MARK: View actions
 
-    func viewFilterChanged(_ text: String) { model.setFilter(text); render() }
-    func viewMoveSelection(_ step: Int) { model.moveSelection(by: step); render() }
-    func viewSelectRow(_ id: String?) { model.select(id); render() }
+    func viewFilterChanged(_ text: String) {
+        actions?.selectedRow = nil
+        model.setFilter(text)
+        render()
+    }
+
+    func viewMoveSelection(_ step: Int) {
+        model.moveSelection(by: step)
+        actions?.selectedRow = model.selectedRow?.id
+        render()
+    }
+
+    func viewSelectRow(_ id: String?) {
+        actions?.selectedRow = id
+        model.select(id)
+        render()
+    }
 
     func viewReturn() { viewSend() }
 
     func viewEscape() {
         guard machine.mode == .focused else { return }
         let hadSelection = model.selectedRow != nil
+        actions?.selectedRow = nil
         _ = model.escape()
         handle(.escape(selection: hadSelection))
         render()
     }
 
-    func viewSelectList(_ list: PanelModel.List) { model.setList(list); render() }
-    func viewSelectDevice(_ id: String) { model.selectTarget(id); render() }
-    func viewSetDontKeep(_ on: Bool) { model.dontKeep = on; render() }
+    func viewSelectList(_ list: PanelModel.List) {
+        if list != model.list { actions?.selectedRow = nil }
+        model.setList(list)
+        render()
+    }
+
+    func viewSelectDevice(_ id: String) {
+        actions?.chosenDevice = id
+        model.selectTarget(id)
+        render()
+    }
+
+    func viewSetDontKeep(_ on: Bool) {
+        actions?.dontKeep = on
+        model.dontKeep = on
+        render()
+    }
 
     func viewTogglePause() {
         let paused = !model.paused
@@ -423,16 +542,17 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
 
     func viewSend() {
         guard let payload = model.payload, let device = model.target else { return }
-        sendHandler?(payload, device, !model.dontKeep)
+        actions?.panelSend(payload, to: device.id, keep: !model.dontKeep)
     }
 
     func viewRemoveAttachments() { model.attachments.removeAll(); render() }
-    // Attach, pairing, settings, Retry and Reveal are the actions task's (T13).
-    func viewAttach() {}
-    func viewPair() {}
-    func viewSettings() {}
-    func viewRetry(_ rowID: String) {}
-    func viewReveal(_ rowID: String) {}
+    func viewAttach() { actions?.openPicker() }
+    func viewPair() { actions?.showPairing() }
+    func viewSettings() { actions?.showSettings() }
+    func viewRetry(_ rowID: String) { actions?.panelRetry(rowID) }
+    func viewReveal(_ rowID: String) { actions?.panelReveal(rowID) }
+    func viewCopy(_ rowID: String) { actions?.panelCopy(rowID) }
+    func viewDelete(_ rowID: String) { actions?.panelDelete(rowID) }
 
     func viewDrag(inside: Bool) { handle(.dragInside(inside)) }
 
