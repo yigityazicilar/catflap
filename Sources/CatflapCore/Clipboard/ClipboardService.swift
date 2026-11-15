@@ -22,12 +22,26 @@ public actor ClipboardService {
         for command in ["clip.list", "clip.get", "clip.add", "clip.keep", "clip.delete", "clip.pause", "clip.send", "clip.send.status"] {
             await runtime.register(command) { [self] request in
                 do { return try await handle(request) }
-                catch let failure as ClipboardFailure { return ControlResponse(failure: failure.rawValue) }
-                catch let failure as TransferFailure { return ControlResponse(failure: failure.localizedDescription) }
-                catch { return ControlResponse(failure: "Cannot access clipboard history.") }
+                catch { return ControlResponse(failure: Self.failureMessage(for: error)) }
             }
         }
     }
+    /// What a failed clipboard command says: each known error its own sentence. Any other
+    /// error type is named in the agent's log, without its values, which can hold a path.
+    static func failureMessage(for error: any Error) -> String {
+        switch error {
+        case let failure as ClipboardFailure: return failure.rawValue
+        case let failure as TransferFailure: return failure.errorDescription ?? unexpectedFailure
+        case let failure as AgentError: return failure.rawValue
+        case let failure as PeerError: return failure.errorDescription ?? unexpectedFailure
+        case is CocoaError: return fileFailure
+        default:
+            FileHandle.standardError.write(Data("catflap: a clipboard command failed with \(String(reflecting: type(of: error)))\n".utf8))
+            return unexpectedFailure
+        }
+    }
+    static let fileFailure = "Cannot read or write a file Catflap keeps for the clipboard."
+    static let unexpectedFailure = "The clipboard command failed. The agent's log names the error."
     private func handle(_ request: ControlRequest) async throws -> ControlResponse {
         let a = request.arguments
         switch request.command {
@@ -112,7 +126,7 @@ public actor ClipboardService {
             let file = (keep ? sentImages : outbox).appendingPathComponent(transferID + (item.mime == "image/png" ? ".png" : ".jpg"))
             try AgentPaths.writePrivate(item.content, to: file)
             do {
-                let row = try await transfers.start(deviceID: deviceID, payload: .file(file), keep: keep, id: transferID)
+                let row = try await transfers.start(deviceID: deviceID, payload: .image(file, mime: item.mime ?? "image/png"), keep: keep, id: transferID)
                 Task { [self] in
                     // Only successful delivery permits removal. Failed and uncertain sends need
                     // the source for Retry, including after a restart.
@@ -127,12 +141,41 @@ public actor ClipboardService {
             } catch { try FileManager.default.removeItem(at: file); throw error }
         }
     }
+    /// What `transfers.send` sends for a clipboard item: its text, its one file, or for an
+    /// image a private copy that every device of the batch shares. A kept copy is named by the
+    /// rows that send it, so it lasts while any of them does.
+    public func payload(forItem id: String, keep: Bool) async throws -> TransferPayload {
+        let item = try await history.item(id: id)
+        switch item.kind {
+        case .text, .url: return .text(String(decoding: item.content, as: UTF8.self))
+        case .files:
+            let references = String(decoding: item.content, as: UTF8.self).split(separator: "\n")
+            guard references.count == 1, let url = URL(string: String(references[0])), url.isFileURL else { throw ClipboardFailure.invalid }
+            return .file(url)
+        case .image:
+            _ = try AgentPaths(directory: outbox)
+            if keep { _ = try AgentPaths(directory: sentImages) }
+            let copyID = UUID().uuidString
+            let file = (keep ? sentImages : outbox).appendingPathComponent(copyID + (item.mime == "image/png" ? ".png" : ".jpg"))
+            try AgentPaths.writePrivate(item.content, to: file)
+            if !keep {
+                // No row names a don't-keep copy, so the cleanup leaves it alone for an hour,
+                // longer than a send that never waits can take.
+                preparing.insert(copyID)
+                Task { [self] in try? await Task.sleep(for: .seconds(3600)); await self.releaseCopy(copyID) }
+            }
+            return .image(file, mime: item.mime ?? "image/png")
+        }
+    }
+    private func releaseCopy(_ id: String) { preparing.remove(id) }
     public func cleanOutbox(now: Date = Date()) async throws {
         if FileManager.default.fileExists(atPath: outbox.path) {
             _ = try AgentPaths(directory: outbox)
             for file in try FileManager.default.contentsOfDirectory(at: outbox, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]) {
                 let info = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey])
                 guard info.isRegularFile == true, info.isSymbolicLink != true else { continue }
+                // A folder's listing belongs to its waiting send, which removes it.
+                if file.pathExtension == "manifest" { continue }
                 if preparing.contains(file.deletingPathExtension().lastPathComponent) { continue }
                 let rows = try await store.query("SELECT status FROM history WHERE direction='sent' AND id=?", bindings: [.text(file.deletingPathExtension().lastPathComponent)])
                 let expired = (info.contentModificationDate ?? .distantPast) < now.addingTimeInterval(-ClipboardHistory.lifetime)

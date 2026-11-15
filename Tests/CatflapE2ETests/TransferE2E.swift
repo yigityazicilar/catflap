@@ -32,6 +32,21 @@ private func transferOffPool<T: Sendable>(_ body: @escaping @Sendable () throws 
         Thread.detachNewThread { continuation.resume(with: Result { try body() }) }
     }
 }
+/// The row a send ended with. A dial that did not finish within its limit on a loaded machine
+/// makes the send wait (status 75); the queue tries again after its backoff, 30 s ±10 %, and
+/// the row turns `ok`. The wait for that is a hang guard only.
+private func settled(_ sent: CommandResult, on agent: AgentHarness) async throws -> TransferRecord {
+    #expect([0, 75].contains(sent.code), "send exited \(sent.code): \(String(decoding: sent.output.prefix(2000), as: UTF8.self))")
+    var row = try sent.decode(TransferRecord.self)
+    guard sent.code == 75 else { return row }
+    let id = row.id, peer = row.deviceID
+    let deadline = ContinuousClock.now + .seconds(180)
+    while row.status != "ok" && ContinuousClock.now < deadline {
+        try await Task.sleep(for: .seconds(1))
+        if let now = try? await transferOffPool({ try agent.command(["transfers", "show", id, "--to", peer]) }).decode(TransferRecord.self) { row = now }
+    }
+    return row
+}
 private final class TransferAgents: @unchecked Sendable {
     let first: AgentHarness
     let second: AgentHarness
@@ -84,8 +99,7 @@ struct TransferE2E {
             progress.mark(first ? "forward transfers" : "backward transfers")
             let text = "searchable transfer " + (first ? "forward" : "backward")
             let sentText = try await transferOffPool { try (first ? agents.first : agents.second).command(["send", "--text", text], timeout: 90) }
-            #expect(sentText.code == 0)
-            let textRow = try sentText.decode(TransferRecord.self)
+            let textRow = try await settled(sentText, on: first ? agents.first : agents.second)
             #expect(textRow.status == "ok")
             let receivedText = try await transferOffPool { try (first ? agents.second : agents.first).command(["history", "--search", text]) }.decode([TransferRecord].self)
             #expect(receivedText.first?.text == text && receivedText.first?.direction == "received")
@@ -99,8 +113,7 @@ struct TransferE2E {
             let expected = try await transferOffPool { try TransferInbox.hash(source) }
             progress.mark(first ? "forward file" : "backward file")
             let sentFile = try await transferOffPool { try (first ? agents.first : agents.second).command(["send", "--file", source.path], timeout: 180) }
-            #expect(sentFile.code == 0)
-            let row = try sentFile.decode(TransferRecord.self)
+            let row = try await settled(sentFile, on: first ? agents.first : agents.second)
             #expect(row.status == "ok" && row.size == 64 * 1024 * 1024 && row.sha256 == expected)
             let received = try await transferOffPool { try (first ? agents.second : agents.first).command(["history", "--search", "large.bin"]) }.decode([TransferRecord].self)
             let path = try #require(received.first?.path)

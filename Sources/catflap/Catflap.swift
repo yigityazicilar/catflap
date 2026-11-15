@@ -18,7 +18,7 @@ struct Catflap: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "catflap", abstract: "Local Catflap agent and control client.",
         subcommands: [Agent.self, Status.self, Devices.self, History.self, Toggle.self, UI.self,
-                      Pair.self, Unpair.self, Send.self, Clip.self, Audit.self, Version.self, EraseIdentity.self])
+                      Pair.self, Unpair.self, Send.self, Transfers.self, Inbox.self, Clip.self, Audit.self, Version.self, EraseIdentity.self])
 
     static func main() async {
         #if os(macOS)
@@ -83,8 +83,15 @@ struct Agent: AsyncParsableCommand {
             let lock: AgentLock
             do { lock = try AgentLock(paths: paths) }
             catch AgentError.alreadyRunning where showIfRunning {
-                guard await Self.showPanel(of: paths) else { throw AgentError.alreadyRunning }
-                return
+                switch await Self.showPanel(of: paths) {
+                case .shown: return
+                case .noAnswer:
+                    // The agent took `panel.show` and gave no reply: say so, with the status
+                    // every other command gives for it.
+                    FileHandle.standardError.write(Data((AgentError.noAnswer.rawValue + "\n").utf8))
+                    throw ExitCode(69)
+                case .refused: throw AgentError.alreadyRunning
+                }
             }
             let runtime = try AgentRuntime(paths: paths)
             AgentRuntime.setProcess(runtime)
@@ -92,6 +99,16 @@ struct Agent: AsyncParsableCommand {
             try await Send.install(on: runtime)
             try await Clip.install(on: runtime)
             try await Audit.install(on: runtime)
+            // Presence: pings on request, and every 60 s while a panel holds a watch lease.
+            let identityServer = await runtime.identityServer
+            let identity = await identityServer.identity
+            let presence = PresenceService(store: await runtime.store, clientKeys: identity.clientKeys)
+            await presence.install(on: runtime)
+            if let peers = await runtime.service(PeerService.self) {
+                // A device that answers a check admits this one: that confirms a new pairing,
+                // and its waiting deliveries are due.
+                await presence.setHereHandler { id in await peers.answered(deviceID: id) }
+            }
             try await runtime.start()
             let control = try ControlServer(paths: paths, lock: lock)
             // For the test of a listener that fails while the agent runs.
@@ -119,11 +136,15 @@ struct Agent: AsyncParsableCommand {
             control.stop(); await task.value
             continuation.finish(); term.cancel(); interrupt.cancel()
             await platform?.stop()
+            await presence.stop()
+            await runtime.service(TransferService.self)?.stop()
             await runtime.stop()
             AgentRuntime.setProcess(nil)
             listenerFailed = control.listenerFailed
             withExtendedLifetime(control) {}
             withExtendedLifetime(lock) {}
+        } catch let code as ExitCode {
+            throw code
         } catch {
             reportAgentError(error)
             throw ExitCode.failure
@@ -134,28 +155,39 @@ struct Agent: AsyncParsableCommand {
             throw ExitCode.failure
         }
     }
+    enum Shown { case shown, noAnswer, refused }
     /// Asks the agent that runs for `paths` to show its panel with `panel.show`, which opens it
     /// focused and never hides it. An agent from before that command refuses it as invalid;
     /// that one is asked for the panel's state, and a hidden panel is opened with `toggle`.
-    /// False if that agent cannot be asked.
-    private static func showPanel(of paths: AgentPaths) async -> Bool {
-        guard let shown = try? await ControlClient.requestAsync(.init("panel.show"), socket: paths.socket) else { return false }
-        if shown.ok { return true }
-        guard shown.error == AgentError.invalidRequest.rawValue else { return false }
-        guard let state = try? await ControlClient.requestAsync(.init("ui.state"), socket: paths.socket), state.ok,
-              let shape = (try? JSONSerialization.jsonObject(with: state.payload)) as? [String: Any] else { return false }
-        if shape["visible"] as? Bool == true { return true }
-        guard let toggled = try? await ControlClient.requestAsync(.init("toggle"), socket: paths.socket) else { return false }
-        return toggled.ok
+    /// `noAnswer` when that agent took a request and did not answer it in time.
+    private static func showPanel(of paths: AgentPaths) async -> Shown {
+        func ask(_ command: String) async -> Result<ControlResponse, AgentError> {
+            do { return .success(try await ControlClient.requestAsync(.init(command), socket: paths.socket)) }
+            catch { return .failure(error as? AgentError == .noAnswer ? .noAnswer : .control) }
+        }
+        let shown: ControlResponse
+        switch await ask("panel.show") {
+        case .success(let reply): shown = reply
+        case .failure(let error): return error == .noAnswer ? .noAnswer : .refused
+        }
+        if shown.ok { return .shown }
+        guard shown.error == AgentError.invalidRequest.rawValue else { return .refused }
+        let state: ControlResponse
+        switch await ask("ui.state") {
+        case .success(let reply): state = reply
+        case .failure(let error): return error == .noAnswer ? .noAnswer : .refused
+        }
+        guard state.ok, let shape = (try? JSONSerialization.jsonObject(with: state.payload)) as? [String: Any] else { return .refused }
+        if shape["visible"] as? Bool == true { return .shown }
+        switch await ask("toggle") {
+        case .success(let reply): return reply.ok ? .shown : .refused
+        case .failure(let error): return error == .noAnswer ? .noAnswer : .refused
+        }
     }
 }
 struct Status: ParsableCommand {
     @OptionGroup var options: ClientOptions
     func run() throws { try options.call("status") { _ = try $0.expect(AgentStatus.self) } }
-}
-struct Devices: ParsableCommand {
-    @OptionGroup var options: ClientOptions
-    func run() throws { try options.call("devices") { _ = try $0.expect([DeviceSummary].self) } }
 }
 struct Toggle: ParsableCommand {
     @OptionGroup var options: ClientOptions
@@ -171,11 +203,17 @@ struct UI: ParsableCommand {
         @OptionGroup var options: ClientOptions
         @Argument var action: String
         @Option(name: .long, help: "A file for the action, such as attach. Repeat for several.") var file: [String] = []
+        @Argument(help: "Absolute paths of files and folders, as a file manager's %F passes them.") var paths: [String] = []
         func run() throws {
             var arguments = ["action": action]
             // Absolute paths: the agent does not share this command's working directory.
-            let paths = file.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
-            if !paths.isEmpty { arguments["files"] = paths.joined(separator: "\n") }
+            for path in paths where !path.hasPrefix("/") {
+                if options.json { print(try ControlJSON.text(ClientErrorOutput(error: "Paths given as arguments must be absolute."))) }
+                else { FileHandle.standardError.write(Data("Paths given as arguments must be absolute.\n".utf8)) }
+                throw ExitCode(64)
+            }
+            let all = (file + paths).map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+            if !all.isEmpty { arguments["files"] = all.joined(separator: "\n") }
             try options.call("ui.invoke", arguments: arguments) { try $0.expectObject() }
         }
     }

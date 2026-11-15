@@ -199,7 +199,17 @@ public actor PresenceService {
         active[device.id] = nil
         guard !stopped, !cancelled, let current = known[device.id], samePeer(current, device) else { return }
         cache[device.id] = Cached(checkedAt: now(), ping: result)
+        if result != nil, let onHere {
+            let id = device.id
+            Task { await onHere(id) }
+        }
     }
+
+    public typealias HereHandler = @Sendable (_ deviceID: String) async -> Void
+    private var onHere: HereHandler?
+    /// Called for each check a device answered. An answer proves its server admits this
+    /// device, which confirms a new pairing and makes its waiting deliveries due.
+    public func setHereHandler(_ handler: HereHandler?) { onHere = handler }
 
     /// Waits for the current checks, including cancellation cleanup. Does not trigger a ping.
     public func waitForChecks() async {

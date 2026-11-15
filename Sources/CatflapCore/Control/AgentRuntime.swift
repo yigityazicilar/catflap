@@ -93,6 +93,7 @@ public actor AgentRuntime {
                 var status = AgentStatus(deviceID: await identityServer.identity.id,
                     serverRunning: await identityServer.isRunning, pairedDevices: devices.count)
                 status.desktop = platform.desktop
+                status.schemaVersion = try await store.schemaVersion()
                 status.clipboardCapture = platform.clipboardCapture
                 status.pasteboardAccess = platform.pasteboardAccess
                 return try ControlResponse(value: status)
