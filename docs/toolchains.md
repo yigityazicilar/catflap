@@ -22,8 +22,8 @@ are pinned to the immutable revisions fetched by the initial CI run.
 
 Linux builds gtk4-layer-shell v1.0.4 from upstream. No GTK dependencies are
 built on macOS. Each job prints its actual toolchain versions before building.
-SwiftPM resolves all package pins on either host, but KeyboardShortcuts is a
-dependency only of the macOS target and is never compiled on Linux.
+The package has no third-party Swift dependencies. The macOS app registers its
+shortcuts with Carbon directly (`Sources/CatflapMac/Shortcut/HotKeys.swift`).
 
 ## tailcat
 

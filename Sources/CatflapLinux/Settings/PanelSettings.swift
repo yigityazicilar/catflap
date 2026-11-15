@@ -3,25 +3,25 @@ import Foundation
 
 /// The settings the panel offers. The shortcuts belong to the desktop (the GlobalShortcuts
 /// portal keeps them); start at login is the autostart entry itself; the rest are rows in the
-/// agent's settings table, so all of them survive a restart.
+/// agent's settings table, so all of them survive a restart. There is no private relay setting
+/// for now: the relay comes from the region pinned in this device's identity, and nothing read
+/// such a setting. A `relay` row an earlier build stored stays in the table, unread and not shown.
 struct PanelSettings: Codable, Sendable, Equatable {
     var hoverBand = true
     var startAtLogin = false
     var receivedTextToClipboard = false
     /// Where received files go. Nil: the default, Downloads/Catflap in the home folder.
     var inbox: String?
-    /// A private relay's address for new connections. Nil: tailcat's public relays.
-    var relay: String?
 
     enum CodingKeys: String, CodingKey {
-        case inbox, relay
+        case inbox
         case hoverBand = "hover_band", startAtLogin = "start_at_login", receivedTextToClipboard = "received_text_to_clipboard"
     }
 
     /// Store keys. `hover_band` is the key the macOS panel reads too.
     enum Key: String, CaseIterable {
         case hoverBand = "hover_band", receivedTextToClipboard = "received_text_to_clipboard"
-        case inbox, relay, startAtLogin = "start_at_login"
+        case inbox, startAtLogin = "start_at_login"
     }
 
     static func load(from store: Store) async -> PanelSettings {
@@ -29,7 +29,6 @@ struct PanelSettings: Codable, Sendable, Equatable {
         settings.hoverBand = (try? await store.setting(Key.hoverBand.rawValue)) != "off"
         settings.receivedTextToClipboard = (try? await store.setting(Key.receivedTextToClipboard.rawValue)) == "on"
         settings.inbox = (try? await store.setting(Key.inbox.rawValue)) ?? nil
-        settings.relay = (try? await store.setting(Key.relay.rawValue)) ?? nil
         settings.startAtLogin = Autostart.isEnabled
         return settings
     }
@@ -54,10 +53,6 @@ struct PanelSettings: Codable, Sendable, Equatable {
                 }
                 inbox = path
                 try await store.setSetting(key.rawValue, value: path)
-            case .relay:
-                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                relay = trimmed.isEmpty ? nil : trimmed
-                try await store.setSetting(key.rawValue, value: trimmed)
             case .startAtLogin:
                 try Autostart.set(on)
                 startAtLogin = Autostart.isEnabled

@@ -13,6 +13,11 @@ struct PanelReport: Codable, Sendable {
     var shortcut: String
     var shortcutTrigger: String?
     var sendClipboardShortcut: String
+    /// Which of the two shortcut requests made at start is open: `panel`, `send` or `settled`.
+    var shortcutSetup: String
+    /// `system-dialog` while the focused panel waits for the keyboard back from the system's
+    /// question about a shortcut; nil otherwise.
+    var focusLostTo: String?
     var desktop: String
     var placement: PanelPlacement
     var openedFrom: String
@@ -45,7 +50,7 @@ struct PanelReport: Codable, Sendable {
         case hasFocus = "has_focus", shortcutTrigger = "shortcut_trigger", reducedMotion = "reduced_motion"
         case highContrast = "high_contrast", selectedRow = "selected_row", sendLabel = "send_label"
         case lastReturn = "last_return", openedFrom = "opened_from", messageActions = "message_actions"
-        case sendClipboardShortcut = "send_clipboard_shortcut"
+        case sendClipboardShortcut = "send_clipboard_shortcut", shortcutSetup = "shortcut_setup", focusLostTo = "focus_lost_to"
     }
 }
 
@@ -74,7 +79,14 @@ final class PanelController: @unchecked Sendable {
     private let style = PanelStyle()
     let shortcut: any ShortcutBackend
     let sendShortcut: any ShortcutBackend
-    private var sendShortcutStarted = false
+    /// The two shortcut requests the agent makes at start, one at a time: the system asks the
+    /// person about each, and two questions at once leave one unanswered. `panel` until the
+    /// panel's own shortcut is settled, `send` until the send-clipboard one is, then `settled`.
+    enum ShortcutSetup: String { case panel, send, settled }
+    private(set) var shortcutSetup = ShortcutSetup.panel
+    /// The focused panel lost the keyboard while a request of `shortcutSetup` was open: to the
+    /// system's question about it, which Catflap caused, not to a click outside.
+    private(set) var focusLostToSystemDialog = false
     private var timers: [PanelMachine.Timer: UInt32] = [:]
     private var waiters: [(id: Int, mode: PanelMode, resume: () -> Void)] = []
     private var nextWaiter = 0
@@ -173,19 +185,35 @@ final class PanelController: @unchecked Sendable {
             guard let self else { return }
             publish()
             settingsPage?.refreshShortcuts()
-            // One portal request at a time: the system asks the person about each, and two
-            // questions at once leave one unanswered. The send-clipboard shortcut follows
-            // once the panel's own shortcut is settled.
-            if shortcut.state != "pending" && !sendShortcutStarted {
-                sendShortcutStarted = true
-                sendShortcut.start(onChange: { [weak self] in self?.settingsPage?.refreshShortcuts() },
-                                   onActivated: { [weak self] in self?.sender.sendLatestCopy() })
-            }
+            if shortcutSetup == .panel && shortcut.state != "pending" { advanceShortcutSetup(to: .send) }
         }, onActivated: { [weak self] in self?.open(from: "top"); self?.handle(.hotkey(display: nil)) })
         notifier = Notifier(controller: self)
         tray = StatusNotifierItem(controller: self)
         watcher = StoreWatcher(controller: self)
         watcher.start()
+        publish()
+    }
+
+    /// The panel's shortcut is settled: the send-clipboard request goes next. Once that one is
+    /// settled too, a panel that lost the keyboard to the system's question gets it back.
+    private func advanceShortcutSetup(to next: ShortcutSetup) {
+        shortcutSetup = next
+        switch next {
+        case .panel:
+            break
+        case .send:
+            sendShortcut.start(onChange: { [weak self] in
+                guard let self else { return }
+                settingsPage?.refreshShortcuts()
+                if shortcutSetup == .send && sendShortcut.state != "pending" { advanceShortcutSetup(to: .settled) }
+                publish()
+            }, onActivated: { [weak self] in self?.sender.sendLatestCopy() })
+        case .settled:
+            if focusLostToSystemDialog {
+                focusLostToSystemDialog = false
+                returnFromDialog()
+            }
+        }
         publish()
     }
 
@@ -195,8 +223,12 @@ final class PanelController: @unchecked Sendable {
             guard let self else { return }
             let active = gtk_window_is_active(window.cast()) != 0
             defer { wasActive = active; publish() }
-            // On Wayland a click outside shows up as the panel losing keyboard focus.
-            if wasActive && !active && !dialogOpen { handle(.focusLost) }
+            if active { focusLostToSystemDialog = false }
+            guard wasActive && !active && !dialogOpen && machine.mode == .focused else { return }
+            // On Wayland a click outside shows up as the panel losing keyboard focus. While a
+            // shortcut request is open, the system may show its question about it at any moment
+            // and that window takes the keyboard: Catflap's own question, so the panel stays.
+            if shortcutSetup != .settled { focusLostToSystemDialog = true } else { handle(.focusLost) }
         }
         GLib.connect(window, "map", Int32(CF_SHAPE_VOID)) { [weak self] _ in
             guard let self else { return }
@@ -300,6 +332,7 @@ final class PanelController: @unchecked Sendable {
         case .hide:
             host.withdraw(view.window)
             wasActive = false
+            focusLostToSystemDialog = false
             openedFrom = "top"
             view.didHide()
             extras.didHide()
@@ -349,6 +382,7 @@ final class PanelController: @unchecked Sendable {
         return PanelReport(
             visible: state.visible, mode: state.mode, hasFocus: state.hasFocus, display: state.display,
             shortcut: state.shortcut, shortcutTrigger: shortcut.trigger, sendClipboardShortcut: sendShortcut.state,
+            shortcutSetup: shortcutSetup.rawValue, focusLostTo: focusLostToSystemDialog ? "system-dialog" : nil,
             desktop: host.desktop, placement: placement, openedFrom: openedFrom, bands: host.triggerDisplays,
             width: Int(gtk_widget_get_width(view.window.cast())), height: Int(gtk_widget_get_height(view.window.cast())),
             reducedMotion: style.reducedMotion, highContrast: style.highContrast, opaque: style.opaqueBackground,

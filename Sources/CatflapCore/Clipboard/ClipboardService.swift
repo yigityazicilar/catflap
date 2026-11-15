@@ -5,16 +5,21 @@ public actor ClipboardService {
     private let transfers: TransferService
     private let store: Store
     private let outbox: URL
+    /// Private copies of images sent with Keep, which their history rows name so they can be
+    /// sent again after the clipboard row, the outbox file or the agent itself is gone. A copy
+    /// goes when no sent row names it any more, or after `ClipboardHistory.lifetime`.
+    public nonisolated let sentImages: URL
     private var preparing: Set<String> = []
     public init(history: ClipboardHistory, transfers: TransferService, store: Store, directory: URL) {
         self.history = history; self.transfers = transfers; self.store = store
         outbox = directory.appendingPathComponent("outbox")
+        sentImages = directory.appendingPathComponent("sent-images")
     }
     public func install(on runtime: AgentRuntime) async throws {
         try await cleanOutbox()
         await runtime.provide(history)
         await runtime.provide(self)
-        for command in ["clip.list", "clip.add", "clip.keep", "clip.delete", "clip.pause", "clip.send", "clip.send.status"] {
+        for command in ["clip.list", "clip.get", "clip.add", "clip.keep", "clip.delete", "clip.pause", "clip.send", "clip.send.status"] {
             await runtime.register(command) { [self] request in
                 do { return try await handle(request) }
                 catch let failure as ClipboardFailure { return ControlResponse(failure: failure.rawValue) }
@@ -26,7 +31,14 @@ public actor ClipboardService {
     private func handle(_ request: ControlRequest) async throws -> ControlResponse {
         let a = request.arguments
         switch request.command {
-        case "clip.list": return try await ControlResponse(value: history.items(search: a["search"]))
+        case "clip.list":
+            // A panel lists again after deleting a history row: a kept image copy no row
+            // names any more goes now rather than at the next start.
+            try? await cleanOutbox()
+            return try await ControlResponse(value: history.previews(search: a["search"]))
+        case "clip.get":
+            guard let id = a["id"] else { throw ClipboardFailure.missing }
+            return try await ControlResponse(value: history.item(id: id))
         case "clip.add":
             guard let kind = ClipboardKind(rawValue: a["kind"] ?? "text") else { throw ClipboardFailure.invalid }
             let types = a["offered_types"]?.split(separator: "\n").map(String.init) ?? []
@@ -90,11 +102,14 @@ public actor ClipboardService {
             }
             return try await transfers.start(deviceID: deviceID, payload: .file(url), keep: keep)
         case .image:
+            // The transfer reads a file. With Keep it is a private copy its history row names
+            // for as long as that row exists; without, a transient one in the outbox.
             _ = try AgentPaths(directory: outbox)
+            if keep { _ = try AgentPaths(directory: sentImages) }
             let transferID = UUID().uuidString
             preparing.insert(transferID)
             defer { preparing.remove(transferID) }
-            let file = outbox.appendingPathComponent(transferID + (item.mime == "image/png" ? ".png" : ".jpg"))
+            let file = (keep ? sentImages : outbox).appendingPathComponent(transferID + (item.mime == "image/png" ? ".png" : ".jpg"))
             try AgentPaths.writePrivate(item.content, to: file)
             do {
                 let row = try await transfers.start(deviceID: deviceID, payload: .file(file), keep: keep, id: transferID)
@@ -113,19 +128,57 @@ public actor ClipboardService {
         }
     }
     public func cleanOutbox(now: Date = Date()) async throws {
-        guard FileManager.default.fileExists(atPath: outbox.path) else { return }
-        _ = try AgentPaths(directory: outbox)
-        for file in try FileManager.default.contentsOfDirectory(at: outbox, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]) {
+        if FileManager.default.fileExists(atPath: outbox.path) {
+            _ = try AgentPaths(directory: outbox)
+            for file in try FileManager.default.contentsOfDirectory(at: outbox, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]) {
+                let info = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey])
+                guard info.isRegularFile == true, info.isSymbolicLink != true else { continue }
+                if preparing.contains(file.deletingPathExtension().lastPathComponent) { continue }
+                let rows = try await store.query("SELECT status FROM history WHERE direction='sent' AND id=?", bindings: [.text(file.deletingPathExtension().lastPathComponent)])
+                let expired = (info.contentModificationDate ?? .distantPast) < now.addingTimeInterval(-ClipboardHistory.lifetime)
+                let needed = rows.contains { row in
+                    if case .text(let status) = row["status"] { return status != "ok" }
+                    return false
+                }
+                if (!needed || expired) && FileManager.default.fileExists(atPath: file.path) {
+                    // A kept row from before kept copies existed names this transient file.
+                    try await store.execute("UPDATE history SET path=NULL WHERE direction='sent' AND path=?", bindings: [.text(outbox.appendingPathComponent(file.lastPathComponent).path)])
+                    try FileManager.default.removeItem(at: file)
+                }
+            }
+        }
+        try await cleanSentImages(now: now)
+    }
+    /// Removes each kept image copy that no sent history row names, and each one older than
+    /// the clipboard's lifetime, together with the path its rows hold.
+    private func cleanSentImages(now: Date) async throws {
+        guard FileManager.default.fileExists(atPath: sentImages.path) else { return }
+        _ = try AgentPaths(directory: sentImages)
+        // Listed in one turn of this actor, with no wait: a copy not being prepared now has
+        // its row saved already, so the query below sees every row that names it.
+        var candidates: [(file: URL, modified: Date)] = []
+        for listed in try FileManager.default.contentsOfDirectory(at: sentImages, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]) {
+            let file = sentImages.appendingPathComponent(listed.lastPathComponent)
             let info = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey])
             guard info.isRegularFile == true, info.isSymbolicLink != true else { continue }
             if preparing.contains(file.deletingPathExtension().lastPathComponent) { continue }
-            let rows = try await store.query("SELECT status FROM history WHERE direction='sent' AND id=?", bindings: [.text(file.deletingPathExtension().lastPathComponent)])
-            let expired = (info.contentModificationDate ?? .distantPast) < now.addingTimeInterval(-ClipboardHistory.lifetime)
-            let needed = rows.contains { row in
-                if case .text(let status) = row["status"] { return status != "ok" }
-                return false
+            candidates.append((file, info.contentModificationDate ?? .distantPast))
+        }
+        func canonical(_ path: String) -> String { URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path }
+        // A row can name a copy by another spelling of its path, as given to `send --file`.
+        var named: [String: [String]] = [:]
+        for row in try await store.query("SELECT path FROM history WHERE direction='sent' AND keep=1 AND path IS NOT NULL") {
+            if case .text(let path) = row["path"] { named[canonical(path), default: []].append(path) }
+        }
+        for (file, modified) in candidates {
+            let expired = modified < now.addingTimeInterval(-ClipboardHistory.lifetime)
+            let names = named[canonical(file.path)] ?? []
+            guard expired || names.isEmpty else { continue }
+            // Its rows must not keep offering a send that can only fail.
+            for path in names {
+                try await store.execute("UPDATE history SET path=NULL WHERE direction='sent' AND path=?", bindings: [.text(path)])
             }
-            if (!needed || expired) && FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+            if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
         }
     }
 }
