@@ -14,6 +14,14 @@ the core's limit plus one overflow sentinel byte, or a three-second deadline. No
 body is requested until the Swift core has inspected the complete raw offered-type list.
 Primary selections are not recorded. The first advertised seat supplies clipboard history.
 
+An offer lives from its `data_offer` until the selection that names it is replaced; a primary
+selection's offer is destroyed as soon as it is named. A read may end between `data_offer`,
+its MIME types and the selection, so an offer no selection has named yet is kept across
+dispatches, never pruned. `ClipboardSplitDeliveryTests` plays such split deliveries from a
+scripted compositor of its own: each event reaches the client in a read of its own (the
+compositor waits until its send queue is empty), for an ordinary offer and for one whose
+password-manager marker arrives last. It needs no nested KWin and is never gated.
+
 `LinuxClipboardE2E` launches an isolated headless KWin with a private runtime directory and
 session bus. It never connects to the login session. `wl-copy --foreground --sensitive`
 provides a real text offer alongside `x-kde-passwordManagerHint`; a client-side protocol

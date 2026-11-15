@@ -38,8 +38,8 @@ an application whose desktop file it finds, and it reads the app id
 
 ## Start
 
-Log out and back in, or run `catflap agent`. On first start Plasma asks once whether Catflap
-may use its two shortcuts:
+Log out and back in, or run `catflap agent`. On first start Plasma asks whether Catflap may
+use each of its two shortcuts, one question after the other:
 
 | Shortcut | Does |
 | --- | --- |
@@ -47,6 +47,11 @@ may use its two shortcuts:
 | Ctrl+Alt+Shift+Space | Sends the newest copy to the device you sent to last. |
 
 Change either in Settings, or in System Settings under Shortcuts.
+
+If the panel is open when one of these questions comes up, the question takes the keyboard but
+the panel stays open, and gets the keyboard back once both questions are answered. Until then
+Catflap cannot tell a click on the question from a click elsewhere, so neither closes the
+panel; afterwards a click outside closes it as usual.
 
 ## The panel
 
@@ -56,7 +61,9 @@ will send and to which device. Esc clears a selection, then closes the panel.
 
 - **Attach…** opens the system file picker; the files appear under the field. You can also
   drop files on the panel, or paste files you copied in the file manager (Ctrl+V). Return or
-  the send button sends them. A dropped file leaves the panel open with the file attached.
+  the send button sends them. A dropped file leaves the panel open with the file attached. If
+  some of the attached files cannot be sent (one was moved or deleted, say), the panel names
+  each file that did not go and why; those stay attached, so the next Send tries only them.
 - **The row actions** below the list act on the selected row: Copy, Delete, Retry for a send
   that did not arrive, and Show in folder for a file. Ctrl+C (with the field empty) and Delete
   do the same from the keyboard. Deleting a history row leaves a received file in the inbox.
@@ -127,7 +134,6 @@ when a device is paired, renamed or removed.
 | Start at login | on after `install.sh` | `$XDG_CONFIG_HOME/autostart/io.github.yigityazicilar.Catflap.desktop` |
 | Put received text on the clipboard | off | the agent's settings |
 | Inbox folder | `~/Downloads/Catflap` | the agent's settings; used from the next start |
-| Private relay | none | the agent's settings; stored, not yet used (see below) |
 
 **Quit Catflap** at the bottom of Settings stops the agent.
 
@@ -149,11 +155,18 @@ runs, which is how the tests check it:
 The control channel also takes arguments for these actions (`text`, `files`, `id`, `device`,
 `keep`, `code`, `key`, `value`); the command line passes only the action name so far.
 
+A send goes to a device from the agent's own list of paired devices, read when you send. If
+that list cannot be read, nothing is sent and the panel says "Catflap could not read your
+paired devices. Try again." A send of several files that did not all start fails (exit 1)
+with a sentence naming each file that did not go; over the control channel its reply still
+lists the sends that started and, under `outcomes`, how each file went.
+
 ## Known limits
 
 - The footer shows whether the selected device answers (Reachable, Not reachable,
   Checking…), not whether the path is direct or relayed: the tailcat library Catflap is built
   on reports no path information.
-- The private relay setting is saved but the engine does not use it yet.
+- There is no private relay setting: the relay comes from the region this device's identity
+  was created with. A relay value an earlier build saved is ignored.
 - Changing the inbox takes effect when the agent next starts.
 - X11 sessions are not supported.

@@ -213,6 +213,12 @@ final class PanelExtras: @unchecked Sendable {
         renderAttachments()
     }
 
+    /// Takes these files (by path) off the attachments and leaves the rest attached.
+    func detach(_ paths: [String]) {
+        attachments.removeAll { uri in URL(string: uri).map { paths.contains($0.path) } ?? false }
+        renderAttachments()
+    }
+
     var attachedPaths: [String] { attachments.compactMap { URL(string: $0)?.path } }
 
     private func renderAttachments() {

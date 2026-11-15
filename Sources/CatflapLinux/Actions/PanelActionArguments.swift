@@ -4,8 +4,17 @@ import Foundation
 
 /// What a `ui invoke` action reports back.
 struct ActionResult: Codable, Sendable {
+    /// How one request of a send went: `started`, `refused` (with the agent's sentence) or
+    /// `unstarted`. `file` is the file's name for a file.
+    struct Outcome: Codable, Sendable {
+        var file: String?
+        var status: SendBatch.Status
+        var error: String?
+    }
     var action: String
     var transfers: [TransferRecord] = []
+    /// One entry per request of a send, in order.
+    var outcomes: [Outcome] = []
     var attachments: [String] = []
     var copied: String?
     var message: String = ""
@@ -41,7 +50,9 @@ enum PanelActionArguments {
             let outcome = await withCheckedContinuation { (done: CheckedContinuation<Result<[TransferRecord], SendRefusal>, Never>) in
                 GLib.idle { panel.sender.sendLatestCopy { done.resume(returning: $0) } }
             }
-            return await respond(action, outcome, panel)
+            return await respond(action, outcome.map { rows in
+                SendBatch(outcomes: rows.map { SendBatch.Outcome(file: nil, status: .started, row: $0) }, refusal: nil)
+            }, panel)
         case "attach":
             let files = files(arguments)
             let missing = files.map { $0.hasPrefix("file://") ? URL(string: $0)?.path ?? $0 : $0 }
@@ -75,9 +86,11 @@ enum PanelActionArguments {
             }
             return await result(action, panel) { panel.sender.retry(deviceID: device, id: id) }
         case "remove":
-            let paired = await pairedDevices(panel)
-            guard let device = await panel.loop.perform({ resolve(arguments["device"], panel, paired: paired) }) else {
-                return ControlResponse(failure: "No paired device has that id or name.")
+            let selected = await panel.loop.perform { panel.view.selectedDevice }
+            let device: PanelDevice
+            switch await target(arguments["device"], runtime: panel.runtime, selected: selected, missing: "No paired device has that id or name.") {
+            case .success(let found): device = found
+            case .failure(let refusal): return await refuse(refusal, panel)
             }
             let outcome = await withCheckedContinuation { (done: CheckedContinuation<Result<Void, SendRefusal>, Never>) in
                 GLib.idle { panel.sender.remove(deviceID: device.id, name: device.name) { done.resume(returning: $0) } }
@@ -139,15 +152,15 @@ enum PanelActionArguments {
             }
         }
         let request = arguments
-        // The agent's own list, as it is now: the panel's copy follows the store a moment
-        // later, so a send right after pairing would find no device in it.
-        let paired = await pairedDevices(panel)
-        let outcome = await withCheckedContinuation { (done: CheckedContinuation<Result<[TransferRecord], SendRefusal>, Never>) in
+        let selected = await panel.loop.perform { panel.view.selectedDevice }
+        let device: PanelDevice
+        switch await target(request["device"] ?? request["device_id"], runtime: panel.runtime, selected: selected,
+                            missing: "No paired device. Pair one first.") {
+        case .success(let found): device = found
+        case .failure(let refusal): return await refuse(refusal, panel)
+        }
+        let outcome = await withCheckedContinuation { (done: CheckedContinuation<Result<SendBatch, SendRefusal>, Never>) in
             GLib.idle {
-                guard let device = resolve(request["device"] ?? request["device_id"], panel, paired: paired) else {
-                    done.resume(returning: .failure(SendRefusal(message: "No paired device. Pair one first.")))
-                    return
-                }
                 let keep = request["keep"].map { $0 != "false" } ?? !panel.extras.dontKeep
                 let payload: PanelPayload?
                 switch action {
@@ -176,12 +189,12 @@ enum PanelActionArguments {
                     guard let request = clipboardRequest(row, device, keep) else {
                         // A history row goes through the panel's own path.
                         panel.sender.send(payload, to: device, keep: keep)
-                        done.resume(returning: .success([]))
+                        done.resume(returning: .success(SendBatch(outcomes: [], refusal: nil)))
                         return
                     }
                     requests = [request]
                 }
-                panel.sender.start(requests, to: device, clearing: payload) { done.resume(returning: $0) }
+                panel.sender.start(requests, to: device, clearing: payload) { done.resume(returning: .success($0)) }
             }
         }
         return await respond(action, outcome, panel)
@@ -192,38 +205,64 @@ enum PanelActionArguments {
         return ControlRequest("clip.send", arguments: ["id": row.id, "device_id": device.id, "keep": keep ? "true" : "false"])
     }
 
-    private static func respond(_ action: String, _ outcome: Result<[TransferRecord], SendRefusal>, _ panel: PanelController) async -> ControlResponse {
+    /// A send that started everything answers ok. One that did not answers with the sentence
+    /// that says which files did not go; when several were asked for, the reply still carries
+    /// the sends that started and how each request went.
+    private static func respond(_ action: String, _ outcome: Result<SendBatch, SendRefusal>, _ panel: PanelController) async -> ControlResponse {
         switch outcome {
         case .failure(let refusal): return ControlResponse(failure: refusal.message)
-        case .success(let rows):
-            return await result(action, panel, transfers: rows) {}
+        case .success(let batch):
+            let outcomes = batch.outcomes.map { ActionResult.Outcome(file: $0.file == nil ? nil : $0.name, status: $0.status, error: $0.error) }
+            guard let refusal = batch.refusal else { return await result(action, panel, transfers: batch.started, outcomes: outcomes) {} }
+            if batch.outcomes.count <= 1 { return ControlResponse(failure: refusal) }
+            var response = await result(action, panel, transfers: batch.started, outcomes: outcomes) {}
+            response.ok = false
+            response.error = refusal
+            response.exitCode = 1
+            return response
         }
     }
 
-    // MARK: Rows and devices, on the GTK thread
-
-    /// The paired devices as the agent lists them, most recently used first; nil when the
-    /// agent could not be asked, and then the panel's own list is used.
-    private static func pairedDevices(_ panel: PanelController) async -> [PanelDevice]? {
-        await PanelController.request([DeviceSummary].self, "devices", panel.runtime)?.map { PanelDevice(id: $0.id, name: $0.name) }
+    /// Shows a refusal that comes before anything is sent in the panel's message line too.
+    private static func refuse(_ refusal: SendRefusal, _ panel: PanelController) async -> ControlResponse {
+        if refusal.message == unreadableDevices { await panel.loop.perform { panel.extras.setMessage(refusal.message) } }
+        return ControlResponse(failure: refusal.message)
     }
 
-    /// The device a `ui invoke` action names: by id, or by a name only one device has; with
-    /// none named, the device selected in the panel if it is still paired, else the most
-    /// recently used one. Called on the GTK thread.
-    private static func resolve(_ text: String?, _ panel: PanelController, paired: [PanelDevice]?) -> PanelDevice? {
-        guard let devices = paired else {
-            guard let text else { return panel.view.selectedDevice ?? panel.settingsPage.firstDevice }
-            return panel.settingsPage.device(text)
-        }
+    // MARK: Devices
+
+    /// What a send or remove answers when the agent's list of paired devices cannot be read.
+    static let unreadableDevices = "Catflap could not read your paired devices. Try again."
+
+    /// The paired devices as the agent lists them now, most recently used first; nil when the
+    /// agent could not be asked or its answer could not be read.
+    static func pairedDevices(_ runtime: AgentRuntime) async -> [PanelDevice]? {
+        await PanelController.request([DeviceSummary].self, "devices", runtime)?.map { PanelDevice(id: $0.id, name: $0.name) }
+    }
+
+    /// The device a `ui invoke` action goes to, from the agent's own list as it is now: the
+    /// panel's copy follows the store a moment later, so a send right after pairing would find
+    /// no device in it, and a device removed since could still be in it. When the agent's list
+    /// cannot be read, nothing goes anywhere. `missing` is the refusal when no device matches.
+    static func target(_ text: String?, runtime: AgentRuntime, selected: PanelDevice?, missing: String) async -> Result<PanelDevice, SendRefusal> {
+        guard let paired = await pairedDevices(runtime) else { return .failure(SendRefusal(message: unreadableDevices)) }
+        guard let device = resolve(text, paired: paired, selected: selected) else { return .failure(SendRefusal(message: missing)) }
+        return .success(device)
+    }
+
+    /// By id, or by a name only one device has; with none named, the device selected in the
+    /// panel if it is still paired, else the most recently used one.
+    static func resolve(_ text: String?, paired devices: [PanelDevice], selected: PanelDevice?) -> PanelDevice? {
         guard let text else {
-            if let selected = panel.view.selectedDevice, devices.contains(selected) { return selected }
+            if let selected, devices.contains(selected) { return selected }
             return devices.first
         }
         if let device = devices.first(where: { $0.id == text }) { return device }
         let named = devices.filter { $0.name == text }
         return named.count == 1 ? named[0] : nil
     }
+
+    // MARK: Rows, on the GTK thread
 
     private static func clipboardRow(_ id: String?, _ panel: PanelController) -> PanelRow? {
         if let id { return PanelText.rows(clipboard: panel.items.filter { $0.id == id }).first }
@@ -245,11 +284,11 @@ enum PanelActionArguments {
     }
 
     /// Runs `body` on the GTK thread, then answers with what the panel shows.
-    private static func result(_ action: String, _ panel: PanelController, transfers: [TransferRecord] = [], copied: String? = nil,
-                               _ body: @escaping @Sendable () -> Void) async -> ControlResponse {
+    private static func result(_ action: String, _ panel: PanelController, transfers: [TransferRecord] = [], outcomes: [ActionResult.Outcome] = [],
+                               copied: String? = nil, _ body: @escaping @Sendable () -> Void) async -> ControlResponse {
         let value = await panel.loop.perform {
             body()
-            return ActionResult(action: action, transfers: transfers, attachments: panel.extras.attachmentNames, copied: copied,
+            return ActionResult(action: action, transfers: transfers, outcomes: outcomes, attachments: panel.extras.attachmentNames, copied: copied,
                                 message: panel.extras.message, state: panel.state())
         }
         return (try? ControlResponse(value: value)) ?? ControlResponse(error: .storage)

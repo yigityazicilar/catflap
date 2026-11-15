@@ -88,6 +88,57 @@ final class LinuxActionsE2E: XCTestCase {
         XCTAssertTrue(try session.eventually { try !session.history().contains { $0.id == received.id } })
     }
 
+    /// Two attached files, one gone by the time Send is pressed: the reply and the panel say
+    /// which file went and which did not, never that the batch was sent; only the missing one
+    /// stays attached, and the next Send sends only it.
+    func testMultiFileSendReportsEachFileAndKeepsOnlyTheOneNotSent() throws {
+        let session = try ActionsSession()
+        try session.start()
+        try session.confirmShortcuts()
+        try session.pairWithCommandLine()
+        let peerName = try XCTUnwrap(session.devices().first?.name)
+        let kept = session.root.appendingPathComponent("home/kept.txt")
+        let gone = session.root.appendingPathComponent("home/gone.txt")
+        try Data((0..<50_000).map { UInt8(truncatingIfNeeded: $0 &* 7) }).write(to: kept)
+        try Data("removed before send".utf8).write(to: gone)
+        let keptHash = try TransferInbox.hash(kept)
+        XCTAssertTrue(try session.invoke("attach", ["files": kept.path + "\n" + gone.path]).ok)
+        XCTAssertEqual(try session.describe().attachments, ["kept.txt", "gone.txt"])
+        try FileManager.default.removeItem(at: gone)
+
+        let reply = try session.invoke("send")
+        XCTAssertFalse(reply.ok, "a batch that did not all start is not a success")
+        let refusal = try XCTUnwrap(reply.error)
+        XCTAssertTrue(refusal.hasPrefix("Sending 1 of 2 files to \(peerName)."), refusal)
+        XCTAssertTrue(refusal.contains("gone.txt was not sent: Cannot read that file."), refusal)
+        let result = try reply.decode(ActionsResult.self)
+        XCTAssertEqual(result.outcomes, [.init(file: "kept.txt", status: "started", error: nil),
+                                         .init(file: "gone.txt", status: "refused", error: "Cannot read that file.")])
+        XCTAssertEqual(result.transfers.count, 1)
+        XCTAssertEqual(result.attachments, ["gone.txt"])
+        // The started file arrives, and the panel's last word on the batch still names the other.
+        XCTAssertTrue(try session.eventually(60) {
+            try session.history(peer: true).contains { $0.direction == "received" && $0.status == "ok" && $0.sha256 == keptHash }
+        })
+        var message = ""
+        XCTAssertTrue(try session.eventually(30) { message = try session.describe().message; return message.hasPrefix("Sent kept.txt to ") })
+        XCTAssertTrue(message.contains("gone.txt was not sent"), message)
+        XCTAssertFalse(message.contains("2 items"), message)
+        XCTAssertEqual(try session.describe().attachments, ["gone.txt"])
+
+        // The file is back: Send sends only what stayed attached.
+        try Data("back before the second send".utf8).write(to: gone)
+        let goneHash = try TransferInbox.hash(gone)
+        let again = try session.invoke("send")
+        XCTAssertTrue(again.ok, again.error ?? "")
+        XCTAssertEqual(try again.decode(ActionsResult.self).outcomes.map(\.file), ["gone.txt"])
+        XCTAssertTrue(try session.eventually(60) {
+            try session.history(peer: true).contains { $0.direction == "received" && $0.status == "ok" && $0.sha256 == goneHash }
+        })
+        XCTAssertTrue(try session.eventually { try session.describe().attachments.isEmpty })
+        XCTAssertEqual(try session.history(peer: true).filter { $0.direction == "received" && $0.sha256 == keptHash }.count, 1)
+    }
+
     func testArrivalNotifiesQuietlyWithCopyAndShowInFolder() throws {
         let session = try ActionsSession()
         try session.start()
@@ -219,16 +270,18 @@ final class LinuxActionsE2E: XCTestCase {
         try session.start(peer: false)
         try session.confirmShortcuts()
         let inbox = session.root.appendingPathComponent("elsewhere").path
-        for (key, value) in [("hover_band", "off"), ("received_text_to_clipboard", "on"), ("inbox", inbox),
-                             ("relay", "relay.example.test"), ("start_at_login", "on")] {
+        for (key, value) in [("hover_band", "off"), ("received_text_to_clipboard", "on"), ("inbox", inbox), ("start_at_login", "on")] {
             let response = try session.invoke("set", ["key": key, "value": value])
             XCTAssertTrue(response.ok, response.error ?? key)
         }
+        // No private relay setting: nothing would use it, so it is neither offered nor stored.
+        let relay = try session.invoke("set", ["key": "relay", "value": "relay.example.test"])
+        XCTAssertFalse(relay.ok)
+        XCTAssertEqual(relay.exitCode, 64)
         let expected = try session.describe().settings
         XCTAssertFalse(expected.hoverBand)
         XCTAssertTrue(expected.receivedTextToClipboard)
         XCTAssertEqual(expected.inbox, inbox)
-        XCTAssertEqual(expected.relay, "relay.example.test")
         XCTAssertTrue(expected.startAtLogin)
         let autostart = session.root.appendingPathComponent("config/autostart/io.github.yigityazicilar.Catflap.desktop")
         let entry = try String(contentsOf: autostart, encoding: .utf8)
@@ -240,8 +293,15 @@ final class LinuxActionsE2E: XCTestCase {
         _ = try session.invoke("simulate-hover")
         XCTAssertEqual(try session.describe().mode, "hidden")
 
+        // A relay value an earlier build stored stays readable in the table but is never shown.
+        let store = session.data.appendingPathComponent("store.sqlite").path
+        XCTAssertEqual(try session.run("/usr/bin/sqlite3", [store, "SELECT count(*) FROM settings WHERE key='relay'"]), Data("0\n".utf8))
+        try session.run("/usr/bin/sqlite3", ["-cmd", ".timeout 5000", store, "INSERT INTO settings(key, value) VALUES('relay', 'relay.example.test')"])
+
         try session.restartPanelAgent()
         XCTAssertEqual(try session.describe().settings, expected)
+        let shown = try XCTUnwrap(try JSONSerialization.jsonObject(with: session.catflap(["ui", "invoke", "describe"])) as? [String: Any])
+        XCTAssertEqual((shown["settings"] as? [String: Any])?.keys.sorted(), ["hover_band", "inbox", "received_text_to_clipboard", "start_at_login"])
         _ = try session.invoke("simulate-hover")
         XCTAssertEqual(try session.describe().mode, "hidden")
         // The Inbox setting is the one the transfer service reads at start.

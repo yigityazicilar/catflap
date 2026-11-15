@@ -23,7 +23,11 @@ struct cf_dc {
     struct wl_seat *seat;
     struct ext_data_control_manager_v1 *manager;
     struct ext_data_control_device_v1 *device;
-    struct offer *offers, *selection;
+    /* Offers introduced by data_offer that no selection or primary_selection has named yet. A
+     * read may end between data_offer, its MIME types and the event that names it, so these
+     * live until that event arrives, however many dispatches it takes. */
+    struct offer *introduced;
+    struct offer *selection;
     uint32_t manager_name, seat_name;
     int wake[2], changed, failed;
     atomic_int cancelled;
@@ -33,13 +37,14 @@ static void free_offer(struct offer *o) {
     for (size_t i = 0; i < o->count; ++i) free(o->types[i]);
     free(o->types); free(o);
 }
-static void prune(struct cf_dc *c) {
-    struct offer **p = &c->offers;
-    while (*p) {
-        struct offer *o = *p;
-        if (o == c->selection) { p = &o->next; continue; }
-        *p = o->next; free_offer(o);
+/* The offer a selection event names leaves the introduced list. */
+static struct offer *named(struct cf_dc *c, struct ext_data_control_offer_v1 *proxy) {
+    if (!proxy) return NULL;
+    struct offer *o = wl_proxy_get_user_data((struct wl_proxy *)proxy);
+    for (struct offer **p = &c->introduced; *p; p = &(*p)->next) {
+        if (*p == o) { *p = o->next; o->next = NULL; break; }
     }
+    return o;
 }
 static void offered(void *data, struct ext_data_control_offer_v1 *proxy, const char *mime) {
     (void)proxy;
@@ -57,22 +62,27 @@ static void data_offer(void *data, struct ext_data_control_device_v1 *device, st
     struct cf_dc *c = data;
     struct offer *o = calloc(1, sizeof(*o));
     if (!o) abort();
-    o->proxy = proxy; o->next = c->offers; c->offers = o;
+    o->proxy = proxy; o->next = c->introduced; c->introduced = o;
     ext_data_control_offer_v1_add_listener(proxy, &offer_listener, o);
 }
 static void selection(void *data, struct ext_data_control_device_v1 *device, struct ext_data_control_offer_v1 *proxy) {
     (void)device;
     struct cf_dc *c = data;
-    c->selection = proxy ? wl_proxy_get_user_data((struct wl_proxy *)proxy) : NULL;
+    struct offer *next = named(c, proxy);
+    /* The protocol asks the client to destroy the selection this one replaces. */
+    if (c->selection && c->selection != next) free_offer(c->selection);
+    c->selection = next;
     c->changed = 1;
-    prune(c);
 }
 static void finished(void *data, struct ext_data_control_device_v1 *device) {
     (void)device; ((struct cf_dc *)data)->failed = 1;
 }
 static void primary(void *data, struct ext_data_control_device_v1 *device, struct ext_data_control_offer_v1 *proxy) {
-    (void)data; (void)device; (void)proxy;
-    /* Primary selection is not clipboard history; prune its offer after dispatch. */
+    (void)device;
+    struct cf_dc *c = data;
+    /* Primary selection is not clipboard history: its offer goes as soon as it is named. */
+    struct offer *o = named(c, proxy);
+    if (o && o != c->selection) free_offer(o);
 }
 static const struct ext_data_control_device_v1_listener device_listener = {
     .data_offer = data_offer, .selection = selection, .finished = finished, .primary_selection = primary
@@ -154,10 +164,9 @@ int cf_dc_open(cf_dc *c) {
 }
 int cf_dc_next(cf_dc *c) {
     while (!atomic_load(&c->cancelled)) {
-        if (c->changed) { c->changed = 0; prune(c); return 1; }
+        if (c->changed) { c->changed = 0; return 1; }
         int result = dispatch(c, -1);
         if (result != 1) return result;
-        prune(c);
     }
     return 0;
 }
@@ -199,7 +208,12 @@ void cf_dc_cancel(cf_dc *c) {
 }
 void cf_dc_destroy(cf_dc *c) {
     if (!c) return;
-    c->selection = NULL; prune(c);
+    if (c->selection) free_offer(c->selection);
+    while (c->introduced) {
+        struct offer *o = c->introduced;
+        c->introduced = o->next;
+        free_offer(o);
+    }
     if (c->device) ext_data_control_device_v1_destroy(c->device);
     if (c->manager) ext_data_control_manager_v1_destroy(c->manager);
     if (c->seat) wl_seat_destroy(c->seat);
