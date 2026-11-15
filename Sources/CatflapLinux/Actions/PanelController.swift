@@ -135,7 +135,7 @@ final class PanelController: @unchecked Sendable {
     static func start(on runtime: AgentRuntime) async -> PanelController? {
         let environment = ProcessInfo.processInfo.environment
         // Only the display the agent was given: without one there is no desktop to show on.
-        guard let display = environment["WAYLAND_DISPLAY"], !display.isEmpty, environment["CATFLAP_PANEL"] != "off" else {
+        guard DesktopSession.hasPanelDisplay(environment), environment["CATFLAP_PANEL"] != "off" else {
             return nil
         }
         // The panel is one small surface in an agent that runs all day: software rendering
