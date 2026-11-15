@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "CDataControl.h"
 #include "ext-data-control-v1-client-protocol.h"
+#include "wlr-data-control-unstable-v1-client-protocol.h"
 #include <wayland-client.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -11,8 +12,13 @@
 #include <time.h>
 #include <unistd.h>
 
+enum cf_dc_transport cf_dc_choose_transport(int ext_available, int wlr_available) {
+    return ext_available ? CF_DC_EXT : wlr_available ? CF_DC_WLR : CF_DC_NONE;
+}
+
 struct offer {
-    struct ext_data_control_offer_v1 *proxy;
+    struct wl_proxy *proxy;
+    int wlr;
     char **types;
     size_t count;
     struct offer *next;
@@ -23,6 +29,9 @@ struct cf_dc {
     struct wl_seat *seat;
     struct ext_data_control_manager_v1 *manager;
     struct ext_data_control_device_v1 *device;
+    struct zwlr_data_control_manager_v1 *wlr_manager;
+    struct zwlr_data_control_device_v1 *wlr_device;
+    uint32_t ext_name, wlr_name, wlr_version;
     /* Offers introduced by data_offer that no selection or primary_selection has named yet. A
      * read may end between data_offer, its MIME types and the event that names it, so these
      * live until that event arrives, however many dispatches it takes. */
@@ -33,12 +42,13 @@ struct cf_dc {
     atomic_int cancelled;
 };
 static void free_offer(struct offer *o) {
-    ext_data_control_offer_v1_destroy(o->proxy);
+    if (o->wlr) zwlr_data_control_offer_v1_destroy((struct zwlr_data_control_offer_v1 *)o->proxy);
+    else ext_data_control_offer_v1_destroy((struct ext_data_control_offer_v1 *)o->proxy);
     for (size_t i = 0; i < o->count; ++i) free(o->types[i]);
     free(o->types); free(o);
 }
 /* The offer a selection event names leaves the introduced list. */
-static struct offer *named(struct cf_dc *c, struct ext_data_control_offer_v1 *proxy) {
+static struct offer *named(struct cf_dc *c, struct wl_proxy *proxy) {
     if (!proxy) return NULL;
     struct offer *o = wl_proxy_get_user_data((struct wl_proxy *)proxy);
     for (struct offer **p = &c->introduced; *p; p = &(*p)->next) {
@@ -62,13 +72,13 @@ static void data_offer(void *data, struct ext_data_control_device_v1 *device, st
     struct cf_dc *c = data;
     struct offer *o = calloc(1, sizeof(*o));
     if (!o) abort();
-    o->proxy = proxy; o->next = c->introduced; c->introduced = o;
+    o->proxy = (struct wl_proxy *)proxy; o->next = c->introduced; c->introduced = o;
     ext_data_control_offer_v1_add_listener(proxy, &offer_listener, o);
 }
 static void selection(void *data, struct ext_data_control_device_v1 *device, struct ext_data_control_offer_v1 *proxy) {
     (void)device;
     struct cf_dc *c = data;
-    struct offer *next = named(c, proxy);
+    struct offer *next = named(c, (struct wl_proxy *)proxy);
     /* The protocol asks the client to destroy the selection this one replaces. */
     if (c->selection && c->selection != next) free_offer(c->selection);
     c->selection = next;
@@ -81,18 +91,47 @@ static void primary(void *data, struct ext_data_control_device_v1 *device, struc
     (void)device;
     struct cf_dc *c = data;
     /* Primary selection is not clipboard history: its offer goes as soon as it is named. */
-    struct offer *o = named(c, proxy);
+    struct offer *o = named(c, (struct wl_proxy *)proxy);
     if (o && o != c->selection) free_offer(o);
 }
 static const struct ext_data_control_device_v1_listener device_listener = {
     .data_offer = data_offer, .selection = selection, .finished = finished, .primary_selection = primary
 };
+/* The two protocols have distinct typed listeners, but share the same offer ownership
+ * and MIME accumulation. No payload is requested by either adapter's event callbacks. */
+static void wlr_offered(void *data, struct zwlr_data_control_offer_v1 *proxy, const char *mime) {
+    (void)proxy; offered(data, NULL, mime);
+}
+static const struct zwlr_data_control_offer_v1_listener wlr_offer_listener = { .offer = wlr_offered };
+static void wlr_data_offer(void *data, struct zwlr_data_control_device_v1 *device, struct zwlr_data_control_offer_v1 *proxy) {
+    (void)device;
+    struct cf_dc *c = data;
+    struct offer *o = calloc(1, sizeof(*o));
+    if (!o) abort();
+    o->proxy = (struct wl_proxy *)proxy; o->wlr = 1;
+    o->next = c->introduced; c->introduced = o;
+    zwlr_data_control_offer_v1_add_listener(proxy, &wlr_offer_listener, o);
+}
+static void wlr_selection(void *data, struct zwlr_data_control_device_v1 *device, struct zwlr_data_control_offer_v1 *proxy) {
+    (void)device; selection(data, NULL, (struct ext_data_control_offer_v1 *)proxy);
+}
+static void wlr_finished(void *data, struct zwlr_data_control_device_v1 *device) {
+    (void)device; finished(data, NULL);
+}
+static void wlr_primary(void *data, struct zwlr_data_control_device_v1 *device, struct zwlr_data_control_offer_v1 *proxy) {
+    (void)device; primary(data, NULL, (struct ext_data_control_offer_v1 *)proxy);
+}
+static const struct zwlr_data_control_device_v1_listener wlr_device_listener = {
+    .data_offer = wlr_data_offer, .selection = wlr_selection, .finished = wlr_finished, .primary_selection = wlr_primary
+};
 static void global(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
     (void)version;
     struct cf_dc *c = data;
-    if (!strcmp(interface, "ext_data_control_manager_v1") && !c->manager) {
-        c->manager = wl_registry_bind(registry, name, &ext_data_control_manager_v1_interface, 1);
-        c->manager_name = name;
+    if (!strcmp(interface, "ext_data_control_manager_v1") && !c->ext_name) {
+        c->ext_name = name;
+    } else if (!strcmp(interface, "zwlr_data_control_manager_v1") && !c->wlr_name) {
+        c->wlr_name = name;
+        c->wlr_version = version < 2 ? version : 2;
     } else if (!strcmp(interface, "wl_seat") && !c->seat) {
         c->seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
         c->seat_name = name;
@@ -102,6 +141,8 @@ static void removed(void *data, struct wl_registry *registry, uint32_t name) {
     (void)registry;
     struct cf_dc *c = data;
     if (name == c->manager_name || name == c->seat_name) c->failed = 1;
+    if (name == c->ext_name) c->ext_name = 0;
+    if (name == c->wlr_name) c->wlr_name = 0;
 }
 static const struct wl_registry_listener registry_listener = { .global = global, .global_remove = removed };
 cf_dc *cf_dc_create(void) {
@@ -157,9 +198,20 @@ int cf_dc_open(cf_dc *c) {
     c->registry = wl_display_get_registry(c->display);
     wl_registry_add_listener(c->registry, &registry_listener, c);
     if (roundtrip(c) < 0) return -1;
-    if (!c->manager || !c->seat) return 0;
-    c->device = ext_data_control_manager_v1_get_data_device(c->manager, c->seat);
-    ext_data_control_device_v1_add_listener(c->device, &device_listener, c);
+    enum cf_dc_transport transport = cf_dc_choose_transport(c->ext_name != 0, c->wlr_name != 0);
+    if (!c->seat || transport == CF_DC_NONE) return 0;
+    /* Registry discovery is complete: ext wins even when wlr was advertised first. */
+    if (transport == CF_DC_EXT) {
+        c->manager_name = c->ext_name;
+        c->manager = wl_registry_bind(c->registry, c->ext_name, &ext_data_control_manager_v1_interface, 1);
+        c->device = ext_data_control_manager_v1_get_data_device(c->manager, c->seat);
+        ext_data_control_device_v1_add_listener(c->device, &device_listener, c);
+    } else {
+        c->manager_name = c->wlr_name;
+        c->wlr_manager = wl_registry_bind(c->registry, c->wlr_name, &zwlr_data_control_manager_v1_interface, c->wlr_version);
+        c->wlr_device = zwlr_data_control_manager_v1_get_data_device(c->wlr_manager, c->seat);
+        zwlr_data_control_device_v1_add_listener(c->wlr_device, &wlr_device_listener, c);
+    }
     return flush(c) < 0 ? -1 : 1;
 }
 int cf_dc_next(cf_dc *c) {
@@ -181,7 +233,8 @@ int cf_dc_receive(cf_dc *c, const char *mime, uint8_t *bytes, size_t capacity, s
     if (pipe2(p, O_CLOEXEC | O_NONBLOCK) < 0) return -1;
     /* The source receives a blocking write end, independent of the bounded reader. */
     fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL) & ~O_NONBLOCK);
-    ext_data_control_offer_v1_receive(c->selection->proxy, mime, p[1]);
+    if (c->selection->wlr) zwlr_data_control_offer_v1_receive((struct zwlr_data_control_offer_v1 *)c->selection->proxy, mime, p[1]);
+    else ext_data_control_offer_v1_receive((struct ext_data_control_offer_v1 *)c->selection->proxy, mime, p[1]);
     close(p[1]);
     int result = -1;
     struct timespec start, now;
@@ -216,6 +269,8 @@ void cf_dc_destroy(cf_dc *c) {
     }
     if (c->device) ext_data_control_device_v1_destroy(c->device);
     if (c->manager) ext_data_control_manager_v1_destroy(c->manager);
+    if (c->wlr_device) zwlr_data_control_device_v1_destroy(c->wlr_device);
+    if (c->wlr_manager) zwlr_data_control_manager_v1_destroy(c->wlr_manager);
     if (c->seat) wl_seat_destroy(c->seat);
     if (c->registry) wl_registry_destroy(c->registry);
     if (c->display) wl_display_disconnect(c->display);

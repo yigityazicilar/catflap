@@ -253,7 +253,7 @@ final class PanelController: @unchecked Sendable {
                 keyboardWaiters = []
                 for waiter in ready { waiter.resume() }
             }
-            guard wasActive && !active && !dialogOpen && machine.mode == .focused else { return }
+            guard wasActive && !active && !dialogOpen && machine.mode == .focused && host.closesOnKeyboardLoss else { return }
             // On Wayland a click outside shows up as the panel losing keyboard focus. While a
             // shortcut request is open, the system may show its question about it at any moment
             // and that window takes the keyboard: Catflap's own question, so the panel stays.
