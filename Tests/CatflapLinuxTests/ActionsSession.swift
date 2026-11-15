@@ -537,9 +537,8 @@ struct ActionsDescription: Decodable {
         let startAtLogin: Bool
         let receivedTextToClipboard: Bool
         let inbox: String?
-        let relay: String?
         enum CodingKeys: String, CodingKey {
-            case inbox, relay
+            case inbox
             case hoverBand = "hover_band", startAtLogin = "start_at_login", receivedTextToClipboard = "received_text_to_clipboard"
         }
     }
@@ -552,8 +551,10 @@ struct ActionsDescription: Decodable {
 
 /// What a `ui invoke` action answers.
 struct ActionsResult: Decodable {
+    struct Outcome: Decodable, Equatable { let file: String?; let status: String; let error: String? }
     let action: String
     let transfers: [TransferRecord]
+    let outcomes: [Outcome]
     let attachments: [String]
     let copied: String?
     let message: String
