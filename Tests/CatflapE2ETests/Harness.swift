@@ -115,7 +115,7 @@ final class AgentHarness {
     /// clipboard or open a window in their session. A test of capture passes
     /// `["CATFLAP_PLATFORM": "on", "WAYLAND_DISPLAY": <its nested compositor>]`.
     let environment: [String: String]
-    private var process: Process?
+    fileprivate var process: Process?
     init(environment: [String: String] = [:]) throws {
         self.environment = environment
         dataDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("ce-" + UUID().uuidString.prefix(8))
@@ -162,15 +162,23 @@ final class AgentHarness {
     }
     /// Stops the agent. One that has to be killed has failed to stop, and that is reported
     /// as a fault: a bounded wait must not let it pass for a clean stop.
-    func stop() {
+    func stop(reportFault: (String) -> Void = harnessError) {
         guard let child = process else { return }
         process = nil
         let pid = child.processIdentifier
         if child.isRunning && !systemView(of: pid).ended { child.terminate() }
-        if waitForEnd(of: child, limit: 7) != .stillRunning { return }
-        harnessError("agent \(pid) did not end within 7 s of SIGTERM; sending SIGKILL")
+        let end = waitForEnd(of: child, limit: 7)
+        if case .ended(let status) = end {
+            // ECHILD with a stale Foundation state remains a diagnostic when the status
+            // is lost. A status we did obtain must never hide a crash or failed exit.
+            if let status, status != 0 {
+                reportFault("agent \(pid) ended abnormally with status \(status)")
+            }
+            return
+        }
+        reportFault("agent \(pid) did not end within 7 s of SIGTERM; sending SIGKILL")
         kill(pid, SIGKILL)
-        if waitForEnd(of: child, limit: 5) == .stillRunning { harnessError("agent \(pid) is still running 5 s after SIGKILL") }
+        if waitForEnd(of: child, limit: 5) == .stillRunning { reportFault("agent \(pid) is still running 5 s after SIGKILL") }
     }
     func restart() throws { stop(); try start() }
     func command(_ arguments: [String], timeout: TimeInterval = 30) throws -> CommandResult {
@@ -246,4 +254,25 @@ func runHarnessProcess(_ executable: URL, arguments: [String], timeout: TimeInte
     guard let drained else { throw HarnessError.outputNotClosed }
     guard let status else { throw HarnessError.exitStatusLost }
     return CommandResult(code: status, output: drained.output, error: drained.error, command: commandName(arguments))
+}
+
+@Suite struct HarnessStopTests {
+    @Test(arguments: ["exit 0", "exit 23", "kill -KILL $$"])
+    func testEndedAgentVerdict(script: String) throws {
+        let agent = try AgentHarness()
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: "/bin/sh")
+        child.arguments = ["-c", script]
+        child.standardOutput = FileHandle.nullDevice
+        child.standardError = FileHandle.nullDevice
+        try child.run()
+        agent.process = child
+        #expect(waitForEnd(of: child, limit: 5) != .stillRunning)
+        var faults: [String] = []
+        agent.stop { faults.append($0) }
+        #expect(faults.isEmpty == (script == "exit 0"))
+        // Repeated teardown cannot hide or report the same exit twice.
+        agent.stop { faults.append($0) }
+        #expect(faults.count == (script == "exit 0" ? 0 : 1))
+    }
 }

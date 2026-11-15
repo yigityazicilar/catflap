@@ -28,6 +28,8 @@ public struct PairingConfiguration: Sendable {
     public var version: Int = WireProtocol.version
     /// Tests only: wraps the pairing tunnel's stream to observe or alter it.
     public var transportHook: (@Sendable (any WireTransport, PairingRole) -> any WireTransport)?
+    /// Tests only: exercise expiry when the background timer never resumes.
+    public var codeExpiryTimerEnabled = true
     public init() {}
 
     public static var defaultName: String {
@@ -132,6 +134,7 @@ public actor PairingService {
     public private(set) var configuration: PairingConfiguration
     private var status = PairingStatus(state: .idle)
     private var session: UUID?
+    private var codeDeadline: ContinuousClock.Instant?
     private var events: AsyncStream<Event>.Continuation?
     private var throwawayServer: TailcatServer?
     private var joinClient: TailcatClient?
@@ -156,7 +159,13 @@ public actor PairingService {
 
     public func setConfiguration(_ value: PairingConfiguration) { configuration = value }
 
-    public func currentStatus() -> PairingStatus { status }
+    public func currentStatus() async -> PairingStatus {
+        if let id = session, status.role == .initiator, status.isActive,
+           status.state != .exchanging, let deadline = codeDeadline, .now >= deadline {
+            await expire(id)
+        }
+        return status
+    }
 
     // MARK: Starting
 
@@ -166,8 +175,15 @@ public actor PairingService {
         guard !status.isActive else { throw PairingError.busy }
         let (id, stream) = begin(.initiator, state: .starting)
         let lifetime = configuration.codeLifetime
-        Task.detached { try? await Task.sleep(for: lifetime); await self.expire(id) }
-        Task.detached { await self.runInitiator(id, stream, expiry: .now + lifetime) }
+        // Capture one deadline before either detached task can be delayed by scheduling.
+        let expiry = ContinuousClock.now + lifetime
+        codeDeadline = expiry
+        status.expiresAt = Date().addingTimeInterval(Double(lifetime.components.seconds)
+            + Double(lifetime.components.attoseconds) / 1e18)
+        if configuration.codeExpiryTimerEnabled {
+            Task.detached { try? await Task.sleep(until: expiry, clock: .continuous); await self.expire(id) }
+        }
+        Task.detached { await self.runInitiator(id, stream, expiry: expiry) }
         let deadline = ContinuousClock.now + .seconds(4)
         while session == id && status.state == .starting && .now < deadline {
             try? await Task.sleep(for: .milliseconds(50))
@@ -184,7 +200,8 @@ public actor PairingService {
         return status
     }
 
-    public func confirm() throws -> PairingStatus {
+    public func confirm() async throws -> PairingStatus {
+        _ = await currentStatus()
         guard [.confirm, .confirmed].contains(status.state), let events else { throw PairingError.nothingToConfirm }
         events.yield(.local(confirm: true))
         return status
@@ -203,6 +220,7 @@ public actor PairingService {
     private func begin(_ role: PairingRole, state: PairingStatus.State) -> (UUID, AsyncStream<Event>) {
         let id = UUID()
         session = id
+        codeDeadline = nil
         status = PairingStatus(state: state, role: role)
         let (stream, continuation) = AsyncStream<Event>.makeStream()
         events = continuation
@@ -256,28 +274,48 @@ public actor PairingService {
             throwawayServer = server
             let listener = try await server.listen(port: PairingProtocol.port, timeout: .seconds(30))
             let info = try await server.info(timeout: .seconds(10))
-            let lifetime = ContinuousClock.now.duration(to: expiry)
+            guard ContinuousClock.now < expiry else { throw PairingFailure.expired }
             update(id) {
                 $0.state = .waiting
                 $0.code = PairingCode(address: info.address, clientKey: joinKeys.privateKey).encoded
-                $0.expiresAt = Date().addingTimeInterval(Double(lifetime.components.seconds))
             }
             // Accept until one connection delivers bytes. An empty or silent one is not an
             // attempt and does not use the code up.
             var first: WireFrame?
             while first == nil {
-                let connection = wrap(try await listener.accept(), .initiator)
+                guard ContinuousClock.now < expiry else { throw PairingFailure.expired }
+                let accepted: TailcatConnection
                 do {
-                    first = try await connection.readFrame(deadline: .now + configuration.firstFrameTimeout)
+                    accepted = try await listener.accept(timeout: ContinuousClock.now.duration(to: expiry))
+                } catch {
+                    if ContinuousClock.now >= expiry { throw PairingFailure.expired }
+                    throw error
+                }
+                guard ContinuousClock.now < expiry else {
+                    await accepted.close()
+                    throw PairingFailure.expired
+                }
+                let connection = wrap(accepted, .initiator)
+                do {
+                    first = try await connection.readFrame(deadline: min(expiry, .now + configuration.firstFrameTimeout))
                     if first == nil { await connection.close(); continue }
                     wire = connection
                 } catch {
+                    // A silent client cannot turn the code deadline into another retry.
+                    if ContinuousClock.now >= expiry {
+                        await connection.close()
+                        throw PairingFailure.expired
+                    }
                     guard await connection.receivedAnyByte else { await connection.close(); continue }
                     wire = connection
                     throw PairingFailure.codeUsed
                 }
             }
             // This connection used the code: accept no other.
+            guard ContinuousClock.now < expiry else {
+                await wire?.close()
+                throw PairingFailure.expired
+            }
             await listener.close()
             guard let wire, let first else { throw PairingFailure.codeUsed }
             update(id) { $0.code = nil; $0.state = .connecting }
@@ -296,9 +334,16 @@ public actor PairingService {
             // Only now does this side reveal its hello, then the joiner reveals its own.
             let exchangeKey = Curve25519.KeyAgreement.PrivateKey()
             let mine = try await myHello(exchangeKey: exchangeKey)
-            try await wire.send(header: mine, timeout: .seconds(10))
+            guard ContinuousClock.now < expiry else { throw PairingFailure.expired }
+            try await wire.send(header: mine, timeout: min(.seconds(10), ContinuousClock.now.duration(to: expiry)))
             let revealed: WireFrame?
-            do { revealed = try await wire.readFrame(timeout: configuration.helloTimeout) } catch { throw PairingFailure.connectionLost }
+            do {
+                revealed = try await wire.readFrame(deadline: min(expiry, .now + configuration.helloTimeout))
+            } catch {
+                if ContinuousClock.now >= expiry { throw PairingFailure.expired }
+                throw PairingFailure.connectionLost
+            }
+            guard ContinuousClock.now < expiry else { throw PairingFailure.expired }
             guard let revealed else { throw PairingFailure.connectionLost }
             // A hello that differs from the commitment is a protocol violation: nothing stored.
             guard revealed.type == PairHello.type, PairingDigits.commitment(hello: revealed.header) == commit.commit,
@@ -392,6 +437,9 @@ public actor PairingService {
         var pendingKey: String?
         do {
             for await event in events {
+                if role == .initiator, status.state != .exchanging, ContinuousClock.now >= readDeadline {
+                    throw PairingFailure.expired
+                }
                 switch event {
                 case .local(confirm: false):
                     try? await wire.send(PairDecline(), timeout: .seconds(5))
@@ -479,7 +527,10 @@ public actor PairingService {
     }
 
     private func fail(_ id: UUID, _ error: Error, wire: WireConnection?) async {
-        if let failure = error as? PairingFailure { finish(id, failure) }
+        if status.role == .initiator, status.state != .exchanging,
+           let deadline = codeDeadline, ContinuousClock.now >= deadline {
+            finish(id, .expired)
+        } else if let failure = error as? PairingFailure { finish(id, failure) }
         else if error is PairingError { finish(id, .protocolViolation) }
         else { finish(id, status.role == .joiner ? .unreachable : .connectionLost) }
     }
