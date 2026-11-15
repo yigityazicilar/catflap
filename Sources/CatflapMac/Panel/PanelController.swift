@@ -124,6 +124,12 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
             guard let state = await controller.invoke("toggle") else { return ControlResponse(error: .unsupported, exitCode: 64) }
             return try ControlResponse(value: state)
         }
+        // Opens the panel focused and never hides it; answers with whatever `ui state` answers,
+        // read after the change, so it carries the action fields once PanelActions has started.
+        await runtime.register("panel.show") { _ in
+            await controller.showFocused()
+            return await runtime.handle(ControlRequest("ui.state"))
+        }
         await runtime.register("ui.state") { _ in
             let state = await controller.snapshot()
             return try ControlResponse(value: state)
@@ -202,8 +208,9 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
         return snapshot()
     }
 
-    /// The panel open and focused, from whatever state it is in: what opening Catflap.app
-    /// again does.
+    /// The panel open and focused, from whatever state it is in; a focused panel stays open.
+    /// The one show path: `panel.show`, opening Catflap.app again, and the actions that need a
+    /// focused panel (attach, type, select) all come here.
     func showFocused() {
         switch machine.mode {
         case .focused:
@@ -336,6 +343,10 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
         case .hidden:
             hideWindow()
         case .hover, .drag:
+            // A panel opened without focus never has the keyboard. One closed a moment ago is
+            // still key until its close animation ends and it is ordered out, and opening it
+            // again cancels that; ordering it out now drops the key status it had.
+            if window.isKeyWindow { window.orderOut(nil) }
             showWindow(animated: before == .hidden)
         case .focused:
             showWindow(animated: before == .hidden)
@@ -452,6 +463,18 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
     }
 
     // MARK: Lists
+
+    /// Reads the lists again now, open or closed, instead of at the next refresh: after a
+    /// pairing the new device is the send target as soon as the panel shows.
+    func reloadLists() {
+        let feed = feed
+        Task { [weak self] in
+            let snapshot = await feed.load()
+            guard let self else { return }
+            self.model.update(devices: snapshot.devices, clipboard: snapshot.clipboard, history: snapshot.history, paused: snapshot.paused)
+            self.render()
+        }
+    }
 
     private func startRefreshing() {
         refresher?.cancel()
