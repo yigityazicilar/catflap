@@ -169,24 +169,34 @@ func waitForStatus(_ device: TestDevice, timeout: Duration = .seconds(60),
     }
 }
 
-/// How long `waitUntil` waits by default before it gives up: a hang guard only, never the
-/// expected time. A passing wait returns as soon as its condition holds. It outlasts the
-/// longest path a send may legitimately take before its row settles, taken from the product's
-/// own limits: one overall dial deadline, the two Open handshake reads, then the waits for the
-/// accept and for the acknowledgement. A guard equal to the dial limit alone failed a refused
-/// text on a loaded macOS runner that the product would have passed.
+/// Default condition-poll hang guard, with headroom above selected send phases: one
+/// overall dial deadline, two Open handshake reads, and the accept/acknowledgement reads.
+/// This is not a bound on a whole send: writes, streams, repeated holds and teardown are
+/// excluded. The original slow macOS refusal's phase is unknown. Return as soon as ready.
 let testWaitGuard: Duration = {
     let limits = TransferLimits()
     return limits.dial + PeerOpen.handshakeTimeout * 2 + limits.idle * 2 + .seconds(10)
 }()
 
-func waitUntil(timeout: Duration = testWaitGuard, _ condition: () async throws -> Bool) async throws -> Bool {
-    let deadline = ContinuousClock.now + timeout
+/// Per-call monotonic time/sleep seam. Real callers still poll every 100 ms using the
+/// continuous clock; tests can cross the old guard without sleeping for 30 real seconds.
+struct ConditionWaitClock: Sendable {
+    var now: @Sendable () -> Duration
+    var sleep: @Sendable (Duration) async throws -> Void
+    static var continuous: Self {
+        let origin = ContinuousClock.now
+        return Self(now: { origin.duration(to: .now) }, sleep: { try await Task.sleep(for: $0) })
+    }
+}
+
+func waitUntil(timeout: Duration = testWaitGuard, clock: ConditionWaitClock = .continuous,
+               _ condition: () async throws -> Bool) async throws -> Bool {
+    let deadline = clock.now() + timeout
     let step = TestProgress.current?.last ?? ""
     TestProgress.mark(step + " (waiting for a condition)")
-    while ContinuousClock.now < deadline {
+    while clock.now() < deadline {
         if try await condition() { return true }
-        try await Task.sleep(for: .milliseconds(100))
+        try await clock.sleep(.milliseconds(100))
     }
     return try await condition()
 }

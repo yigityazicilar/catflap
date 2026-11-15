@@ -11,7 +11,7 @@ import Darwin
 private final class HarnessBundleMarker: NSObject {}
 #endif
 
-enum HarnessError: Error { case executableMissing, startupFailed, commandTimedOut, exitStatusLost, outputNotClosed }
+enum HarnessError: Error { case executableMissing, startupFailed, commandTimedOut, exitStatusLost, outputNotClosed, processObservationFailed(Int32) }
 struct CommandResult {
     let code: Int32
     let output: Data
@@ -66,52 +66,96 @@ func harnessError(_ text: String) {
     if Test.current != nil { Issue.record(Comment(rawValue: text)) }
 }
 
-/// Whether a child of the test process has ended. The exit status is nil when it could not be read.
-enum ChildEnd: Equatable { case stillRunning, ended(status: Int32?) }
+/// Unknown status is not evidence of a clean exit. An observation failure is not evidence
+/// that a PID is still alive, either.
+enum ChildEnd: Equatable { case stillRunning, ended(status: Int32?), observationFailed(Int32) }
+enum ChildObservation: Equatable { case running, ended(collected: Bool), failed(Int32) }
 
-/// What the system says about a child, leaving its exit status in place for Foundation.
-/// `collected` means the status has already been taken, so the child is fully gone.
-private func systemView(of pid: pid_t) -> (ended: Bool, collected: Bool) {
+/// What the system says, without taking the status away from Foundation.
+func systemView(of pid: pid_t) -> ChildObservation {
     var info = siginfo_t()
-    guard waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT) == 0 else { return (errno == ECHILD, true) }
+    guard waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT) == 0 else {
+        let code = errno
+        return code == ECHILD ? .ended(collected: true) : .failed(code)
+    }
     #if os(Linux)
     let reported = info._sifields._sigchld.si_pid
     #else
     let reported = info.si_pid
     #endif
-    return (reported == pid, false)
+    return reported == pid ? .ended(collected: false) : .running
 }
 
-/// Waits for a child to end, for at most `limit` seconds.
-///
-/// `Process.waitUntilExit()` is not used anywhere in the tests. On the macOS test machines it
-/// was seen waiting without end, in `AgentHarness.stop()`, for an agent that was no longer in
-/// the process table. Why that wait was never woken is not known, and neither is what
-/// `isRunning` said at the time. So every wait has a limit, and the system is asked too: a
-/// child it has reported as ended for a full second counts as ended, and the disagreement is
-/// written to standard error so the next occurrence leaves facts behind.
-func waitForEnd(of child: Process, limit: TimeInterval) -> ChildEnd {
-    let pid = child.processIdentifier
-    let start = ContinuousClock.now
-    var endedSince: ContinuousClock.Instant?
-    while true {
-        if !child.isRunning { return .ended(status: child.terminationStatus) }
-        let system = systemView(of: pid)
-        if system.ended {
-            let since = endedSince ?? .now
-            endedSince = since
-            if since.duration(to: .now) > .seconds(1) {
-                var status: Int32?
+func childExitStatus(_ raw: Int32) -> Int32 {
+    raw & 0x7f == 0 ? (raw >> 8) & 0xff : raw & 0x7f
+}
+
+/// Per-child seam: no process-wide hooks or replacement reapers. The real collector is
+/// always nonblocking, including when another collector wins after WNOWAIT observation.
+struct ChildProcessOperations {
+    var foundationStatus: () -> Int32?
+    var observe: () -> ChildObservation
+    var collect: () -> Int32?
+    var now: () -> TimeInterval
+    var pause: () -> Void
+    var signal: (Int32) -> Void
+    var note: (String) -> Void = harnessNote
+
+    static func live(_ child: Process) -> Self {
+        let pid = child.processIdentifier
+        let origin = ContinuousClock.now
+        return Self(
+            foundationStatus: { child.isRunning ? nil : child.terminationStatus },
+            observe: { systemView(of: pid) },
+            collect: {
                 var raw: Int32 = 0
-                if !system.collected, waitpid(pid, &raw, WNOHANG) == pid { status = raw & 0x7f == 0 ? (raw >> 8) & 0xff : raw & 0x7f }
-                harnessNote("child \(pid) has ended (exit status \(system.collected ? "already collected" : "not yet collected")), but Foundation still reports it running a second later")
+                return waitpid(pid, &raw, WNOHANG) == pid ? childExitStatus(raw) : nil
+            },
+            now: {
+                let elapsed = origin.duration(to: .now).components
+                return Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+            },
+            pause: { Thread.sleep(forTimeInterval: 0.02) },
+            signal: { number in _ = kill(pid, number) })
+    }
+}
+
+/// A bounded wait. Foundation can lag the system's non-consuming observation; allow a
+/// second for it to catch up, then attempt only a nonblocking collection. The historical
+/// macOS waitUntilExit hang's cause is unknown; this seam models disagreements, not its cause.
+func waitForEnd(of child: Process, limit: TimeInterval, operations: ChildProcessOperations? = nil,
+                knownEnded: Bool = false) -> ChildEnd {
+    let operations = operations ?? .live(child)
+    let start = operations.now()
+    var endedSince: TimeInterval? = knownEnded ? start : nil
+    var lastError: Int32?
+    while true {
+        if let status = operations.foundationStatus() { return .ended(status: status) }
+        let now = operations.now()
+        switch operations.observe() {
+        case .ended(let collected):
+            let since = endedSince ?? now
+            endedSince = since
+            // Even a short limit cannot turn an established-dead child into a live timeout.
+            if now - since > 1 || now - start >= limit {
+                let status = collected ? nil : operations.collect()
+                operations.note("child \(child.processIdentifier) has ended (exit status \(collected ? "already collected" : "not yet collected")), but Foundation still reports it running")
                 return .ended(status: status)
             }
-        } else {
-            endedSince = nil
+        case .running:
+            if endedSince != nil { return .ended(status: nil) }
+            lastError = nil
+        case .failed(let code):
+            if lastError != code { operations.note("child observation failed with errno \(code); retrying within the wait limit") }
+            lastError = code
+            // Once established ended, a later observation error cannot authorize a signal.
+            if endedSince != nil { return .ended(status: nil) }
         }
-        if start.duration(to: .now) >= .seconds(limit) { return .stillRunning }
-        Thread.sleep(forTimeInterval: 0.02)
+        if now - start >= limit {
+            if let lastError { return .observationFailed(lastError) }
+            return .stillRunning
+        }
+        operations.pause()
     }
 }
 
@@ -124,7 +168,9 @@ final class AgentHarness {
     /// clipboard or open a window in their session. A test of capture passes
     /// `["CATFLAP_PLATFORM": "on", "WAYLAND_DISPLAY": <its nested compositor>]`.
     let environment: [String: String]
-    fileprivate var process: Process?
+    var process: Process?
+    /// Scoped to this harness only; nil uses the real child operations.
+    var stopOperations: ChildProcessOperations?
     init(environment: [String: String] = [:]) throws {
         self.environment = environment
         dataDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("ce-" + UUID().uuidString.prefix(8))
@@ -175,19 +221,52 @@ final class AgentHarness {
         guard let child = process else { return }
         process = nil
         let pid = child.processIdentifier
-        if child.isRunning && !systemView(of: pid).ended { child.terminate() }
-        let end = waitForEnd(of: child, limit: 7)
+        let operations = stopOperations ?? .live(child)
+        var knownEnded = false
+        if operations.foundationStatus() == nil {
+            switch operations.observe() {
+            case .running: operations.signal(SIGTERM)
+            case .ended: knownEnded = true
+            case .failed(let code): reportFault("agent \(pid) observation failed with errno \(code) before SIGTERM")
+            }
+        }
+        let end = waitForEnd(of: child, limit: 7, operations: operations, knownEnded: knownEnded)
         if case .ended(let status) = end {
-            // ECHILD with a stale Foundation state remains a diagnostic when the status
-            // is lost. A status we did obtain must never hide a crash or failed exit.
-            if let status, status != 0 {
+            guard let status else {
+                reportFault("agent \(pid) ended but its exit status was lost")
+                return
+            }
+            if status != 0 {
                 reportFault("agent \(pid) ended abnormally with status \(status)")
             }
             return
         }
-        reportFault("agent \(pid) did not end within 7 s of SIGTERM; sending SIGKILL")
-        kill(pid, SIGKILL)
-        if waitForEnd(of: child, limit: 5) == .stillRunning { reportFault("agent \(pid) is still running 5 s after SIGKILL") }
+        if case .observationFailed(let code) = end {
+            reportFault("agent \(pid) observation failed with errno \(code); exit not established")
+            return
+        }
+        // Recheck immediately before escalation: a child ending at the deadline must not
+        // cause us to signal a PID which the system has already established dead.
+        if let status = operations.foundationStatus() {
+            if status != 0 {
+                reportFault("agent \(pid) ended abnormally with status \(status)")
+            }
+            return
+        }
+        switch operations.observe() {
+        case .ended:
+            reportFault("agent \(pid) ended but its exit status was lost")
+        case .failed(let code):
+            reportFault("agent \(pid) observation failed with errno \(code) before SIGKILL")
+        case .running:
+            reportFault("agent \(pid) did not end within 7 s of SIGTERM; sending SIGKILL")
+            operations.signal(SIGKILL)
+            switch waitForEnd(of: child, limit: 5, operations: operations) {
+            case .stillRunning: reportFault("agent \(pid) is still running 5 s after SIGKILL")
+            case .observationFailed(let code): reportFault("agent \(pid) observation failed with errno \(code) after SIGKILL")
+            case .ended: break // The forced stop has already faulted, whatever its status.
+            }
+        }
     }
     func restart() throws { stop(); try start() }
     /// Ends this harness's own agent with SIGKILL, as a crash would, and waits for it.
@@ -266,6 +345,7 @@ func runHarnessProcess(_ executable: URL, arguments: [String], timeout: TimeInte
     if end == .stillRunning { kill(child.processIdentifier, SIGKILL); _ = waitForEnd(of: child, limit: 5) }
     // Both pipes close once the child has gone.
     let drained = readers.finish(limit: 30, command: commandName(arguments))
+    if case .observationFailed(let code) = end { throw HarnessError.processObservationFailed(code) }
     guard case .ended(let status) = end else { throw HarnessError.commandTimedOut }
     guard let drained else { throw HarnessError.outputNotClosed }
     guard let status else { throw HarnessError.exitStatusLost }
