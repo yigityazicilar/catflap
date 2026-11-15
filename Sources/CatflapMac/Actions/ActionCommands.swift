@@ -2,6 +2,13 @@
 import AppKit
 import CatflapCore
 
+/// Test-only hooks (`notification-press` and the `test-*` actions of `ui invoke`) are answered
+/// only when the agent runs with CATFLAP_TEST_HOOKS=on, as the test suites start it. Otherwise
+/// they are unknown actions, and nothing is kept for them.
+enum MacTestHooks {
+    static let on = ProcessInfo.processInfo.environment["CATFLAP_TEST_HOOKS"] == "on"
+}
+
 /// The pairing in progress as `ui state` shows it. The code itself is never included.
 struct MacPairingState: Codable, Sendable, Equatable {
     var state: String
@@ -356,6 +363,45 @@ extension PanelActions {
                 return refuse(ActionRefusal(message: "The panel did not take that key."))
             }
             return await finishPanelAction(action, message: nil)
+
+        // Test hooks; without CATFLAP_TEST_HOOKS=on these fall through to the panel's actions,
+        // which do not know them.
+        case "notification-press" where MacTestHooks.on:
+            // A press on the newest notification posted for the row `id` (`<device>/<id>`),
+            // through `respond`, the function `userNotificationCenter(_:didReceive:)` calls,
+            // with the userInfo that notification was posted with.
+            guard let id = arguments["id"],
+                  let userInfo = notifier.postedUserInfo.last(where: { "\($0["device_id"] ?? "")/\($0["id"] ?? "")" == id }) else {
+                return refuse(ActionRefusal(message: "No notification was posted for that row."))
+            }
+            notifier.respond(userInfo: userInfo, action: arguments["button"] ?? "copy")
+            return await answer(action)
+
+        case "test-press-recorder" where MacTestHooks.on:
+            // A click on a shortcut recorder in settings (`which`: panel or send): the first
+            // starts recording, the next stops it. The answer's message says which it is now.
+            if settingsWindow?.isOpen != true { showSettings() }
+            guard let window = settingsWindow else { return refuse(ActionRefusal(message: "Settings did not open.")) }
+            let recorder = arguments["which"] == "send" ? window.sendRecorder : window.panelRecorder
+            recorder.performClick(nil)
+            return await answer(action, message: recorder.recording ? "recording" : "not recording")
+
+        case "test-hold-shortcut" where MacTestHooks.on:
+            // Another registration in this process takes the combination of a binding (`which`:
+            // panel or send). RegisterEventHotKey refuses it while Catflap's own holds it.
+            let binding = arguments["which"] == "send" ? sendShortcut : panelShortcut
+            guard testHeldShortcut == nil, let combination = binding.shortcut else {
+                return refuse(ActionRefusal(message: "Nothing to hold."))
+            }
+            switch HotKeyRegistrar.shared.register(combination, action: {}) {
+            case .success(let made): testHeldShortcut = made
+            case .failure: return refuse(ActionRefusal(message: "That combination is registered already."))
+            }
+            return await answer(action)
+
+        case "test-release-shortcut" where MacTestHooks.on:
+            releaseTestHeldShortcut()
+            return await answer(action)
 
         default:
             guard let state = controller.invoke(action) else { return ControlResponse(error: .unsupported, exitCode: 64) }

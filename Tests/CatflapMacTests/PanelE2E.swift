@@ -109,6 +109,12 @@ private final class PanelAgent: @unchecked Sendable {
     func invoke(_ action: String) async throws -> MacUIState { try await command(["ui", "invoke", action]).state() }
     func state() async throws -> MacUIState { try await command(["ui", "state"]).state() }
 
+    /// One request on the agent's control socket, as the command line sends it.
+    func request(_ name: String, _ arguments: [String: String] = [:]) async throws -> ControlResponse {
+        let socket = directory.appendingPathComponent("control.sock")
+        return try await panelOffPool { try ControlClient.request(ControlRequest(name, arguments: arguments), socket: socket) }
+    }
+
     /// Polls `ui state` until `done` holds or ten seconds pass, and returns the last state.
     func waitForState(_ done: @escaping @Sendable (MacUIState) -> Bool) async throws -> MacUIState {
         try await panelOffPool {
@@ -303,6 +309,60 @@ struct MacPanelE2E {
             print("MacPanelE2E shortcut: \(state.shortcut) \(state.shortcutKeys)")
             #expect(state.shortcut == "bound")
             #expect(!state.shortcutKeys.isEmpty)
+        }
+    }
+
+    /// Sends `panel.show` as a raw control request and checks that the panel is open and
+    /// focused after it, and that the reply is the object `ui state` answers right after it.
+    private static func show(_ agent: PanelAgent, _ step: String) async throws {
+        let reply = try await agent.request("panel.show")
+        print("MacPanelE2E panel.show \(step): ok=\(reply.ok) error=\(reply.error ?? "none") exit=\(reply.exitCode)")
+        #expect(reply.ok, "panel.show \(step): \(reply.error ?? "")")
+        guard reply.ok else { return }
+        let read = try await agent.request("ui.state")
+        let shown = try ControlJSON.decoder.decode(MacUIState.self, from: reply.payload)
+        check(shown, visible: true, mode: "focused", focus: true, "panel.show \(step)")
+        func object(_ payload: Data) -> NSDictionary { ((try? JSONSerialization.jsonObject(with: payload)) as? NSDictionary) ?? [:] }
+        let replied = object(reply.payload), current = object(read.payload)
+        let names = Set((replied.allKeys + current.allKeys).compactMap { $0 as? String })
+        // Only the names of differing fields are printed, never their values.
+        let differing = names.filter { name in !((replied[name] as? NSObject)?.isEqual(current[name]) ?? (current[name] == nil)) }.sorted()
+        #expect(replied.count > 0 && differing.isEmpty, "panel.show \(step): the reply is what ui state answers after it; differing fields: \(differing)")
+        // The object `ui state` answers with the actions running, not the panel's own part only.
+        #expect(replied["wired"] != nil && replied["settings"] != nil, "panel.show \(step): the reply has the fields of the actions")
+        print("MacPanelE2E panel.show \(step): \(shown.summary) fields=\(replied.count) differing_from_ui_state=\(differing.count)")
+    }
+
+    /// `panel.show` opens a hidden panel and a hover panel focused, leaves a focused panel
+    /// focused, never hides it, and answers with what `ui state` answers after it.
+    @Test func testPanelShowOpensFocusedAndNeverHides() async throws {
+        try await withAgent { agent in
+            Self.check(try await agent.state(), visible: false, mode: "hidden", focus: false, "before panel.show")
+            try await Self.show(agent, "from hidden")
+            try await Self.show(agent, "from focused")
+            Self.check(try await agent.state(), visible: true, mode: "focused", focus: true, "after panel.show twice")
+
+            // Hide and hover back to back, inside the close animation of the focused panel: the
+            // hover panel must not keep the keyboard the focused one had.
+            #expect(try await agent.request("ui.invoke", ["action": "hide"]).ok)
+            let hover = try await agent.request("ui.invoke", ["action": "simulate-hover"])
+            Self.check(try ControlJSON.decoder.decode(MacUIState.self, from: hover.payload), visible: true, mode: "hover", focus: false, "simulate-hover")
+            Self.check(try await agent.state(), visible: true, mode: "hover", focus: false, "ui state after simulate-hover")
+            try await Self.show(agent, "from hover")
+            _ = try await agent.invoke("hide")
+        }
+    }
+
+    /// The test hooks are unknown actions in an agent started without CATFLAP_TEST_HOOKS=on.
+    @Test func testTestHooksAreUnknownWithoutTheirSwitch() async throws {
+        try await withAgent { agent in
+            for action in ["notification-press", "test-press-recorder", "test-hold-shortcut", "test-release-shortcut"] {
+                let refused = try await agent.request("ui.invoke", ["action": action, "id": "none/none", "which": "panel"])
+                #expect(!refused.ok && refused.error == AgentError.unsupported.rawValue, "\(action) without the switch: \(refused.error ?? "accepted")")
+            }
+            let state = try await agent.state()
+            #expect(state.shortcut == "bound", "the panel's shortcut stays registered")
+            print("MacPanelE2E test hooks without the switch: refused, shortcut=\(state.shortcut)")
         }
     }
 

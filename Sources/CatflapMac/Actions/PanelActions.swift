@@ -64,6 +64,8 @@ final class PanelActions {
     private var lastRowAction: Task<Void, Never>?
     private var deviceNames: [String: String] = [:]
     private var stopped = false
+    /// The registration `ui invoke test-hold-shortcut` made; test hooks only.
+    var testHeldShortcut: HotKeyRegistrar.Registration?
 
     private init(runtime: AgentRuntime, controller: PanelController, pollClipboard: @escaping @MainActor () async -> Void) {
         self.runtime = runtime
@@ -107,10 +109,16 @@ final class PanelActions {
         pairing.stop()
         picker.cancel()
         sendShortcut.stop()
+        releaseTestHeldShortcut()
         settingsWindow?.close()
         pairingWindow?.close()
         if controller.actions === self { controller.actions = nil }
         NSApplication.shared.servicesProvider = nil
+    }
+
+    func releaseTestHeldShortcut() {
+        if let held = testHeldShortcut { HotKeyRegistrar.shared.unregister(held) }
+        testHeldShortcut = nil
     }
 
     // MARK: Devices
@@ -430,9 +438,7 @@ final class PanelActions {
         return true
     }
 
-    func ensureFocused() {
-        if controller.snapshot().mode != PanelMode.focused.rawValue { _ = controller.invoke("toggle") }
-    }
+    func ensureFocused() { controller.showFocused() }
 
     /// What the panel's field holds.
     var fieldText: String { controller.fieldText }
@@ -499,6 +505,8 @@ final class PanelActions {
         pairingWindow?.render(pairing.status, message: pairing.message, thisDevice: Self.thisDevice)
         if pairing.status.state == .paired {
             pairingWindow?.clearCode()
+            // The panel learns the new device now, not when it next opens and refreshes.
+            controller.reloadLists()
             Task { await refreshDevices() }
         }
     }
