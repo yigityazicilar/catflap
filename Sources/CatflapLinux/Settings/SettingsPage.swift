@@ -5,7 +5,7 @@ import CatflapCore
 import Foundation
 
 /// Settings inside the panel: both shortcuts, the hover band, start at login, received text to
-/// the clipboard, the inbox folder, a private relay, the paired devices with Remove and
+/// the clipboard, the inbox folder, the paired devices with Remove and
 /// Pair, and Quit. libadwaita's preference rows, the same on KDE and GNOME.
 // Touched only on the GTK thread, like the panel itself.
 final class SettingsPage: @unchecked Sendable {
@@ -17,7 +17,6 @@ final class SettingsPage: @unchecked Sendable {
     private let loginRow: OpaquePointer
     private let clipboardRow: OpaquePointer
     private let inboxRow: OpaquePointer
-    private let relayRow: OpaquePointer
     private let devicesGroup: OpaquePointer
     private let firstControl: OpaquePointer
     private var deviceRows: [OpaquePointer] = []
@@ -58,12 +57,7 @@ final class SettingsPage: @unchecked Sendable {
 
         let files = Self.group("Receiving")
         inboxRow = Self.actionRow("Inbox folder", "")
-        relayRow = opaque(adw_entry_row_new())
-        adw_preferences_row_set_title(relayRow.cast(), "Private relay")
-        adw_entry_row_set_show_apply_button(relayRow.cast(), 1)
-        cf_accessible_label(relayRow.cast(), "Private relay")
         adw_preferences_group_add(files.cast(), inboxRow.cast())
-        adw_preferences_group_add(files.cast(), relayRow.cast())
         gtk_box_append(content.cast(), files.cast())
 
         devicesGroup = Self.group("Devices")
@@ -95,10 +89,6 @@ final class SettingsPage: @unchecked Sendable {
                 guard let self, !updating else { return }
                 set(key, adw_switch_row_get_active(row) != 0 ? "on" : "off")
             }
-        }
-        GLib.connect(relayRow, "apply", Int32(CF_SHAPE_VOID)) { [weak self] _ in
-            guard let self else { return }
-            set(.relay, gtk_editable_get_text(relayRow).map { String(cString: $0) } ?? "")
         }
         refresh()
     }
@@ -149,7 +139,6 @@ final class SettingsPage: @unchecked Sendable {
         adw_switch_row_set_active(clipboardRow, settings.receivedTextToClipboard ? 1 : 0)
         let inbox = settings.inbox ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads/Catflap").path
         adw_action_row_set_subtitle(inboxRow.cast(), inbox + " (used from the next start)")
-        gtk_editable_set_text(relayRow, settings.relay ?? "")
         refreshShortcuts()
     }
 
@@ -201,16 +190,6 @@ final class SettingsPage: @unchecked Sendable {
     // MARK: Devices
 
     func deviceName(_ id: String) -> String? { devices.first { $0.id == id }?.name }
-
-    /// A paired device by id, or by name when exactly one has it.
-    func device(_ text: String) -> PanelDevice? {
-        if let device = devices.first(where: { $0.id == text }) { return device }
-        let named = devices.filter { $0.name == text }
-        return named.count == 1 ? named[0] : nil
-    }
-
-    /// The most recently used device, which the agent lists first.
-    var firstDevice: PanelDevice? { devices.first }
 
     func update(devices next: [PanelDevice]) {
         guard next != devices else { return }

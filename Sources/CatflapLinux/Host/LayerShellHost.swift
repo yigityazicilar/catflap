@@ -36,8 +36,12 @@ final class LayerShellHost: PanelHost {
             requested = display
             gtk_layer_set_monitor(window.cast(), display.flatMap(Self.monitor(named:)))
         }
-        if wanted != keyboard {
+        // A panel still shown whose keyboard went to another window (a system question Catflap
+        // asked) is handed it back the same way as one that becomes focused.
+        let regain = visible && wanted == GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND && gtk_window_is_active(window.cast()) == 0
+        if wanted != keyboard || regain {
             keyboard = wanted
+            if handover != 0 { GLib.cancel(handover); handover = 0 }
             if visible && wanted == GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND {
                 // A surface already shown does not get the keyboard when it becomes
                 // on-demand. Exclusive hands it over at once; on-demand then keeps it until

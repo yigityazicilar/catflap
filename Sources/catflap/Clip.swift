@@ -4,7 +4,7 @@ import Foundation
 
 struct Clip: AsyncParsableCommand, AgentFeature {
     @OptionGroup var options: ClientOptions
-    @Argument(help: "list, add, keep, delete, pause, or send") var action: String?
+    @Argument(help: "list, get, add, keep, delete, pause, or send") var action: String?
     @Argument(help: "Item id, or on/off for pause.") var id: String?
     @Option(name: .long) var text: String?
     @Option(name: .long, help: "Read an image from a file, or add a file reference with --kind files.") var file: String?
@@ -25,8 +25,8 @@ struct Clip: AsyncParsableCommand, AgentFeature {
         try await service.install(on: runtime)
     }
     func run() async throws {
-        guard let action, ["list", "add", "keep", "delete", "pause", "send"].contains(action) else {
-            try fail("Use clip list, add, keep, delete, pause, or send.", code: 64)
+        guard let action, ["list", "get", "add", "keep", "delete", "pause", "send"].contains(action) else {
+            try fail("Use clip list, get, add, keep, delete, pause, or send.", code: 64)
         }
         if latest && action != "send" { try fail("--latest goes with clip send.", code: 64) }
         var arguments: [String: String] = [:]
@@ -56,6 +56,9 @@ struct Clip: AsyncParsableCommand, AgentFeature {
                     }
                 } else { arguments["text"] = text }
             }
+        case "get":
+            guard let id else { try fail("An item id is required.", code: 64) }
+            arguments["id"] = id
         case "keep", "delete", "send":
             if latest {
                 guard id == nil else { try fail("Use an item id or --latest, not both.", code: 64) }
@@ -73,23 +76,30 @@ struct Clip: AsyncParsableCommand, AgentFeature {
         }
         if action != "send" {
             let response = try await request(.init("clip." + action, arguments: arguments))
+            // The list is previews, without image bodies; `clip get` prints one item whole.
+            switch action {
+            case "list": _ = try response.expect([ClipboardItem].self)
+            case "get": _ = try response.expect(ClipboardItem.self)
+            case "pause": _ = try response.expect([String: Bool].self)
+            default: _ = try response.expect(ClipboardIngestResult.self)
+            }
             print(String(decoding: response.payload, as: UTF8.self)); return
         }
         // With --latest and no --to, the agent picks the most recently used device.
         if let to { arguments["device_id"] = to }
         else if !latest {
-            guard let first = try await request(.init("devices")).decode([DeviceSummary].self).first else {
+            guard let first = try await request(.init("devices")).expect([DeviceSummary].self).first else {
                 try fail("No paired device. Pair one first with `catflap pair start`.", code: 1)
             }
             arguments["device_id"] = first.id
         }
         arguments["keep"] = dontKeep ? "false" : "true"
-        var row = try await request(.init("clip.send", arguments: arguments)).decode(TransferRecord.self)
+        var row = try await request(.init("clip.send", arguments: arguments)).expect(TransferRecord.self)
         let device = row.deviceID
         let deadline = ContinuousClock.now + .seconds(3600)
         while row.status == "sending", ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(200))
-            row = try await request(.init("clip.send.status", arguments: ["device_id": device, "id": row.id])).decode(TransferRecord.self)
+            row = try await request(.init("clip.send.status", arguments: ["device_id": device, "id": row.id])).expect(TransferRecord.self)
         }
         if row.status == "ok" { print(try ControlJSON.text(row)); return }
         let reason = row.error ?? (row.status == "unconfirmed" ? "Not confirmed. The other device may have it; Retry will not send a second copy." : row.status == "sending" ? "Still sending after an hour. `catflap history` shows how it ends." : "Not sent.")

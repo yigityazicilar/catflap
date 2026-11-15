@@ -92,6 +92,119 @@ private func closeStatus(_ handle: tc_handle) -> Int32 {
 
 @Suite(.serialized)
 struct TailcatTests {
+    @Test func testDiscoPingReturnsLatencyAndPathWithoutEndpoint() async throws {
+        let tunnel = try await Tunnel.start()
+        let client = try TailcatClient(address: tunnel.info.address, key: tunnel.clientKeys)
+        do {
+            let ping = try await client.ping(timeout: generous)
+            #expect(ping.latency >= 0)
+            switch ping.path {
+            case .direct: break
+            case .relayed(let regionID, let regionCode):
+                #expect(regionID > 0)
+                #expect(!regionCode.isEmpty)
+            }
+            #expect(!String(reflecting: ping).contains("endpoint"))
+        } catch {
+            await client.close(); await tunnel.server.close(); throw error
+        }
+        await client.close(); await tunnel.server.close()
+    }
+
+    @Test func testDiscoPingCancellationWaitsForReturnAndClosesToken() async throws {
+        let tunnel = try await Tunnel.start()
+        let client = try TailcatClient(address: tunnel.info.address, key: tunnel.clientKeys)
+        let entered = Shared(false)
+        let release = DispatchSemaphore(value: 0)
+        let events = Shared<[String]>([])
+        let token = Shared<tc_handle>(0)
+        installHooks(TestHooks(beforeCCall: { report in
+            guard report.operation == "client.ping" else { return }
+            token.update { $0 = report.token }; entered.update { $0 = true }
+            release.wait()
+        }, afterCReturn: { report in
+            guard report.operation == "client.ping" else { return }
+            events.update { $0.append("c-returned") }
+        }))
+        defer { clearHooks() }
+        let task = Task {
+            do { _ = try await client.ping(timeout: generous); return false }
+            catch { events.update { $0.append("swift-resumed") }; return (error as? TailcatError)?.code == .cancelled }
+        }
+        while !entered.value { await Task.yield() }
+        task.cancel()
+        #expect(events.value.isEmpty)
+        release.signal()
+        #expect(await task.value)
+        #expect(events.value == ["c-returned", "swift-resumed"])
+        #expect(!HandleLedger.shared.isLive(token.value))
+        #expect(closeStatus(token.value) == Int32(TC_CLOSED))
+        await client.close(); await tunnel.server.close()
+    }
+
+    @Test func testDiscoPingLateResultIsDiscarded() async throws {
+        let tunnel = try await Tunnel.start()
+        let client = try TailcatClient(address: tunnel.info.address, key: tunnel.clientKeys)
+        let returned = Shared(false)
+        let release = DispatchSemaphore(value: 0)
+        installHooks(TestHooks(afterCReturn: { report in
+            guard report.operation == "client.ping" else { return }
+            returned.update { $0 = true }; release.wait()
+        }))
+        defer { clearHooks() }
+        let task = Task { try await client.ping(timeout: generous) }
+        while !returned.value { await Task.yield() }
+        task.cancel(); release.signal()
+        switch await task.result {
+        case .success: Issue.record("Delivered a ping after cancellation")
+        case .failure(let error): #expect((error as? TailcatError)?.code == .cancelled)
+        }
+        await client.close(); await tunnel.server.close()
+    }
+
+    @Test func testDiscoPingAbsentPeerEndsAtDeadlineEvent() async throws {
+        let tunnel = try await Tunnel.start()
+        let client = try TailcatClient(address: tunnel.info.address, key: tunnel.clientKeys)
+        await tunnel.server.close()
+        let returned = Shared(false)
+        installHooks(TestHooks(afterCReturn: { report in
+            if report.operation == "client.ping" { returned.update { $0 = true } }
+        }))
+        defer { clearHooks() }
+        let error = await #expect(throws: TailcatError.self) { _ = try await client.ping(timeout: .seconds(3)) }
+        #expect(error?.code == .timeout)
+        #expect(returned.value)
+        await client.close()
+    }
+
+    @Test func testThousandConcurrentDiscoPingCancelRacesLeaveNoTokens() async throws {
+        let tunnel = try await Tunnel.start()
+        let client = try TailcatClient(address: tunnel.info.address, key: tunnel.clientKeys)
+        let tokens = Shared<Set<tc_handle>>([])
+        let entered = Shared(0)
+        installHooks(TestHooks(beforeCCall: { report in
+            guard report.operation == "client.ping" else { return }
+            tokens.update { $0.insert(report.token) }; entered.update { $0 += 1 }
+        }))
+        defer { clearHooks() }
+        var unexpected = 0
+        // Bound native call threads while racing one thousand concurrent Swift calls.
+        for batch in 0..<50 {
+            let tasks = (0..<20).map { _ in Task { try await client.ping(timeout: .seconds(10)) } }
+            while entered.value < (batch + 1) * 20 { await Task.yield() }
+            for task in tasks { task.cancel() }
+            for task in tasks {
+                if case .failure(let error) = await task.result,
+                   (error as? TailcatError)?.code != .cancelled { unexpected += 1 }
+            }
+        }
+        #expect(unexpected == 0)
+        #expect(tokens.value.count == 1000)
+        #expect(tokens.value.filter { HandleLedger.shared.isLive($0) }.isEmpty)
+        #expect(tokens.value.filter { closeStatus($0) != Int32(TC_CLOSED) }.isEmpty)
+        await client.close(); await tunnel.server.close()
+    }
+
     @Test func testRoundTripOneMiBMatchesSHA256() async throws {
         let tunnel = try await Tunnel.start()
         let (client, dialed, accepted) = try await tunnel.connect()

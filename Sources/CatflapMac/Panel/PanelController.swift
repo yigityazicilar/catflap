@@ -27,6 +27,8 @@ struct MacUIState: Codable, Sendable {
     /// Whether the system has this app in front, and how often it activated it.
     var appFrontmost: Bool
     var activations: Int
+    /// How often Catflap.app was opened again while it ran; each time the panel opened.
+    var reopens: Int
     var activationPolicy: String
     var eventLoop: Bool
     /// `material`, or `opaque` under Reduce Transparency or Increase Contrast.
@@ -49,7 +51,7 @@ struct MacUIState: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case visible, mode, display, shortcut, frame, level, background, motion, list, rows, devices, attachments, glyph
         case hasFocus = "has_focus", shortcutKeys = "shortcut_keys", displayFrame = "display_frame", visibleFrame = "visible_frame"
-        case appActive = "app_active", appFrontmost = "app_frontmost", activations, activationPolicy = "activation_policy", eventLoop = "event_loop"
+        case appActive = "app_active", appFrontmost = "app_frontmost", activations, reopens, activationPolicy = "activation_policy", eventLoop = "event_loop"
         case statusItem = "status_item", clipboardRows = "clipboard_rows", historyRows = "history_rows"
         case sendLabel = "send_label", sendLine = "send_line"
     }
@@ -81,7 +83,8 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
     private let container: FlapContainer
     private let band = HoverBand()
     private var statusItem: PanelStatusItem?
-    private var shortcut: PanelShortcut?
+    /// The panel's global shortcut, ⌃⌥⌘Space by default; Settings rebinds it.
+    let shortcut = ShortcutBinding(name: ShortcutBinding.panelName, default: ShortcutBinding.panelDefault)
     private var machine = PanelStateMachine()
     private var model = PanelModel()
     private var placement: Placement?
@@ -149,7 +152,8 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
             item.events = self
             statusItem = item
         }
-        shortcut = PanelShortcut { [weak self] in _ = self?.invoke("toggle") }
+        shortcut.activate { [weak self] in _ = self?.invoke("toggle") }
+        shell.onReopen = { [weak self] in self?.showFocused() }
         observers.append(NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in MainActor.assumeIsolated { self?.applyAppearance() } })
@@ -162,7 +166,8 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
         for task in [deadline, refresher, hiding, arrivedEnd] { task?.cancel() }
         window.orderOut(nil)
         band.stop()
-        shortcut?.stop()
+        shortcut.stop()
+        shell.onReopen = nil
         statusItem?.remove()
         statusItem = nil
         for observer in observers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
@@ -197,6 +202,22 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
         return snapshot()
     }
 
+    /// The panel open and focused, from whatever state it is in: what opening Catflap.app
+    /// again does.
+    func showFocused() {
+        switch machine.mode {
+        case .focused:
+            window.orderFrontRegardless()
+            window.makeKey()
+            _ = window.makeFirstResponder(surface.field)
+        case .hidden:
+            placement = .topCentre(Self.screenForHotkey())
+            handle(.hotkey)
+        case .hover, .drag:
+            handle(.hotkey)
+        }
+    }
+
     func snapshot() -> MacUIState {
         let visible = machine.mode != .hidden
         let screen = placement?.screen
@@ -211,12 +232,12 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
         return MacUIState(
             visible: visible, mode: machine.mode.rawValue, hasFocus: visible && window.isKeyWindow,
             display: visible ? screen.map(Self.displayID) : nil,
-            shortcut: shortcut?.state ?? "unavailable", shortcutKeys: shortcut?.description ?? "",
+            shortcut: shortcut.state, shortcutKeys: shortcut.keys,
             frame: surfaceFrame.map(MacUIState.Frame.init), displayFrame: visible ? screen.map { MacUIState.Frame($0.frame) } : nil,
             visibleFrame: visible ? screen.map { MacUIState.Frame($0.visibleFrame) } : nil,
             level: window.level.rawValue, appActive: NSApplication.shared.isActive,
             appFrontmost: NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid(),
-            activations: shell.activations, activationPolicy: policy,
+            activations: shell.activations, reopens: shell.reopens, activationPolicy: policy,
             eventLoop: shell.running, background: surface.opaqueBackground ? "opaque" : "material",
             motion: accessibility.accessibilityDisplayShouldReduceMotion ? "fade" : "flap",
             statusItem: statusItem != nil, list: model.list.rawValue, rows: model.rows.count,
@@ -546,6 +567,12 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
     }
 
     func viewRemoveAttachments() { model.attachments.removeAll(); render() }
+
+    /// Removes the attachments in `sent`; the others stay attached, to be sent again.
+    func removeAttachments(_ sent: [URL]) {
+        model.attachments.removeAll { sent.contains($0) }
+        render()
+    }
     func viewAttach() { actions?.openPicker() }
     func viewPair() { actions?.showPairing() }
     func viewSettings() { actions?.showSettings() }

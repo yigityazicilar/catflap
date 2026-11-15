@@ -27,18 +27,107 @@ struct PairingTests {
             #expect(expiring.state == .waiting)
             let code = try #require(expiring.code)
             let expired = try await waitForStatus(short, timeout: .seconds(10)) { !$0.isActive }
+            if expired.state == .waiting, let expiresAt = expiring.expiresAt {
+                print("pairing expiry diagnostic: still waiting \(Date().timeIntervalSince(expiresAt)) s past expires_at")
+            }
             #expect(expired.state == .failed)
             #expect(expired.error == "The pairing code expired.")
-            #expect(expired.code == nil)
+            let codeGone = expired.code == nil
+            #expect(codeGone)
 
             // The throwaway server is gone: the code no longer reaches anything.
             _ = try await joiner.pairing.join(code: code)
             let joined = try await waitForStatus(joiner, timeout: .seconds(20)) { !$0.isActive }
             #expect(joined.state == .failed)
-            #expect(joined.digits == nil)
+            let noJoinedDigits = joined.digits == nil
+            #expect(noJoinedDigits)
             for device in [short, joiner] {
                 #expect(try await device.devices.isEmpty)
                 #expect(await device.serverRunning == false)
+            }
+        }
+    }
+
+    @Test func testExpiredCodeIsRefusedWithoutTimerBeforeStatusRead() async throws {
+        let log = TunnelLog()
+        try await withTestDevices { devices in
+            let owner = try await devices.make("Device A") {
+                $0.codeLifetime = .seconds(15)
+                $0.codeExpiryTimerEnabled = false
+                $0.transportHook = { RecordingTransport(inner: $0, role: $1, log: log) }
+            }
+            let joiner = try await devices.make("Device B") { $0.dialTimeout = .seconds(6) }
+            let waiting = try await startWaitingPairing(owner)
+            let code = try #require(waiting.code)
+            try await waitPastPairingExpiry(waiting)
+            // Do not poll the owner first: status reads must not be what prevents admission.
+            _ = try await joiner.pairing.join(code: code)
+            let joined = try await waitForStatus(joiner, timeout: .seconds(20)) { !$0.isActive }
+            #expect(joined.state == .failed)
+            let noDigits = joined.digits == nil
+            #expect(noDigits)
+            // This also catches a briefly displayed hello/digits before a later read timeout.
+            #expect(log.frames(.initiator).isEmpty)
+            let expired = await owner.status
+            expectExpiredPairing(expired)
+            try await expectNothingStored(owner, joiner)
+        }
+    }
+
+    @Test func testExpiredStatusIsReportedWithoutTimer() async throws {
+        try await withTestDevices { devices in
+            let owner = try await devices.make("Device A") {
+                $0.codeLifetime = .seconds(15)
+                $0.codeExpiryTimerEnabled = false
+            }
+            let joiner = try await devices.make("Device B") { $0.dialTimeout = .seconds(6) }
+            let waiting = try await startWaitingPairing(owner)
+            let code = try #require(waiting.code)
+            try await waitPastPairingExpiry(waiting)
+            // One read must report expiry, not a polling allowance for the disabled timer.
+            let expired = await owner.status
+            expectExpiredPairing(expired)
+            _ = try await joiner.pairing.join(code: code)
+            let joined = try await waitForStatus(joiner, timeout: .seconds(20)) { !$0.isActive }
+            #expect(joined.state == .failed)
+            let noDigits = joined.digits == nil
+            #expect(noDigits)
+            try await expectNothingStored(owner, joiner)
+        }
+    }
+
+    @Test func testEmptyConnectionCannotOutliveCodeWithoutTimer() async throws {
+        try await withTestDevices { devices in
+            let owner = try await devices.make("Device A") {
+                $0.codeLifetime = .seconds(15)
+                $0.firstFrameTimeout = .seconds(60)
+                $0.codeExpiryTimerEnabled = false
+            }
+            let waiting = try await startWaitingPairing(owner)
+            let text = try #require(waiting.code)
+            let parsed = PairingCode(text)
+            let code = try #require(parsed)
+            let stranger = try TailcatClient(address: code.address,
+                key: TailcatKeys(privateKey: code.clientKey, publicKey: "", presharedKey: ""))
+            do {
+                let silent = try await Dialer.dial(stranger, port: PairingProtocol.port, timeout: .seconds(10))
+                try await waitPastPairingExpiry(waiting)
+                // No owner status read or timer can close the socket for this assertion.
+                let ending: Result<Data?, Error> = await Result(catching: {
+                    try await silent.read(upTo: 16, timeout: .seconds(6))
+                })
+                await silent.close()
+                await stranger.close()
+                switch ending {
+                case .success(let data): #expect(data == nil)
+                case .failure(let error): #expect((error as? TailcatError)?.code != .timeout)
+                }
+                let expired = await owner.status
+                expectExpiredPairing(expired)
+                try await expectNothingStored(owner)
+            } catch {
+                await stranger.close()
+                throw error
             }
         }
     }
@@ -54,7 +143,8 @@ struct PairingTests {
             _ = try await second.pairing.join(code: code)
             let refused = try await waitForStatus(second, timeout: .seconds(30)) { !$0.isActive }
             #expect(refused.state == .failed)
-            #expect(refused.digits == nil)
+            let noRefusedDigits = refused.digits == nil
+            #expect(noRefusedDigits)
             print("single-use: second device ended with: \(refused.error ?? "no message")")
             // The owner still shows the first device's digits, and only those.
             let ownerStatus = await owner.status
@@ -102,7 +192,8 @@ struct PairingTests {
             try await Task.sleep(for: .seconds(3))
             let afterSilence = await owner.status
             #expect(afterSilence.state == .waiting)
-            #expect(afterSilence.digits == nil)
+            let noSilentDigits = afterSilence.digits == nil
+            #expect(noSilentDigits)
             // The owner closed the silent connection without writing to it.
             let silentEnd: Result<Data?, Error> = await Result(catching: { try await silent.read(upTo: 16, timeout: .seconds(10)) })
             switch silentEnd {
@@ -131,8 +222,10 @@ struct PairingTests {
         let initiator = PairHello(v: 2, deviceID: "device-a", name: "Device A", clientKey: "nodekey:a",
                                   exchangeKey: exchangeKey(), build: "0.1.0-dev", nonce: Nonce.make())
         let base = PairingDigits.digits(joinerHello: try WireCodec.header(joiner), initiatorHello: try WireCodec.header(initiator))
-        #expect(base.count == 6 && base.allSatisfy(\.isNumber))
-        #expect(PairingDigits.digits(joinerHello: try WireCodec.header(joiner), initiatorHello: try WireCodec.header(initiator)) == base)
+        let validDigits = base.count == 6 && base.allSatisfy(\.isNumber)
+        #expect(validDigits)
+        let stableDigits = PairingDigits.digits(joinerHello: try WireCodec.header(joiner), initiatorHello: try WireCodec.header(initiator)) == base
+        #expect(stableDigits)
 
         func variants(_ hello: PairHello) -> [PairHello] {
             var result: [PairHello] = []
@@ -147,14 +240,17 @@ struct PairingTests {
         }
         for changed in variants(joiner) {
             let digits = PairingDigits.digits(joinerHello: try WireCodec.header(changed), initiatorHello: try WireCodec.header(initiator))
-            #expect(digits != base)
+            let changedDigits = digits != base
+            #expect(changedDigits)
         }
         for changed in variants(initiator) {
             let digits = PairingDigits.digits(joinerHello: try WireCodec.header(joiner), initiatorHello: try WireCodec.header(changed))
-            #expect(digits != base)
+            let changedDigits = digits != base
+            #expect(changedDigits)
         }
         // The roles are part of the hash: swapping the two hellos changes the digits too.
-        #expect(PairingDigits.digits(joinerHello: try WireCodec.header(initiator), initiatorHello: try WireCodec.header(joiner)) != base)
+        let swappedDigits = PairingDigits.digits(joinerHello: try WireCodec.header(initiator), initiatorHello: try WireCodec.header(joiner)) != base
+        #expect(swappedDigits)
         // Fresh nonces give each pairing its own digits.
         var seen = Set<String>()
         for _ in 0..<50 {
@@ -182,10 +278,41 @@ struct PairingTests {
                   + "search matched: \(machine.matched); both devices show the same digits: \(sameDigits)")
             // The machine really sat in the middle, and both people see digits to compare.
             #expect(machine.placedBetween)
-            #expect(aDigits != nil && bDigits != nil)
+            let bothShowDigits = aDigits != nil && bDigits != nil
+            #expect(bothShowDigits)
             #expect(!sameDigits)
             _ = await a.pairing.decline()
             _ = await b.pairing.decline()
+            try await expectNothingStored(a, b)
+        }
+
+        // Unlike the arm above, this middle machine changes its hello after committing.
+        // Rejection must happen before digits, confirmation, or permanent material.
+        let dishonest = MiddleBox(dishonestReveal: true)
+        let log = TunnelLog()
+        try await withTestDevices { devices in
+            let a = try await devices.make("Device A") {
+                $0.transportHook = { RecordingTransport(inner: $0, role: $1, log: log) }
+            }
+            let b = try await devices.make("Device B") {
+                $0.transportHook = { transport, role in
+                    role == .joiner ? dishonest.wrap(transport) : transport
+                }
+            }
+            var started = try await a.pairing.start()
+            if started.state == .starting { started = try await waitForStatus(a) { $0.state != .starting } }
+            _ = try await b.pairing.join(code: try #require(started.code))
+            let aEnd = try await waitForStatus(a) { $0.state == .confirm || !$0.isActive }
+            let bEnd = try await waitForStatus(b) { $0.state == .confirm || !$0.isActive }
+            let machine = try #require(dishonest.machine)
+            #expect(machine.placedBetween)
+            #expect(machine.brokeCommitment)
+            #expect(aEnd.state == .failed)
+            #expect(aEnd.error == "The other device broke the pairing protocol.")
+            let noInitiatorDigits = aEnd.digits == nil
+            #expect(noInitiatorDigits)
+            #expect(bEnd.state == .failed)
+            #expect(log.frames(.initiator) == ["pair_hello"])
             try await expectNothingStored(a, b)
         }
     }
@@ -214,7 +341,8 @@ struct PairingTests {
             #expect(aEnd.state == .failed)
             #expect(aEnd.error == "The other device broke the pairing protocol.")
             // The initiator never showed digits for a hello that broke its commitment.
-            #expect(aEnd.digits == nil)
+            let noInitiatorDigits = aEnd.digits == nil
+            #expect(noInitiatorDigits)
             #expect(bEnd.state == .failed)
             try await expectNothingStored(a, b)
         }
@@ -512,7 +640,8 @@ struct PairingTests {
             #expect(try response.decode(UnpairResult.self).serverRunning == false)
             #expect(await a.serverRunning == false)
             #expect(await a.runtime.identityServer.listener == nil)
-            #expect(try await a.runtime.identityServer.address() == nil)
+            let noAddress = try await a.runtime.identityServer.address() == nil
+            #expect(noAddress)
             #expect(try await a.devices.isEmpty)
             let status = try await a.handle("status").decode(AgentStatus.self)
             #expect(status.serverRunning == false && status.pairedDevices == 0)
@@ -530,6 +659,31 @@ struct PairingTests {
             #expect(await a.serverRunning == false)
         }
     }
+}
+
+private func startWaitingPairing(_ device: TestDevice) async throws -> PairingStatus {
+    var status = try await device.pairing.start()
+    if status.state == .starting { status = try await waitForStatus(device) { $0.state != .starting } }
+    try #require(status.state == .waiting)
+    return status
+}
+
+private func waitPastPairingExpiry(_ status: PairingStatus) async throws {
+    let expiry = try #require(status.expiresAt)
+    // Old status timestamps and the JSON wire format round down to whole seconds.
+    // Cross that rounding interval too, without polling the owner or relying on its timer.
+    let remaining = expiry.timeIntervalSinceNow + 1
+    if remaining > 0 { try await Task.sleep(for: .seconds(remaining)) }
+    #expect(Date() >= expiry)
+}
+
+private func expectExpiredPairing(_ status: PairingStatus) {
+    #expect(status.state == .failed)
+    #expect(status.error == "The pairing code expired.")
+    let codeGone = status.code == nil
+    let noDigits = status.digits == nil
+    #expect(codeGone)
+    #expect(noDigits)
 }
 
 private func expectNothingStored(_ devices: TestDevice...) async throws {

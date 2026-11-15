@@ -14,11 +14,30 @@ public struct ClipboardItem: Codable, Sendable, Identifiable {
     public let id: String
     public let timestamp: Date
     public let kind: ClipboardKind
+    /// The whole item, or in a list preview (`truncated`) its first bytes: at most
+    /// `ClipboardHistory.previewLimit` of a text, cut between characters, and none of an image.
     public let content: Data
     public let mime: String?
     public let kept: Bool
+    /// The whole item's size, also in a preview.
+    public let size: Int
+    /// True when `content` is not the whole item; `clip.get` returns it whole.
+    public let truncated: Bool
     public var text: String? { kind == .image ? nil : String(data: content, encoding: .utf8) }
-    public var size: Int { content.count }
+    enum CodingKeys: String, CodingKey { case id, timestamp, kind, content, mime, kept, size, truncated }
+    init(id: String, timestamp: Date, kind: ClipboardKind, content: Data, mime: String?, kept: Bool, size: Int? = nil, truncated: Bool = false) {
+        self.id = id; self.timestamp = timestamp; self.kind = kind; self.content = content; self.mime = mime; self.kept = kept
+        self.size = size ?? content.count; self.truncated = truncated
+    }
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id); timestamp = try c.decode(Date.self, forKey: .timestamp)
+        kind = try c.decode(ClipboardKind.self, forKey: .kind); content = try c.decode(Data.self, forKey: .content)
+        mime = try c.decodeIfPresent(String.self, forKey: .mime); kept = try c.decode(Bool.self, forKey: .kept)
+        // An item from before previews existed is whole.
+        size = try c.decodeIfPresent(Int.self, forKey: .size) ?? content.count
+        truncated = try c.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
+    }
 }
 public struct ClipboardIngestResult: Codable, Sendable {
     public let status: String
@@ -214,17 +233,66 @@ public actor ClipboardHistory {
     public func items(search: String? = nil, now: Date = Date()) async throws -> [ClipboardItem] {
         try await retain(now: now)
         let rows = try await store.query("SELECT * FROM clipboard ORDER BY timestamp DESC,rowid DESC")
-        return try rows.map { row in
+        return try rows.map(Self.item).filter { item in search.map { item.text?.localizedCaseInsensitiveContains($0) == true } ?? true }
+    }
+    /// The list `clip.list` sends: every item without an image's body and with at most
+    /// `previewLimit` bytes of a text, so a full history fits in one control reply whatever
+    /// it holds. No image body is read for it. A search still matches a text's whole content.
+    public func previews(search: String? = nil, now: Date = Date()) async throws -> [ClipboardItem] {
+        try await retain(now: now)
+        // One byte past the limit shows whether, and where, the cut falls inside a character.
+        let rows = try await store.query("""
+            SELECT id,timestamp,kind,mime,kept,length(content) AS size,
+                   CASE WHEN kind='image' THEN NULL ELSE substr(content,1,?) END AS content
+            FROM clipboard ORDER BY timestamp DESC,rowid DESC
+            """, bindings: [.integer(Int64(Self.previewLimit + 1))])
+        var result: [ClipboardItem] = []
+        for row in rows {
             guard case .text(let id) = row["id"], case .real(let time) = row["timestamp"],
                   case .text(let kind) = row["kind"], let parsed = ClipboardKind(rawValue: kind),
-                  case .blob(let data) = row["content"], case .integer(let kept) = row["kept"] else { throw AgentError.storage }
+                  case .integer(let size) = row["size"], case .integer(let kept) = row["kept"] else { throw AgentError.storage }
             let mime: String?
             if case .text(let value) = row["mime"] { mime = value } else { mime = nil }
-            return ClipboardItem(id: id, timestamp: Date(timeIntervalSince1970: time), kind: parsed, content: data, mime: mime, kept: kept != 0)
-        }.filter { item in search.map { item.text?.localizedCaseInsensitiveContains($0) == true } ?? true }
+            var content = Data()
+            if case .blob(let head) = row["content"] { content = head }
+            var truncated = parsed == .image || Int(size) > content.count
+            if content.count > Self.previewLimit {
+                // UTF-8 continuation bytes are 10xxxxxx: back up to the start of a character.
+                var cut = Self.previewLimit
+                while cut > 0 && content[content.startIndex + cut] & 0xC0 == 0x80 { cut -= 1 }
+                content = content.prefix(cut)
+                truncated = true
+            }
+            if let search {
+                guard parsed != .image else { continue }
+                let text: String
+                if truncated { text = try await self.text(id: id) ?? "" } else { text = String(decoding: content, as: UTF8.self) }
+                guard text.localizedCaseInsensitiveContains(search) else { continue }
+            }
+            result.append(ClipboardItem(id: id, timestamp: Date(timeIntervalSince1970: time), kind: parsed, content: content,
+                                        mime: mime, kept: kept != 0, size: Int(size), truncated: truncated))
+        }
+        return result
     }
+    /// At most this many bytes of a text are in `previews`. The Linux panel searches the list
+    /// it gets, so a match further into a long text is found by `clip list --search` only.
+    public static let previewLimit = 8 * 1024
+    private func text(id: String) async throws -> String? {
+        guard case .blob(let data) = try await store.query("SELECT content FROM clipboard WHERE id=?", bindings: [.text(id)]).first?["content"] else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+    private static func item(_ row: SQLRow) throws -> ClipboardItem {
+        guard case .text(let id) = row["id"], case .real(let time) = row["timestamp"],
+              case .text(let kind) = row["kind"], let parsed = ClipboardKind(rawValue: kind),
+              case .blob(let data) = row["content"], case .integer(let kept) = row["kept"] else { throw AgentError.storage }
+        let mime: String?
+        if case .text(let value) = row["mime"] { mime = value } else { mime = nil }
+        return ClipboardItem(id: id, timestamp: Date(timeIntervalSince1970: time), kind: parsed, content: data, mime: mime, kept: kept != 0)
+    }
+    /// One whole item, read on its own.
     public func item(id: String) async throws -> ClipboardItem {
-        guard let item = try await items().first(where: { $0.id == id }) else { throw ClipboardFailure.missing }
-        return item
+        try await retain()
+        guard let row = try await store.query("SELECT * FROM clipboard WHERE id=?", bindings: [.text(id)]).first else { throw ClipboardFailure.missing }
+        return try Self.item(row)
     }
 }

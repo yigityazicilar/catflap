@@ -29,7 +29,11 @@ private struct Description: Decodable {
     let field: String
     let sendLabel: String
     let lastReturn: String?
+    let shortcut: String
     let shortcutTrigger: String?
+    let sendClipboardShortcut: String
+    let shortcutSetup: String?
+    let focusLostTo: String?
     struct Placement: Decodable {
         let layer: String
         let anchor: String
@@ -40,7 +44,8 @@ private struct Description: Decodable {
     enum CodingKeys: String, CodingKey {
         case mode, placement, bands, opaque, motion, rows, field
         case reducedMotion = "reduced_motion", highContrast = "high_contrast", selectedRow = "selected_row"
-        case sendLabel = "send_label", lastReturn = "last_return", shortcutTrigger = "shortcut_trigger"
+        case sendLabel = "send_label", lastReturn = "last_return", shortcutTrigger = "shortcut_trigger", shortcut
+        case sendClipboardShortcut = "send_clipboard_shortcut", shortcutSetup = "shortcut_setup", focusLostTo = "focus_lost_to"
     }
 }
 
@@ -68,6 +73,8 @@ private final class PanelSession {
     private(set) var agentLog: URL?
     private var kwinLog: URL?
     private var fakeInput: URL?
+    /// The portal's front end while `holdPortal()` keeps it stopped.
+    private var heldPortal: Int32 = 0
 
     init() throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("pn-" + UUID().uuidString.prefix(8))
@@ -110,6 +117,7 @@ private final class PanelSession {
     }
 
     deinit {
+        if heldPortal > 0 { kill(heldPortal, SIGCONT) }
         for child in children.reversed() { stop(child.process, agent: child.agent, group: child.group) }
         // Nothing may stay behind: the document portal's FUSE mount ends with the bus group.
         let mounts = (try? String(contentsOfFile: "/proc/self/mounts", encoding: .utf8)) ?? ""
@@ -259,6 +267,7 @@ private final class PanelSession {
         try launch("/usr/lib/at-spi-bus-launcher", ["--launch-immediately"])
         _ = eventually(5) { (try? run("/usr/bin/busctl", ["--user", "status", "org.a11y.Bus"], seconds: 3)) != nil }
         try launch("/usr/lib/at-spi2-registryd", [])
+        try watchFocus()
         if topPanel { try launchWindows() }
         try before()
         let agent = try launch(executable.path, ["agent", "--data-dir", data.path], agent: true,
@@ -398,16 +407,101 @@ private final class PanelSession {
         try windows().last { $0.cls == "catflap" && $0.h > 100 }
     }
 
-    /// Answers the system's confirmation for the shortcut with Return, as the person would,
-    /// and waits until the agent reports it bound.
+    /// Answers the system's question about each of the agent's two shortcuts with Return, as
+    /// the person would: first the panel's, then the send-clipboard one, which the agent asks
+    /// for only once the first is settled. Returns when the agent reports both settled and the
+    /// last question has closed.
     func confirmShortcut() throws {
-        guard eventually(15, { (try? windows().contains { $0.caption == "Global Shortcuts Requested" }) == true || (try? state().shortcut) == "bound" }) else {
-            throw PanelTestError.timedOut("portal dialog")
+        for (number, request) in [(1, \Description.shortcut), (2, \Description.sendClipboardShortcut)] {
+            // The question is up and has the keyboard, or the system settled it without asking.
+            guard try eventually(30, { try describe()[keyPath: request] != "pending" || questionUp(number) }) else {
+                throw PanelTestError.timedOut("portal question \(number)")
+            }
+            if try describe()[keyPath: request] == "pending" { try input("key 28") }
+            guard try eventually(10, { try describe()[keyPath: request] != "pending" }) else {
+                throw PanelTestError.timedOut("shortcut \(number) settled")
+            }
         }
-        if try state().shortcut != "bound" { try input("key 28") }
-        guard try eventually(10, { try state().shortcut == "bound" }) else { throw PanelTestError.timedOut("shortcut bound") }
-        // The dialog closes and the other application has the keyboard again.
-        _ = eventually(5) { (try? windows().contains { $0.caption == "Global Shortcuts Requested" }) == false }
+        guard try eventually(10, { try describe().shortcutSetup == "settled" && !questionOpen() }) else {
+            throw PanelTestError.timedOut("portal questions closed")
+        }
+    }
+
+    // MARK: Focus as KWin sees it
+
+    /// From the start of the session, KWin logs every window it adds, removes and activates,
+    /// in order. Catflap's windows are `catflap` (only the panel ever takes the keyboard, so an
+    /// activated one is `panel`), the portal's "Global Shortcuts Requested" is `question`, any
+    /// other window `other`, and no active window `none`.
+    private func watchFocus() throws {
+        let script = root.appendingPathComponent("focus.js")
+        try """
+        function name(w, activated) {
+          if (!w) return "none";
+          if (w.resourceClass == "catflap") return activated ? "panel" : "catflap";
+          return w.caption == "Global Shortcuts Requested" ? "question" : "other";
+        }
+        workspace.windowActivated.connect(function (w) { print("FOCUS activated " + name(w, true)); });
+        workspace.windowAdded.connect(function (w) { print("FOCUS added " + name(w, false)); });
+        workspace.windowRemoved.connect(function (w) { print("FOCUS removed " + name(w, false)); });
+        """.write(to: script, atomically: true, encoding: .utf8)
+        // KWin's scripting interface can join the bus a moment after its display socket appears.
+        guard eventually(10, { (try? run("/usr/bin/busctl", ["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting",
+                                                          "loadScript", "ss", script.path, "focus"])) != nil }) else {
+            throw PanelTestError.startupFailed("focus log")
+        }
+        try run("/usr/bin/busctl", ["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "start"])
+    }
+
+    /// KWin's focus log so far, oldest first: `activated panel`, `added question`, ...
+    func focusLog() -> [String] {
+        guard let kwinLog else { return [] }
+        let log = (try? String(contentsOf: kwinLog, encoding: .utf8)) ?? ""
+        return log.split(separator: "\n").compactMap { line in line.range(of: "FOCUS ").map { String(line[$0.upperBound...]) } }
+    }
+
+    /// The window KWin activated last, after the first `since` entries of the focus log.
+    func lastActivated(since: Int = 0) -> String? {
+        focusLog().dropFirst(since).last { $0.hasPrefix("activated ") }.map { String($0.dropFirst(10)) }
+    }
+
+    func questionOpen() -> Bool {
+        let log = focusLog()
+        return log.filter { $0 == "added question" }.count > log.filter { $0 == "removed question" }.count
+    }
+
+    /// The system's `number`th shortcut question is on screen and has the keyboard.
+    func questionUp(_ number: Int) -> Bool {
+        focusLog().filter { $0 == "added question" }.count >= number && questionOpen() && lastActivated() == "question"
+    }
+
+    /// Gives the open question the keyboard, as the person's click on it would.
+    func activateQuestion() throws {
+        let marker = "A" + UUID().uuidString.prefix(8)
+        let script = root.appendingPathComponent("activate-\(marker).js")
+        try """
+        for (const w of workspace.stackingOrder) { if (w.caption == "Global Shortcuts Requested") workspace.activeWindow = w; }
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try run("/usr/bin/busctl", ["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "loadScript", "ss", script.path, marker])
+        try run("/usr/bin/busctl", ["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "start"])
+        guard eventually(10, { lastActivated() == "question" }) else { throw PanelTestError.timedOut("question activated") }
+        try run("/usr/bin/busctl", ["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript", "s", marker])
+    }
+
+    /// Stops the desktop portal's front end, so an answer the person gives reaches the agent
+    /// only at `releasePortal()`: the question closes, its answer is held back.
+    func holdPortal() throws {
+        let status = String(decoding: try run("/usr/bin/busctl", ["--user", "status", "org.freedesktop.portal.Desktop"]), as: UTF8.self)
+        guard let line = status.split(separator: "\n").first(where: { $0.hasPrefix("PID=") }), let pid = Int32(line.dropFirst(4)), pid > 0 else {
+            throw PanelTestError.startupFailed("portal process")
+        }
+        heldPortal = pid
+        kill(pid, SIGSTOP)
+    }
+
+    func releasePortal() {
+        if heldPortal > 0 { kill(heldPortal, SIGCONT) }
+        heldPortal = 0
     }
 
     /// Accessible roles and names of the agent's windows, as AT-SPI reports them.
@@ -467,6 +561,86 @@ final class LinuxPanelE2E: XCTestCase {
         XCTAssertEqual(closed.mode, "hidden")
         XCTAssertFalse(try session.state().visible)
         XCTAssertTrue(try session.eventually { try session.panelWindow() == nil })
+    }
+
+    /// The first start's two shortcut questions, with the panel open while they come: the
+    /// system's question takes the keyboard without closing the panel, the panel gets it back
+    /// once both are answered, and a click outside closes it again from then on.
+    func testShortcutQuestionTakesTheKeyboardWithoutClosingThePanel() throws {
+        let session = try PanelSession()
+        try session.start()
+        guard session.eventually(30, { session.questionUp(1) }) else { throw PanelTestError.timedOut("first question") }
+        // The first question is up, unanswered: the panel opens over it with the keyboard.
+        var mark = session.focusLog().count
+        try session.openFocused()
+        XCTAssertEqual(session.lastActivated(since: mark), "panel")
+        // The person clicks the question: Catflap's own, so the panel stays, without the keyboard.
+        mark = session.focusLog().count
+        try session.activateQuestion()
+        try session.expectWaitingForQuestion()
+        XCTAssertEqual(session.lastActivated(since: mark), "question")
+        // Answered: the second question comes up while the panel waits, and takes the keyboard.
+        try session.input("key \(Key.enter)")
+        guard session.eventually(30, { session.questionUp(2) }) else { throw PanelTestError.timedOut("second question") }
+        try session.expectWaitingForQuestion()
+        XCTAssertEqual(try session.describe().shortcutSetup, "send")
+        // Answered too: the panel has the keyboard again.
+        mark = session.focusLog().count
+        try session.input("key \(Key.enter)")
+        XCTAssertTrue(try session.eventually(10) { let s = try session.state(); return s.mode == "focused" && s.visible && s.hasFocus })
+        XCTAssertEqual(try session.describe().shortcutSetup, "settled")
+        XCTAssertNil(try session.describe().focusLostTo)
+        XCTAssertEqual(session.lastActivated(since: mark), "panel")
+        XCTAssertEqual(session.focusLog().filter { $0 == "removed catflap" }.count, 0, "the panel never closed")
+        // With nothing Catflap asked still open, a click outside closes the panel.
+        try session.input("move 100 700", "click")
+        XCTAssertTrue(try session.eventually { let s = try session.state(); return s.mode == "hidden" && !s.visible })
+    }
+
+    /// The panel opened at each point where the portal holds an answer back: after the first
+    /// question closed (the moment the second one is asked), while the second question is up,
+    /// and after the second closed. It ends focused each time.
+    func testPanelOpenedWhileAnAnswerIsHeldBackKeepsTheKeyboard() throws {
+        let session = try PanelSession()
+        try session.start()
+        guard session.eventually(30, { session.questionUp(1) }) else { throw PanelTestError.timedOut("first question") }
+        // Answered, but the answer is held back: the question has closed, the agent still waits.
+        try session.holdPortal()
+        try session.input("key \(Key.enter)")
+        guard session.eventually(10, { !session.questionOpen() }) else { throw PanelTestError.timedOut("first question closed") }
+        XCTAssertEqual(try session.describe().shortcut, "pending")
+        try session.openFocused()
+        // The answer arrives, the agent asks for the second shortcut, and its question comes up
+        // over the open panel and takes the keyboard. The panel stays.
+        var mark = session.focusLog().count
+        session.releasePortal()
+        guard session.eventually(30, { session.questionUp(2) }) else { throw PanelTestError.timedOut("second question") }
+        try session.expectWaitingForQuestion()
+        XCTAssertEqual(session.lastActivated(since: mark), "question")
+        // The second question is up: the panel opened again goes over it with the keyboard.
+        _ = try session.toggle()
+        XCTAssertEqual(try session.state().mode, "hidden")
+        try session.openFocused()
+        try session.activateQuestion()
+        try session.expectWaitingForQuestion()
+        // Answered and held back again; the panel opened now has the keyboard, and keeps it when
+        // the answer arrives.
+        try session.holdPortal()
+        try session.input("key \(Key.enter)")
+        guard session.eventually(10, { !session.questionOpen() }) else { throw PanelTestError.timedOut("second question closed") }
+        XCTAssertEqual(try session.describe().sendClipboardShortcut, "pending")
+        if try session.state().mode == "focused" { _ = try session.toggle() }
+        XCTAssertEqual(try session.state().mode, "hidden")
+        try session.openFocused()
+        mark = session.focusLog().count
+        session.releasePortal()
+        XCTAssertTrue(try session.eventually { try session.describe().shortcutSetup == "settled" })
+        let state = try session.state()
+        XCTAssertEqual(state.mode, "focused")
+        XCTAssertTrue(state.hasFocus)
+        XCTAssertNil(session.lastActivated(since: mark), "nothing took the keyboard")
+        XCTAssertEqual(try session.describe().sendClipboardShortcut, "bound")
+        XCTAssertFalse(try session.toggle().visible)
     }
 
     func testShortcutIsBoundThroughThePortalAndToggles() throws {
@@ -648,6 +822,25 @@ final class LinuxPanelE2E: XCTestCase {
 }
 
 private extension PanelSession {
+    /// Opens the panel with the hotkey's command and waits until it has the keyboard.
+    func openFocused(file: StaticString = #filePath, line: UInt = #line) throws {
+        let opened = try toggle()
+        XCTAssertEqual(opened.mode, "focused", file: file, line: line)
+        XCTAssertTrue(try eventually(10) { let s = try state(); return s.visible && s.hasFocus }, "panel never had the keyboard", file: file, line: line)
+        // KWin's own account agrees, so a later look at its log starts after this activation.
+        XCTAssertTrue(eventually(10) { lastActivated() == "panel" }, file: file, line: line)
+    }
+
+    /// The system's question has the keyboard; the panel the person opened stays open and
+    /// waits for it. Decided once the panel has seen the keyboard go, not before.
+    func expectWaitingForQuestion(file: StaticString = #filePath, line: UInt = #line) throws {
+        guard try eventually(10, { try !state().hasFocus }) else { throw PanelTestError.timedOut("keyboard to the question") }
+        let after = try state()
+        XCTAssertEqual(after.mode, "focused", "the question closed the panel", file: file, line: line)
+        XCTAssertTrue(after.visible, file: file, line: line)
+        XCTAssertEqual(try describe().focusLostTo, "system-dialog", file: file, line: line)
+    }
+
     /// Types `text` with one fake device, so no key is lost to a new device.
     func input(contentsOf text: String) throws {
         try input(text.map { "key " + (Key.letters[$0] ?? Key.space) })

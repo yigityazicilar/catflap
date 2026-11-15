@@ -46,10 +46,6 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks" "$app/Contents/Resources"
 cp "$binary" "$app/Contents/MacOS/catflap"
 cp "$library" "$app/Contents/Frameworks/libtailcat.dylib"
-# Resource bundles of the packages (KeyboardShortcuts' strings) sit beside the executable.
-for resources in "$(dirname "$binary")"/*.bundle; do
-    if [[ -d "$resources" ]]; then cp -R "$resources" "$app/Contents/Resources/"; fi
-done
 executable="$app/Contents/MacOS/catflap"
 # Libraries the build linked from outside macOS (a package manager's SQLite, found through
 # pkg-config) go into Frameworks as well, so the app needs nothing macOS does not have.

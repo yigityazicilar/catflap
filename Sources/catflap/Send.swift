@@ -14,7 +14,7 @@ struct Send: AsyncParsableCommand, AgentFeature {
         guard let peers = await runtime.service(PeerService.self) else { throw AgentError.invalidRequest }
         let store = await runtime.store
         let configured = try await store.setting("inbox")
-        let directory = configured.map { URL(fileURLWithPath: $0) } ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads/Catflap")
+        let directory = configured.map { URL(fileURLWithPath: $0) } ?? TransferInbox.defaultDirectory
         let service = TransferService(store: store, inbox: try TransferInbox(directory: directory, create: false), peers: peers)
         try await service.install(on: runtime)
     }
@@ -23,18 +23,18 @@ struct Send: AsyncParsableCommand, AgentFeature {
         let device: String
         if let to { device = to }
         else {
-            guard let first = try await request(.init("devices")).decode([DeviceSummary].self).first else {
+            guard let first = try await request(.init("devices")).expect([DeviceSummary].self).first else {
                 try fail("No paired device. Pair one first with `catflap pair start`.", code: 1)
             }
             device = first.id
         }
         var arguments = ["device_id": device, "keep": dontKeep ? "false" : "true"]
         arguments["text"] = text; arguments["file"] = file.map { URL(fileURLWithPath: $0).standardizedFileURL.path }; arguments["retry"] = retry
-        var row = try await request(.init("send", arguments: arguments)).decode(TransferRecord.self)
+        var row = try await request(.init("send", arguments: arguments)).expect(TransferRecord.self)
         let deadline = ContinuousClock.now + .seconds(3600)
         while row.status == "sending" && ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(200))
-            row = try await request(.init("send.status", arguments: ["device_id": device, "id": row.id])).decode(TransferRecord.self)
+            row = try await request(.init("send.status", arguments: ["device_id": device, "id": row.id])).expect(TransferRecord.self)
         }
         if row.status == "ok" { print(try ControlJSON.text(row)); return }
         // The send did not end well. A row read back from the store carries no reason, so one

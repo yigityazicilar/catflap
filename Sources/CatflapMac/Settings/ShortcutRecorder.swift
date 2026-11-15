@@ -1,10 +1,9 @@
 #if os(macOS)
 import AppKit
-import KeyboardShortcuts
 
 /// A button that shows a shortcut and records a new one: click it, then press the
 /// combination. Esc stops without a change, Delete removes the binding. While it listens,
-/// Catflap's own shortcuts do not fire.
+/// Catflap's own shortcuts are unregistered, so the keys reach it.
 @MainActor
 final class ShortcutRecorder: NSButton {
     let binding: ShortcutBinding
@@ -34,35 +33,36 @@ final class ShortcutRecorder: NSButton {
     }
 
     @objc private func clicked() {
-        if recording { finish() } else { begin() }
+        if recording { finish(); onChange?(nil) } else { begin() }
     }
 
     private func begin() {
         recording = true
-        for other in quiet { KeyboardShortcuts.disable([other.name]) }
+        for other in quiet { other.suspend() }
         monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
-            let shortcut = KeyboardShortcuts.Shortcut(event: event)
             let code = event.keyCode
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            let consumed = MainActor.assumeIsolated { self?.record(shortcut, code: code, flags: flags) ?? false }
+            let consumed = MainActor.assumeIsolated { self?.record(code: code, flags: flags) ?? false }
             return consumed ? nil : event
         }
         refresh()
     }
 
+    /// Stops listening. The bindings register again; one whose combination was taken meanwhile
+    /// is a conflict, which the settings show.
     private func finish() {
         recording = false
         if let monitor { NSEvent.removeMonitor(monitor) }
         monitor = nil
-        for other in quiet { KeyboardShortcuts.enable([other.name]) }
+        for other in quiet { other.resume() }
         refresh()
     }
 
     /// Returns true when the key press belonged to the recorder.
-    private func record(_ shortcut: KeyboardShortcuts.Shortcut?, code: UInt16, flags: NSEvent.ModifierFlags) -> Bool {
+    private func record(code: UInt16, flags: NSEvent.ModifierFlags) -> Bool {
         guard recording else { return false }
         // Esc (53) stops; Delete (51) and Forward Delete (117) remove the binding.
-        if code == 53 && flags.subtracting(.function).isEmpty { finish(); return true }
+        if code == 53 && flags.subtracting(.function).isEmpty { finish(); onChange?(nil); return true }
         if (code == 51 || code == 117) && flags.subtracting(.function).isEmpty {
             _ = binding.rebind(nil)
             finish()
@@ -71,15 +71,21 @@ final class ShortcutRecorder: NSButton {
         }
         let modifiers = flags.intersection([.control, .option, .command, .shift])
         // A global shortcut needs Control, Option or Command; Shift alone would take a letter.
-        guard let shortcut, !modifiers.intersection([.control, .option, .command]).isEmpty else {
+        guard !modifiers.intersection([.control, .option, .command]).isEmpty else {
             NSSound.beep()
             return true
         }
-        // KeyboardShortcuts is quiet for this binding while recording; let it register again.
-        KeyboardShortcuts.enable([binding.name])
-        let taken = binding.rebind(shortcut)
+        let shortcut = Shortcut(key: Int(code), modifiers: modifiers)
+        // The other binding is quiet while recording, so the system would not refuse its keys.
+        if quiet.contains(where: { $0 !== binding && $0.shortcut == shortcut }) {
+            finish()
+            onChange?("Catflap's other shortcut is \(ShortcutBinding.describe(shortcut)). Choose another.")
+            return true
+        }
+        binding.resume()
+        let refusal = binding.rebind(shortcut)
         finish()
-        onChange?(taken ? nil : "macOS or another app already uses \(ShortcutBinding.describe(shortcut)). Choose another.")
+        onChange?(refusal.map { ShortcutBinding.sentence($0, shortcut) })
         return true
     }
 

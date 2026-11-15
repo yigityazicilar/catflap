@@ -7,6 +7,20 @@ struct ActionRefusal: Error, Sendable {
     let message: String
 }
 
+/// An attached file that did not start sending, with the sentence saying why.
+struct NotSent: Codable, Sendable, Equatable {
+    var file: String
+    var reason: String
+}
+
+/// How starting a send went: the rows that started, while they are `sending`, and the attached
+/// files that did not start. `files` are the attached files that started, in the order of `rows`.
+struct SendStart: Sendable {
+    var rows: [TransferRecord] = []
+    var files: [URL] = []
+    var notSent: [NotSent] = []
+}
+
 /// Everything the panel does beyond appearing and leaving: sending typed text, attached files
 /// and list rows; Copy, Delete, Retry and Reveal; Attach through the open panel, pasted files
 /// and the Services menu; the send-clipboard shortcut; notifications on arrival and on a
@@ -25,8 +39,10 @@ final class PanelActions {
     let picker = FilePicker()
     let services = ServiceProvider()
     let pairing: PairingFlow
-    let panelShortcut = ShortcutBinding(existing: ShortcutBinding.panelName, default: ShortcutBinding.panelDefault)
-    private(set) var sendShortcut: ShortcutBinding?
+    /// The panel's shortcut, which the panel registers; settings rebind it here.
+    var panelShortcut: ShortcutBinding { controller.shortcut }
+    /// The send-clipboard shortcut, ⌃⌥⇧⌘Space by default.
+    let sendShortcut = ShortcutBinding(name: ShortcutBinding.sendClipboardName, default: ShortcutBinding.sendClipboardDefault)
     private(set) var settings = MacSettings()
     private(set) var settingsWindow: SettingsWindowController?
     private(set) var pairingWindow: PairingWindowController?
@@ -43,7 +59,7 @@ final class PanelActions {
     /// have moved without this object seeing where (arrow keys, typing, another list).
     var selectedRow: String?
     private let pollClipboard: @MainActor () async -> Void
-    private var lastPanelSend: Task<Result<[TransferRecord], ActionRefusal>, Never>?
+    private var lastPanelSend: Task<Result<SendStart, ActionRefusal>, Never>?
     /// The row action (Copy, Delete, Reveal) the panel started most recently.
     private var lastRowAction: Task<Void, Never>?
     private var deviceNames: [String: String] = [:]
@@ -70,10 +86,11 @@ final class PanelActions {
         settings = await MacSettings.load(from: runtime.store)
         await refreshDevices()
         controller.actions = self
-        sendShortcut = ShortcutBinding(name: ShortcutBinding.sendClipboardName, default: ShortcutBinding.sendClipboardDefault) { [weak self] in
+        sendShortcut.activate { [weak self] in
             guard let self else { return }
             Task { _ = await self.sendLatest() }
         }
+        noteShortcuts()
         notifier.perform = { [weak self] action in self?.perform(action) }
         services.receive = { [weak self] urls in self?.attachFromElsewhere(urls) }
         NSApplication.shared.servicesProvider = services
@@ -89,7 +106,7 @@ final class PanelActions {
         history.stop()
         pairing.stop()
         picker.cancel()
-        sendShortcut?.stop()
+        sendShortcut.stop()
         settingsWindow?.close()
         pairingWindow?.close()
         if controller.actions === self { controller.actions = nil }
@@ -124,15 +141,16 @@ final class PanelActions {
 
     /// Return or the send button in the panel.
     func panelSend(_ payload: PanelPayload, to deviceID: String, keep: Bool) {
-        let task = Task { [weak self] () -> Result<[TransferRecord], ActionRefusal> in
+        let task = Task { [weak self] () -> Result<SendStart, ActionRefusal> in
             guard let self else { return .failure(ActionRefusal(message: "Catflap is stopping.")) }
             let outcome = await self.send(payload, to: deviceID, keep: keep)
             switch outcome {
-            case .success:
-                // What was sent leaves the field, the attachment row and the selection.
+            case .success(let start):
+                // What was sent leaves the field, the attachment row and the selection. An
+                // attached file that did not start stays attached, to be sent again.
                 switch payload {
                 case .text: self.controller.viewFilterChanged("")
-                case .files: self.controller.viewRemoveAttachments()
+                case .files: self.controller.removeAttachments(start.files)
                 case .row: self.selectedRow = nil; self.controller.viewSelectRow(nil)
                 }
             case .failure(let refusal):
@@ -146,7 +164,7 @@ final class PanelActions {
     /// Retry on a history row in the panel.
     func panelRetry(_ rowID: String) {
         let (device, id) = Self.split(rowID)
-        lastPanelSend = Task { [weak self] () -> Result<[TransferRecord], ActionRefusal> in
+        lastPanelSend = Task { [weak self] () -> Result<SendStart, ActionRefusal> in
             guard let self else { return .failure(ActionRefusal(message: "Catflap is stopping.")) }
             let outcome = await self.retry(deviceID: device, id: id)
             if case .failure(let refusal) = outcome { self.sendFailed(title: "Not sent to \(self.name(of: device))", body: refusal.message) }
@@ -195,31 +213,43 @@ final class PanelActions {
     }
 
     /// The send the panel started most recently, for `ui invoke send`.
-    func takePanelSend() -> Task<Result<[TransferRecord], ActionRefusal>, Never>? {
+    func takePanelSend() -> Task<Result<SendStart, ActionRefusal>, Never>? {
         defer { lastPanelSend = nil }
         return lastPanelSend
     }
 
     /// Starts sending `payload`; returns the rows at once, while they are `sending`. How each
-    /// ends is seen by the history watcher, whoever started it.
-    func send(_ payload: PanelPayload, to deviceID: String, keep: Bool) async -> Result<[TransferRecord], ActionRefusal> {
+    /// ends is seen by the history watcher, whoever started it. Attached files start one by
+    /// one: a file that cannot start (gone, unreadable, too large) does not stop the others,
+    /// and is reported with its reason; only when none started is the send refused.
+    func send(_ payload: PanelPayload, to deviceID: String, keep: Bool) async -> Result<SendStart, ActionRefusal> {
         guard let transfers = await runtime.service(TransferService.self) else {
             return .failure(ActionRefusal(message: "Sending is not available."))
         }
-        var rows: [TransferRecord] = []
+        var begun = SendStart()
         do {
             switch payload {
             case .text(let text):
-                rows.append(try await transfers.start(deviceID: deviceID, payload: .text(text), keep: keep))
+                begun.rows.append(try await transfers.start(deviceID: deviceID, payload: .text(text), keep: keep))
             case .files(let urls):
-                for url in urls { rows.append(try await transfers.start(deviceID: deviceID, payload: .file(url), keep: keep)) }
+                for url in urls {
+                    do {
+                        begun.rows.append(try await transfers.start(deviceID: deviceID, payload: .file(url), keep: keep))
+                        begun.files.append(url)
+                    } catch {
+                        begun.notSent.append(NotSent(file: url.path, reason: Self.sentence(error)))
+                    }
+                }
+                if begun.rows.isEmpty, let first = begun.notSent.first {
+                    return .failure(ActionRefusal(message: urls.count == 1 ? first.reason : Self.notSentSentence(begun.notSent, started: 0)))
+                }
             case .row(let row):
                 switch row.kind {
                 case .text, .url, .image, .files:
                     guard let clipboard = await runtime.service(ClipboardService.self) else {
                         return .failure(ActionRefusal(message: "Clipboard history is not available."))
                     }
-                    rows.append(try await clipboard.send(id: row.id, deviceID: deviceID, keep: keep))
+                    begun.rows.append(try await clipboard.send(id: row.id, deviceID: deviceID, keep: keep))
                 case .sent, .received:
                     let (device, id) = Self.split(row.id)
                     guard let record = try await transfers.history.record(deviceID: device, id: id) else {
@@ -229,9 +259,9 @@ final class PanelActions {
                         guard let text = try await transfers.copyText(deviceID: device, id: id) else {
                             return .failure(ActionRefusal(message: "That text was not kept, so it cannot be sent again."))
                         }
-                        rows.append(try await transfers.start(deviceID: deviceID, payload: .text(text), keep: keep))
+                        begun.rows.append(try await transfers.start(deviceID: deviceID, payload: .text(text), keep: keep))
                     } else if let path = record.path, FileManager.default.fileExists(atPath: path) {
-                        rows.append(try await transfers.start(deviceID: deviceID, payload: .file(URL(fileURLWithPath: path)), keep: keep))
+                        begun.rows.append(try await transfers.start(deviceID: deviceID, payload: .file(URL(fileURLWithPath: path)), keep: keep))
                     } else {
                         return .failure(ActionRefusal(message: "That file is not kept on this Mac, so it cannot be sent again."))
                     }
@@ -240,13 +270,26 @@ final class PanelActions {
         } catch {
             return .failure(ActionRefusal(message: Self.sentence(error)))
         }
-        started(rows, to: deviceID)
-        return .success(rows)
+        started(begun.rows, to: deviceID)
+        if !begun.notSent.isEmpty {
+            sendFailed(title: "Not every file sent to \(name(of: deviceID))", body: Self.notSentSentence(begun.notSent, started: begun.rows.count))
+        }
+        return .success(begun)
+    }
+
+    /// Each attached file that did not start, with why, and how many others are on their way.
+    static func notSentSentence(_ files: [NotSent], started: Int) -> String {
+        let each = files.map { URL(fileURLWithPath: $0.file).lastPathComponent + ": " + $0.reason }.joined(separator: " ")
+        switch started {
+        case 0: return each
+        case 1: return each + " The other file is on its way."
+        default: return each + " The other \(started) files are on their way."
+        }
     }
 
     /// The send-clipboard shortcut: the newest copy, if clipboard history recorded it, to the
     /// most recently used device. Success is quiet; a refusal says why in a notification.
-    func sendLatest() async -> Result<[TransferRecord], ActionRefusal> {
+    func sendLatest() async -> Result<SendStart, ActionRefusal> {
         // A copy made less than one poll before the shortcut is seen first.
         await pollClipboard()
         let response = await runtime.handle(ControlRequest("clip.send", arguments: ["latest": "true"]))
@@ -256,17 +299,17 @@ final class PanelActions {
             return .failure(ActionRefusal(message: sentence))
         }
         started([row], to: row.deviceID)
-        return .success([row])
+        return .success(SendStart(rows: [row]))
     }
 
-    func retry(deviceID: String, id: String) async -> Result<[TransferRecord], ActionRefusal> {
+    func retry(deviceID: String, id: String) async -> Result<SendStart, ActionRefusal> {
         guard let transfers = await runtime.service(TransferService.self) else {
             return .failure(ActionRefusal(message: "Sending is not available."))
         }
         do {
             let row = try await transfers.retry(deviceID: deviceID, id: id)
             started([row], to: deviceID)
-            return .success([row])
+            return .success(SendStart(rows: [row]))
         } catch {
             return .failure(ActionRefusal(message: Self.sentence(error)))
         }
@@ -287,7 +330,11 @@ final class PanelActions {
                     guard let text = try await transfers.copyText(deviceID: device, id: id) else {
                         return ActionRefusal(message: "That text was not kept, and the ten minutes to copy it are over.")
                     }
-                    PasteboardWriter.write(text: text)
+                    // A text that was not kept goes on the clipboard marked concealed, so no
+                    // clipboard history, Catflap's own included, reads or keeps it. This is the
+                    // Copy of the row, of the notification, and of received text put on the
+                    // clipboard on arrival.
+                    PasteboardWriter.write(text: text, concealed: !record.keep)
                 } else if let path = record.path, FileManager.default.fileExists(atPath: path) {
                     PasteboardWriter.write(files: [URL(fileURLWithPath: path)])
                 } else {
@@ -411,27 +458,29 @@ final class PanelActions {
         let window = settingsWindow ?? makeSettingsWindow()
         settingsWindow = window
         settings.startAtLogin = LoginItem.state
-        settings.panelShortcut = panelShortcut.keys
-        settings.sendShortcut = sendShortcut?.keys ?? ""
+        noteShortcuts()
         if controller.snapshot().visible { _ = controller.invoke("hide") }
         window.show()
         Task { await refreshDevices() }
     }
 
     private func makeSettingsWindow() -> SettingsWindowController {
-        let send = sendShortcut ?? ShortcutBinding(existing: ShortcutBinding.sendClipboardName, default: ShortcutBinding.sendClipboardDefault)
-        let window = SettingsWindowController(panel: panelShortcut, send: send)
+        let window = SettingsWindowController(panel: panelShortcut, send: sendShortcut)
         window.actions = self
         for recorder in [window.panelRecorder, window.sendRecorder] {
             recorder.onChange = { [weak self] refusal in
                 guard let self else { return }
                 self.settingsMessage = refusal ?? ""
-                self.settings.panelShortcut = self.panelShortcut.keys
-                self.settings.sendShortcut = self.sendShortcut?.keys ?? ""
+                self.noteShortcuts()
                 Task { await self.refreshDevices() }
             }
         }
         return window
+    }
+
+    /// The shortcuts as the settings show them: their keys, and whether each is bound.
+    func noteShortcuts() {
+        settings.noteShortcuts(panel: panelShortcut, send: sendShortcut)
     }
 
     func showPairing() {
@@ -462,15 +511,12 @@ final class PanelActions {
             refusal = LoginItem.set(MacSettings.on(value))
             settings.startAtLogin = LoginItem.state
         case .panelShortcut, .sendShortcut:
-            guard let binding = key == .panelShortcut ? panelShortcut : sendShortcut else {
-                return ActionRefusal(message: "That shortcut is not available.")
-            }
+            let binding = key == .panelShortcut ? panelShortcut : sendShortcut
             if ["none", "off", ""].contains(value.lowercased()) { _ = binding.rebind(nil) }
             else if let shortcut = binding.parse(value) {
-                if !binding.rebind(shortcut) { refusal = "macOS or another app already uses \(ShortcutBinding.describe(shortcut)). Choose another." }
-            } else { refusal = "Write the shortcut as, for example, ctrl+option+space." }
-            settings.panelShortcut = panelShortcut.keys
-            settings.sendShortcut = sendShortcut?.keys ?? ""
+                if let why = binding.rebind(shortcut) { refusal = ShortcutBinding.sentence(why, shortcut) }
+            } else { refusal = "Write the shortcut as, for example, ctrl+option+cmd+space." }
+            noteShortcuts()
         default:
             var updated = settings
             refusal = await updated.store(key, value, in: runtime.store)

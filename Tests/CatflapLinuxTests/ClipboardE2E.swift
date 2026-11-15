@@ -12,6 +12,7 @@ private final class ClipboardSession {
     var environment: [String: String]
     private var children: [(Process, Bool)] = []
     private(set) var agentLog: URL?
+    private var agentProcess: Process?
     let data: URL
 
     init() throws {
@@ -76,8 +77,13 @@ private final class ClipboardSession {
         child.standardError = try FileHandle(forWritingTo: log)
         try child.run()
         children.append((child, agent))
-        if agent { agentLog = log }
+        if agent { agentLog = log; agentProcess = child }
         return child
+    }
+
+    /// Stops the agent as logout does; it must exit 0 within the usual bound.
+    func stopAgent() {
+        if let agentProcess { stop(agentProcess, agent: true) }
     }
 
     func command(_ arguments: [String]) throws -> Data {
@@ -126,10 +132,15 @@ private final class ClipboardSession {
         try ControlJSON.decoder.decode([ClipboardItem].self, from: command(["clip", "list"]))
     }
 
+    /// One item whole: `clip list` has previews, without image bodies or long texts' ends.
+    func item(_ id: String) throws -> ClipboardItem {
+        try ControlJSON.decoder.decode(ClipboardItem.self, from: command(["clip", "get", id]))
+    }
+
     func waitForText(_ text: String, seconds: TimeInterval = 2) throws -> Bool {
         let end = Date().addingTimeInterval(seconds)
         repeat {
-            if try items().contains(where: { $0.text == text }) { return true }
+            if try items().contains(where: { listed in try (listed.truncated ? item(listed.id) : listed).text == text }) { return true }
             Thread.sleep(forTimeInterval: 0.02)
         } while Date() < end
         return false
@@ -199,6 +210,199 @@ private final class ClipboardSession {
         }
         throw ClipboardTestError.startupFailed
     }
+
+    /// A compositor of its own that offers only ext-data-control and plays `steps` to the
+    /// watcher: `offer:X` (data_offer), `type:X:MIME`, `select:X`, `primary:X`, `body:X:TEXT`
+    /// (what a read of X returns) and `read:X` (wait until the client asked to read X). Every
+    /// event goes alone: it is flushed, and the next step waits until the client has read all of
+    /// it (the socket's send queue is empty), so the watcher gets each one in a dispatch of its
+    /// own. Nothing is sent before `begin()`. The log says what was sent, what the client asked
+    /// to read and when it destroyed each offer: `EARLY` for an offer destroyed before a
+    /// selection named it.
+    func startScriptedDataControl(_ steps: [String]) throws -> (server: Process, log: URL) {
+        let sources = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("Sources/CDataControl")
+        let header = root.appendingPathComponent("ext-data-control-v1-server-protocol.h")
+        let scanner = try launch("/usr/bin/wayland-scanner", ["server-header", sources.appendingPathComponent("ext-data-control-v1.xml").path, header.path])
+        guard wait(scanner, seconds: 30), scanner.terminationStatus == 0 else { throw ClipboardTestError.commandFailed }
+        let source = root.appendingPathComponent("scripted.c")
+        let program = root.appendingPathComponent("scripted")
+        try Self.scriptedServer.write(to: source, atomically: true, encoding: .utf8)
+        let compiler = try launch("/usr/bin/cc", [source.path, sources.appendingPathComponent("ext-data-control-v1-protocol.c").path,
+                                                  "-I" + root.path, "-lwayland-server", "-o", program.path])
+        guard wait(compiler, seconds: 30), compiler.terminationStatus == 0 else { throw ClipboardTestError.commandFailed }
+        let log = root.appendingPathComponent("scripted-log")
+        environment["WAYLAND_DISPLAY"] = "scripted"
+        let server = try launch(program.path, [log.path] + steps)
+        let end = Date().addingTimeInterval(10)
+        while server.isRunning && Date() < end {
+            if FileManager.default.fileExists(atPath: root.appendingPathComponent("scripted").path) { return (server, log) }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        throw ClipboardTestError.startupFailed
+    }
+
+    /// Waits for a captured row with `text`. False as soon as capture is no longer active; the
+    /// long bound only guards against a hang.
+    func waitForCapture(_ text: String) throws -> Bool {
+        let end = Date().addingTimeInterval(30)
+        repeat {
+            if try items().contains(where: { $0.text == text }) { return true }
+            if let status = try? ControlJSON.decoder.decode(AgentStatus.self, from: command(["status"])),
+               status.clipboardCapture != "active" { return false }
+            Thread.sleep(forTimeInterval: 0.02)
+        } while Date() < end
+        return false
+    }
+
+    private static let scriptedServer = """
+    #include <wayland-server.h>
+    #include <linux/sockios.h>
+    #include <signal.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <sys/ioctl.h>
+    #include <unistd.h>
+    #include "ext-data-control-v1-server-protocol.h"
+
+    struct offer { char name; struct wl_resource *resource; const char *body; int named, replaced, received; };
+    static struct wl_display *display;
+    static struct wl_client *client;
+    static struct wl_resource *device;
+    static struct wl_event_source *timer;
+    static struct wl_listener gone;
+    static struct offer offers[16], *selection, *primary, *awaited;
+    static int count, total, next, go;
+    static char **steps;
+    static FILE *out;
+
+    static void note(const char *what, const struct offer *o, const char *detail) {
+        fprintf(out, "%s %c %s\\n", what, o ? o->name : '-', detail);
+        fflush(out);
+    }
+    static struct offer *find(char name) {
+        for (int i = 0; i < count; i++) if (offers[i].name == name) return &offers[i];
+        if (count == 16) abort();
+        offers[count].name = name;
+        return &offers[count++];
+    }
+    static void receive(struct wl_client *c, struct wl_resource *r, const char *mime, int32_t fd) {
+        (void)c;
+        struct offer *o = wl_resource_get_user_data(r);
+        note("receive", o, mime);
+        const char *body = o->body ? o->body : "";
+        size_t left = strlen(body);
+        while (left) { ssize_t n = write(fd, body, left); if (n <= 0) break; body += n; left -= (size_t)n; }
+        close(fd);
+        o->received++;
+        if (awaited == o) awaited = NULL;
+    }
+    static void destroy_offer(struct wl_client *c, struct wl_resource *r) {
+        (void)c;
+        struct offer *o = wl_resource_get_user_data(r);
+        /* The resource stays until the client goes, as events already on their way would. */
+        note("destroy", o, !o->named ? "EARLY" : o->replaced ? "replaced" : o == primary ? "primary" : "current");
+    }
+    static const struct ext_data_control_offer_v1_interface offer_impl = { .receive = receive, .destroy = destroy_offer };
+    static void offer_gone(struct wl_resource *r) { ((struct offer *)wl_resource_get_user_data(r))->resource = NULL; }
+    static void destroy_resource(struct wl_client *c, struct wl_resource *r) { (void)c; wl_resource_destroy(r); }
+    static void source_offer(struct wl_client *c, struct wl_resource *r, const char *mime) { (void)c; (void)r; (void)mime; }
+    static const struct ext_data_control_source_v1_interface source_impl = { .offer = source_offer, .destroy = destroy_resource };
+    static void set_selection(struct wl_client *c, struct wl_resource *r, struct wl_resource *source) { (void)c; (void)r; (void)source; }
+    static const struct ext_data_control_device_v1_interface device_impl = {
+        .set_selection = set_selection, .destroy = destroy_resource, .set_primary_selection = set_selection };
+    static void device_gone(struct wl_resource *r) { if (r == device) device = NULL; }
+    static int unread(void) { int n = 0; return ioctl(wl_client_get_fd(client), SIOCOUTQ, &n) < 0 ? -1 : n; }
+    static int is(const char *step, size_t verb, const char *name) { return strlen(name) == verb && !strncmp(step, name, verb); }
+
+    /* One step; 1 when it sent an event, which the client must then read on its own. */
+    static int perform(const char *step) {
+        const char *colon = strchr(step, ':');
+        if (!colon || !colon[1]) { note("end", NULL, step); return 0; }
+        size_t verb = (size_t)(colon - step);
+        struct offer *o = find(colon[1]);
+        const char *rest = colon[2] == ':' ? colon + 3 : "";
+        if (is(step, verb, "body")) { o->body = rest; return 0; }
+        if (is(step, verb, "read")) { if (!o->received) awaited = o; return 0; }
+        if (is(step, verb, "offer")) {
+            o->resource = wl_resource_create(client, &ext_data_control_offer_v1_interface, 1, 0);
+            wl_resource_set_implementation(o->resource, &offer_impl, o, offer_gone);
+            ext_data_control_device_v1_send_data_offer(device, o->resource);
+        } else if (is(step, verb, "type")) {
+            ext_data_control_offer_v1_send_offer(o->resource, rest);
+        } else if (is(step, verb, "select")) {
+            if (selection) selection->replaced = 1;
+            selection = o; o->named = 1;
+            ext_data_control_device_v1_send_selection(device, o->resource);
+        } else if (is(step, verb, "primary")) {
+            if (primary) primary->replaced = 1;
+            primary = o; o->named = 1;
+            ext_data_control_device_v1_send_primary_selection(device, o->resource);
+        } else {
+            note("unknown", o, step);
+            return 0;
+        }
+        note("sent", o, step);
+        return 1;
+    }
+    static int tick(void *data) {
+        (void)data;
+        if (!client || !device) return 0;
+        wl_display_flush_clients(display);
+        while (next < total && !awaited && unread() == 0) {
+            int sent = perform(steps[next++]);
+            wl_display_flush_clients(display);
+            if (sent) break;
+        }
+        if (next < total || awaited) wl_event_source_timer_update(timer, 1);
+        return 0;
+    }
+    static void start(void) {
+        if (!go || !device || timer) return;
+        timer = wl_event_loop_add_timer(wl_display_get_event_loop(display), tick, NULL);
+        wl_event_source_timer_update(timer, 1);
+    }
+    static int begin(int number, void *data) { (void)number; (void)data; go = 1; start(); return 0; }
+    static void client_gone(struct wl_listener *l, void *data) { (void)l; (void)data; client = NULL; device = NULL; note("gone", NULL, ""); }
+    static void get_device(struct wl_client *c, struct wl_resource *r, uint32_t id, struct wl_resource *seat) {
+        (void)r; (void)seat;
+        struct wl_resource *created = wl_resource_create(c, &ext_data_control_device_v1_interface, 1, id);
+        wl_resource_set_implementation(created, &device_impl, NULL, device_gone);
+        if (client) return;
+        client = c; device = created;
+        gone.notify = client_gone;
+        wl_client_add_destroy_listener(c, &gone);
+        start();
+    }
+    static void create_source(struct wl_client *c, struct wl_resource *r, uint32_t id) {
+        (void)r;
+        struct wl_resource *source = wl_resource_create(c, &ext_data_control_source_v1_interface, 1, id);
+        wl_resource_set_implementation(source, &source_impl, NULL, NULL);
+    }
+    static const struct ext_data_control_manager_v1_interface manager_impl = {
+        .create_data_source = create_source, .get_data_device = get_device, .destroy = destroy_resource };
+    static void bind_manager(struct wl_client *c, void *d, uint32_t v, uint32_t id) {
+        (void)d; (void)v;
+        struct wl_resource *r = wl_resource_create(c, &ext_data_control_manager_v1_interface, 1, id);
+        wl_resource_set_implementation(r, &manager_impl, NULL, NULL);
+    }
+    static void bind_seat(struct wl_client *c, void *d, uint32_t v, uint32_t id) { (void)d; (void)v; wl_resource_create(c, &wl_seat_interface, 1, id); }
+    int main(int argc, char **argv) {
+        if (argc < 2 || !(out = fopen(argv[1], "a"))) return 2;
+        steps = argv + 2;
+        total = argc - 2;
+        display = wl_display_create();
+        if (!display) return 1;
+        wl_event_loop_add_signal(wl_display_get_event_loop(display), SIGUSR1, begin, NULL);
+        if (wl_display_add_socket(display, "scripted") < 0) return 1;
+        wl_global_create(display, &wl_seat_interface, 1, NULL, bind_seat);
+        wl_global_create(display, &ext_data_control_manager_v1_interface, 1, NULL, bind_manager);
+        wl_display_run(display);
+        wl_display_destroy(display);
+        return 0;
+    }
+    """
 }
 
 final class LinuxClipboardE2E: XCTestCase {
@@ -257,7 +461,10 @@ final class LinuxClipboardE2E: XCTestCase {
         let end = Date().addingTimeInterval(5)
         var captured = false
         repeat {
-            captured = try session.items().contains { $0.kind == .image && $0.mime == "image/png" && $0.content == png }
+            captured = try session.items().contains { listed in
+                guard listed.kind == .image, listed.mime == "image/png" else { return false }
+                return try session.item(listed.id).content == png
+            }
             if captured { break }
             Thread.sleep(forTimeInterval: 0.02)
         } while Date() < end
@@ -308,5 +515,70 @@ final class ClipboardStatusTests: XCTestCase {
         XCTAssertEqual(status.clipboardCapture, "unsupported")
         XCTAssertFalse(session.trace().contains("ext_data_control_manager_v1@"))
         XCTAssertTrue(try session.items().isEmpty)
+    }
+}
+
+/// The compositor may deliver data_offer, the MIME types and the selection in separate reads.
+/// An offer the watcher has been introduced to must live until a selection names it. These run
+/// everywhere: the scripted compositor is the test's own, so no nested KWin is needed.
+final class ClipboardSplitDeliveryTests: XCTestCase {
+    private func play(_ steps: [String], until text: String) throws -> (session: ClipboardSession, log: () -> String) {
+        let session = try ClipboardSession()
+        let (server, log) = try session.startScriptedDataControl(steps)
+        let read = { (try? String(contentsOf: log, encoding: .utf8)) ?? "" }
+        try session.startAgent(expected: "active")
+        kill(server.processIdentifier, SIGUSR1)
+        XCTAssertTrue(try session.waitForCapture(text), "capture stopped or never saw the row; compositor log:\n" + read())
+        return (session, read)
+    }
+
+    private func finish(_ session: ClipboardSession, _ log: () -> String) throws {
+        let status = try ControlJSON.decoder.decode(AgentStatus.self, from: session.command(["status"]))
+        XCTAssertEqual(status.clipboardCapture, "active")
+        XCTAssertFalse(session.trace().contains("unknown object"))
+        XCTAssertFalse(log().contains("EARLY"), log())
+        session.stopAgent()
+        // The watcher closed its connection on the way out.
+        let end = Date().addingTimeInterval(10)
+        while Date() < end && !log().contains("gone - ") { Thread.sleep(forTimeInterval: 0.02) }
+        XCTAssertTrue(log().contains("gone - "), log())
+    }
+
+    func testOfferIntroducedBeforeItsSelectionIsKeptAndCaptureContinues() throws {
+        let first = "split ordinary copy " + UUID().uuidString
+        let last = "copy after the split ones " + UUID().uuidString
+        let (session, log) = try play([
+            "body:A:" + first, "offer:A", "type:A:text/plain;charset=utf-8", "type:A:text/plain", "select:A", "read:A",
+            // A primary selection is not history: its offer is let go once it is named.
+            "offer:P", "type:P:text/plain", "primary:P",
+            "body:C:" + last, "offer:C", "type:C:text/plain;charset=utf-8", "select:C", "read:C", "end",
+        ], until: last)
+        XCTAssertEqual(try session.items().map(\.text), [last, first])
+        let lines = log().split(separator: "\n")
+        XCTAssertEqual(lines.filter { $0.hasPrefix("receive A ") }.count, 1)
+        XCTAssertEqual(lines.filter { $0.hasPrefix("receive C ") }.count, 1)
+        XCTAssertFalse(lines.contains { $0.hasPrefix("receive P ") })
+        // Retired only when replaced or discarded, and before the next read.
+        let receiveC = try XCTUnwrap(lines.firstIndex { $0.hasPrefix("receive C ") })
+        XCTAssertNotNil(lines[..<receiveC].firstIndex(of: "destroy A replaced"), log())
+        XCTAssertNotNil(lines[..<receiveC].firstIndex(of: "destroy P primary"), log())
+        try finish(session, log)
+    }
+
+    func testMarkerArrivingLastKeepsTheOfferUnread() throws {
+        let marked = "marked split copy " + UUID().uuidString
+        let last = "ordinary copy after the marked one " + UUID().uuidString
+        let (session, log) = try play([
+            "body:B:" + marked, "offer:B", "type:B:text/plain;charset=utf-8", "type:B:x-kde-passwordManagerHint", "select:B",
+            "body:C:" + last, "offer:C", "type:C:text/plain;charset=utf-8", "select:C", "read:C", "end",
+        ], until: last)
+        // The following ordinary copy is the barrier: the watcher handles one selection at a time.
+        XCTAssertEqual(try session.items().map(\.text), [last])
+        let lines = log().split(separator: "\n")
+        XCTAssertFalse(lines.contains { $0.hasPrefix("receive B ") }, log())
+        XCTAssertEqual(lines.filter { $0.hasPrefix("receive C ") }.count, 1)
+        let receiveC = try XCTUnwrap(lines.firstIndex { $0.hasPrefix("receive C ") })
+        XCTAssertNotNil(lines[..<receiveC].firstIndex(of: "destroy B replaced"), log())
+        try finish(session, log)
     }
 }
