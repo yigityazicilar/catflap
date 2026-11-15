@@ -1,0 +1,10 @@
+Package: catflap
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: Catflap maintainers
+Depends: libgtk-4-1, libadwaita-1-0, libgtk4-layer-shell0 (>= 1.0.4), libwayland-client0, libx11-6, libxfixes3, libsqlite3-0, libc6, libstdc++6, libgcc-s1, zlib1g
+Description: Private clipboard history and transfers between your own devices
+ GTK panel and command-line agent. Swift runtime libraries and pinned
+ libtailcat are installed in the application's private library directory.

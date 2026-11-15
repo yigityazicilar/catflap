@@ -1,0 +1,24 @@
+# Release publishing supplies the source archive and its reviewed checksum.
+pkgname=catflap
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Private clipboard history and transfers between your own devices'
+arch=('x86_64')
+url='https://github.com/yigityazicilar/catflap'
+license=('BSD-3-Clause')
+depends=('gtk4' 'libadwaita' 'gtk4-layer-shell>=1.0.4' 'wayland' 'libx11' 'libxfixes' 'sqlite' 'gcc-libs' 'glibc' 'zlib')
+makedepends=('swift-bin' 'go>=1.27.2' 'git' 'pkgconf' 'patchelf' 'clang')
+options=('!strip' '!debug')
+source=("catflap-${pkgver}.tar.gz::${CATFLAP_SOURCE_URL:-https://github.com/yigityazicilar/catflap/archive/refs/tags/v${pkgver}.tar.gz}")
+sha256sums=("${CATFLAP_SOURCE_SHA256:?Set the reviewed release archive SHA-256 before building}")
+
+build() {
+    swift --version
+    cd "$srcdir/catflap-$pkgver"
+    CATFLAP_VERSION="$pkgver" bash scripts/package/build.sh stage
+}
+
+package() {
+    cd "$srcdir/catflap-$pkgver"
+    cp -a build/package-root/. "$pkgdir/"
+}

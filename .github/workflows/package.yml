@@ -1,0 +1,37 @@
+name: Linux packages
+on:
+  push:
+    branches: [main, 'ci/**']
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    name: package-${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [arch, ubuntu, debian, fedora]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build and test in separate clean containers
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 scripts/package/run.py '${{ matrix.target }}' --output "$RUNNER_TEMP/packages/${{ matrix.target }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: catflap-${{ matrix.target }}-x86_64
+          path: ${{ runner.temp }}/packages/${{ matrix.target }}/*
+          if-no-files-found: error
+  package:
+    needs: verify
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every target to pass
+        env:
+          RESULT: ${{ needs.verify.result }}
+        run: test "$RESULT" = success
