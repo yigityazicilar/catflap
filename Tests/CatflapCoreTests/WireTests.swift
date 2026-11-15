@@ -11,8 +11,8 @@ struct WireTests {
             let b = try await devices.make("Device B")
             try await linkDevices(a, b)
             let (aID, bID) = (await a.id, await b.id)
-            // The tunnel works and A speaks another version: A answers `mismatch` and closes.
-            await a.peers.setVersion(WireProtocol.version + 1)
+            // The tunnel works and A speaks an older version: A answers `mismatch` and closes.
+            await a.peers.setVersion(WireProtocol.version - 1)
             let error = await #expect(throws: PeerError.self) { _ = try await b.peers.open(deviceID: aID) }
             #expect(error == .updateNeeded(device: "Device A"))
             #expect(error?.errorDescription == "Update Catflap on Device A")
@@ -43,6 +43,22 @@ struct WireTests {
             #expect(owner.error == "Update Catflap on the other device")
             #expect(try await a.devices.isEmpty)
             #expect(try await b.devices.isEmpty)
+        }
+    }
+
+    @Test func testNewerPeerAsksToUpdateThisDevice() async throws {
+        try await withTestDevices { devices in
+            let a = try await devices.make("Device A")
+            let b = try await devices.make("Device B")
+            try await linkDevices(a, b)
+            let (aID, bID) = (await a.id, await b.id)
+            // A is the newer one: B, which dialed, is the device to update, and says so.
+            await a.peers.setVersion(WireProtocol.version + 1)
+            let error = await #expect(throws: PeerError.self) { _ = try await b.peers.open(deviceID: aID) }
+            #expect(error?.errorDescription == "Update Catflap on this device: Device A runs a newer Catflap")
+            // A, which was dialed, notes that B needs the update, so its `devices` can say so.
+            let state = try? await a.runtime.store.query("SELECT peer_state FROM device_state WHERE device_id=?", bindings: [.text(bID)])
+            #expect(state?.first?["peer_state"] == .text("update_peer"))
         }
     }
 

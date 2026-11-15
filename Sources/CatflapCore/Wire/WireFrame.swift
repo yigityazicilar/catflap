@@ -1,8 +1,10 @@
 import Foundation
 
-/// Wire protocol v2: frames of a 4-byte big-endian length and a JSON header of at most 64 KiB.
+/// Wire protocol v3: frames of a 4-byte big-endian length and a JSON header of at most 64 KiB.
+/// Every change to a frame's fields comes with a new version, so builds that differ in any
+/// frame tell each other so before anything else.
 public enum WireProtocol {
-    public static let version = 2
+    public static let version = 3
     public static let maxHeader = 64 * 1024
     /// The one TCP port the permanent server listens on inside the tunnel.
     public static let port: UInt16 = 7447

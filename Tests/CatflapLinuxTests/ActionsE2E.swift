@@ -382,11 +382,17 @@ final class LinuxActionsE2E: XCTestCase {
         XCTAssertTrue(session.eventually {
             !((try? String(contentsOf: menu, encoding: .utf8)) ?? "send --to").contains("send --to")
         })
-        // The other device still lists this one; a send from it now fails.
-        let refused = try session.run(session.executable.path,
-                                      ["send", "--text", "after removal", "--data-dir", session.peerData.path, "--json"],
-                                      seconds: 90, allowFailure: true)
-        XCTAssertTrue(String(decoding: refused, as: UTF8.self).contains("\"ok\":false"))
+        // The other device still lists this one. To it, a device that dropped its key looks
+        // exactly like one that is offline (xfer-design §1, "This device does not know you"):
+        // the send waits at the door, status 75, and would expire after 7 days.
+        let sender = Process(), out = Pipe()
+        sender.executableURL = session.executable
+        sender.arguments = ["send", "--text", "after removal", "--data-dir", session.peerData.path, "--json"]
+        sender.environment = session.environment; sender.standardOutput = out; sender.standardError = FileHandle.nullDevice
+        try sender.run(); let printed = out.fileHandleForReading.readDataToEndOfFile(); sender.waitUntilExit()
+        FileHandle.standardError.write(Data("send after removal: exit \(sender.terminationStatus), \(String(decoding: printed, as: UTF8.self))\n".utf8))
+        XCTAssertEqual(sender.terminationStatus, 75)
+        XCTAssertTrue(try session.history(peer: true).contains { $0.text == "after removal" && $0.status == "waiting" })
         XCTAssertFalse(try session.history().contains { $0.text == "after removal" })
     }
 
