@@ -7,10 +7,14 @@ import CGtkShim
 /// wlroots-style compositors offer the protocol.
 final class LayerShellHost: PanelHost {
     let desktop = "layer-shell"
+    var closesOnKeyboardLoss: Bool { focus?.isWlroots != true }
     private let bands = HoverBands()
     private var requested: String?
     private var keyboard = GTK_LAYER_SHELL_KEYBOARD_MODE_NONE
     private var handover: UInt32 = 0
+    private var focus: WlrootsFocus?
+    private var focusRequested = false
+    private var eventSink: ((PanelMachine.Event) -> Void)?
     private(set) var blurAvailable = false
     var onDrop: (([String]) -> Void)?
 
@@ -27,9 +31,37 @@ final class LayerShellHost: PanelHost {
         gtk_layer_set_exclusive_zone(window.cast(), 0)
         gtk_layer_set_keyboard_mode(window.cast(), keyboard)
         blurAvailable = cf_blur_supported(window.cast()) != 0
+        let policy = WlrootsFocus()
+        focus = policy
+        policy.onActivation = { [weak self] in
+            guard let self, focusRequested, gtk_widget_get_visible(window.cast()) != 0 else { return }
+            eventSink?(.focusLost)
+        }
+        policy.onSetupChange = { [weak self, weak policy] in
+            guard let self, policy?.isWlroots == true, focusRequested, gtk_widget_get_visible(window.cast()) != 0 else { return }
+            present(window, mode: .focused, display: requested)
+        }
     }
 
     func present(_ window: OpaquePointer, mode: PanelMode, display: String?) {
+        focusRequested = mode == .focused
+        if focus?.isWlroots == true {
+            let visible = gtk_widget_get_visible(window.cast()) != 0
+            if requested != display || !visible {
+                requested = display
+                gtk_layer_set_monitor(window.cast(), display.flatMap(Self.monitor(named:)))
+            }
+            // Released Sway drops focus on an EXCLUSIVE -> ON_DEMAND transition.
+            // Pending portal requests release the keyboard; their existing completion
+            // hook and the file picker's withdraw/return path restore it afterwards.
+            let wanted = focusRequested && !WlrootsFocus.shortcutPending ? GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE : GTK_LAYER_SHELL_KEYBOARD_MODE_NONE
+            if wanted == GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE && keyboard != wanted { focus?.discardActivations() }
+            keyboard = wanted
+            gtk_layer_set_keyboard_mode(window.cast(), keyboard)
+            gtk_window_present(window.cast())
+            _ = cf_surface_commit(window.cast())
+            return
+        }
         let wanted = mode == .focused ? GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND : GTK_LAYER_SHELL_KEYBOARD_MODE_NONE
         let visible = gtk_widget_get_visible(window.cast()) != 0
         if requested != display || !visible {
@@ -66,6 +98,7 @@ final class LayerShellHost: PanelHost {
     }
 
     func withdraw(_ window: OpaquePointer) {
+        focusRequested = false
         if handover != 0 { GLib.cancel(handover); handover = 0 }
         gtk_widget_set_visible(window.cast(), 0)
         keyboard = GTK_LAYER_SHELL_KEYBOARD_MODE_NONE
@@ -81,10 +114,16 @@ final class LayerShellHost: PanelHost {
     }
 
     func startTriggers(_ sink: @escaping (PanelMachine.Event) -> Void) {
+        eventSink = sink
+        focus?.start()
         bands.start(sink: sink) { [weak self] files in self?.onDrop?(files) }
     }
 
-    func stopTriggers() { bands.stop() }
+    func stopTriggers() {
+        focus?.stop()
+        eventSink = nil
+        bands.stop()
+    }
 
     var triggerDisplays: [String] { bands.displays }
 
