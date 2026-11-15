@@ -348,6 +348,13 @@ final class PanelApp: @unchecked Sendable {
             try ControlResponse(value: await loop.perform { self.handle(.hotkey(display: nil)); return self.state() })
         }
         await runtime.register("ui.invoke") { [self] request in await invoke(request.arguments["action"] ?? "") }
+        // Opens the panel focused unless it is already; never hides it.
+        await runtime.register("panel.show") { [self] _ in
+            try ControlResponse(value: await loop.perform {
+                if self.machine.mode != .focused { self.handle(.hotkey(display: self.machine.display)) }
+                return self.state()
+            })
+        }
     }
 
     private func invoke(_ action: String) async -> ControlResponse {

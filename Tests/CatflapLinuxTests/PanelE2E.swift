@@ -6,7 +6,7 @@ import XCTest
 private enum PanelTestError: Error { case missingExecutable, timedOut(String), commandFailed(String), startupFailed(String) }
 
 /// What `ui state --json` reports.
-private struct State: Decodable {
+private struct State: Decodable, Equatable {
     let visible: Bool
     let mode: String
     let hasFocus: Bool
@@ -222,6 +222,13 @@ private final class PanelSession {
     func describe() throws -> Description { try ControlJSON.decoder.decode(Description.self, from: catflap(["ui", "invoke", "describe"])) }
     func invoke(_ action: String) throws -> State { try ControlJSON.decoder.decode(State.self, from: catflap(["ui", "invoke", action])) }
     func toggle() throws -> State { try ControlJSON.decoder.decode(State.self, from: catflap(["toggle"])) }
+
+    /// `panel.show`, sent on the control socket as a second launch of the app sends it.
+    func show() throws -> State {
+        let response = try ControlClient.request(ControlRequest("panel.show"), socket: data.appendingPathComponent("control.sock"))
+        guard response.ok else { throw PanelTestError.commandFailed("panel.show: " + (response.error ?? "no error text")) }
+        return try response.decode(State.self)
+    }
 
     /// Polls `condition` until it holds or `seconds` pass. Waiting on the event, not a sleep.
     func eventually(_ seconds: TimeInterval = 5, _ condition: () throws -> Bool) rethrows -> Bool {
@@ -641,6 +648,57 @@ final class LinuxPanelE2E: XCTestCase {
         XCTAssertNil(session.lastActivated(since: mark), "nothing took the keyboard")
         XCTAssertEqual(try session.describe().sendClipboardShortcut, "bound")
         XCTAssertFalse(try session.toggle().visible)
+    }
+
+    /// `panel.show`, which a second launch sends: from hidden and from hover it opens the
+    /// panel with the keyboard; a focused panel stays as it is, also while the system's
+    /// shortcut question has the keyboard; it never hides the panel; and it answers with what
+    /// `ui.state` says.
+    func testPanelShowOpensFocusedAndNeverHides() throws {
+        let session = try PanelSession()
+        try session.start()
+        guard session.eventually(30, { session.questionUp(1) }) else { throw PanelTestError.timedOut("first question") }
+        // Hidden, with the first question up: the panel opens over it with the keyboard.
+        XCTAssertFalse(try session.state().visible)
+        var mark = session.focusLog().count
+        let opened = try session.show()
+        XCTAssertEqual(opened.mode, "focused")
+        XCTAssertTrue(opened.visible)
+        XCTAssertTrue(opened.hasFocus)
+        XCTAssertEqual(opened, try session.state())
+        XCTAssertTrue(session.eventually(10) { session.lastActivated(since: mark) == "panel" })
+        // The person clicks the question: the panel waits for it, and panel.show leaves it so,
+        // without taking the keyboard back and without closing it.
+        try session.activateQuestion()
+        try session.expectWaitingForQuestion()
+        mark = session.focusLog().count
+        let waiting = try session.show()
+        XCTAssertEqual(waiting.mode, "focused")
+        XCTAssertTrue(waiting.visible)
+        XCTAssertFalse(waiting.hasFocus)
+        XCTAssertEqual(waiting, try session.state())
+        XCTAssertEqual(try session.describe().focusLostTo, "system-dialog")
+        XCTAssertNil(session.lastActivated(since: mark), "panel.show took the keyboard from the question")
+        // Both questions answered: the panel has the keyboard again, and panel.show keeps it so.
+        try session.confirmShortcut()
+        XCTAssertTrue(try session.eventually(10) { let s = try session.state(); return s.mode == "focused" && s.hasFocus })
+        let focused = try session.show()
+        XCTAssertEqual(focused.mode, "focused")
+        XCTAssertTrue(focused.visible)
+        XCTAssertTrue(focused.hasFocus)
+        XCTAssertEqual(focused, try session.state())
+        XCTAssertEqual(try session.show(), focused)
+        XCTAssertEqual(session.focusLog().filter { $0 == "removed catflap" }.count, 0, "panel.show closed the panel")
+        // Opened by hover, without the keyboard: panel.show gives it the keyboard where it is.
+        XCTAssertEqual(try session.invoke("hide").mode, "hidden")
+        let hover = try session.invoke("simulate-hover")
+        XCTAssertEqual(hover.mode, "hover")
+        XCTAssertFalse(hover.hasFocus)
+        let shown = try session.show()
+        XCTAssertEqual(shown.mode, "focused")
+        XCTAssertTrue(shown.visible)
+        XCTAssertTrue(shown.hasFocus)
+        XCTAssertEqual(shown, try session.state())
     }
 
     func testShortcutIsBoundThroughThePortalAndToggles() throws {

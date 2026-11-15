@@ -139,6 +139,50 @@ final class LinuxActionsE2E: XCTestCase {
         XCTAssertEqual(try session.history(peer: true).filter { $0.direction == "received" && $0.sha256 == keptHash }.count, 1)
     }
 
+    /// Return in the panel while the agent cannot read its list of paired devices: although
+    /// the panel's own copy still shows the device, nothing is sent, the panel says why, and
+    /// what was typed and attached stays. With the list readable again the same Return sends.
+    func testReturnSendsNothingWhileThePairedDevicesCannotBeRead() throws {
+        let session = try ActionsSession()
+        // While this file exists the panel's agent answers `devices` with an error.
+        let fault = session.root.appendingPathComponent("devices-fault")
+        session.environment["CATFLAP_TEST_DEVICES_FAULT"] = fault.path
+        try session.start()
+        try session.confirmShortcuts()
+        try session.pairWithCommandLine()
+        let peerName = try XCTUnwrap(session.devices().first?.name)
+        let file = session.root.appendingPathComponent("home/stays.txt")
+        try Data("stays attached".utf8).write(to: file)
+        XCTAssertTrue(try session.invoke("attach", ["files": file.path]).ok)
+        XCTAssertTrue(try session.eventually { try session.describe().hasFocus })
+        let text = "not sent while the list cannot be read"
+        try session.type(text)
+        XCTAssertTrue(try session.eventually { try session.describe().field == text })
+        // The panel's own copy of the list names the device the send would go to.
+        XCTAssertTrue(try session.describe().sendLabel.hasSuffix("to \(peerName)"))
+
+        _ = FileManager.default.createFile(atPath: fault.path, contents: nil)
+        XCTAssertThrowsError(try session.devices(), "the fault is not on")
+        try session.input("key \(EvdevKey.enter)")
+        var description = try session.describe()
+        XCTAssertTrue(try session.eventually {
+            description = try session.describe()
+            return description.message == "Catflap could not read your paired devices. Try again."
+        }, "the panel said: \(description.message)")
+        XCTAssertEqual(description.field, text)
+        XCTAssertEqual(description.attachments, ["stays.txt"])
+        XCTAssertTrue(description.sendLabel.hasSuffix("to \(peerName)"), description.sendLabel)
+        XCTAssertFalse(try session.history().contains { $0.direction == "sent" }, "a transfer started")
+        XCTAssertFalse(try session.history(peer: true).contains { $0.direction == "received" }, "something arrived")
+
+        // The list readable again: the same Return sends the text, and the file stays attached.
+        try FileManager.default.removeItem(at: fault)
+        try session.input("key \(EvdevKey.enter)")
+        XCTAssertTrue(try sentText(text, session))
+        XCTAssertTrue(try receivedText(text, session, peer: true))
+        XCTAssertEqual(try session.describe().attachments, ["stays.txt"])
+    }
+
     func testArrivalNotifiesQuietlyWithCopyAndShowInFolder() throws {
         let session = try ActionsSession()
         try session.start()
