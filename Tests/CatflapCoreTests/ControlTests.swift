@@ -39,4 +39,28 @@ struct ControlTests {
         task.cancel(); await task.value
         await runtime.stop()
     }
+    /// Without a panel, `panel.show` opens the panel focused, as `toggle` does when it opens
+    /// it, from hidden and from shown without focus; it leaves a focused panel as it is,
+    /// never hides it, and answers with what `ui.state` then says.
+    @Test func testPanelShowOpensThePanelFocusedAndNeverHidesIt() async throws {
+        let paths = try storeTestPaths()
+        defer { removeStoreTestPaths(paths) }
+        let runtime = try AgentRuntime(paths: paths)
+        var hovered = UIState()
+        hovered.visible = true; hovered.mode = "hover"; hovered.hasFocus = false
+        for start in [UIState(), hovered] {
+            await runtime.setUIState(start)
+            // The second time round the panel is already focused.
+            for round in 1...2 {
+                let shown = await runtime.handle(.init("panel.show"))
+                try #require(shown.ok, "panel.show from \(start.mode), round \(round): \(shown.error ?? "")")
+                let state = await runtime.handle(.init("ui.state"))
+                #expect(shown.payload == state.payload, "panel.show answered other than ui.state")
+                let after = try state.decode(UIState.self)
+                #expect(after.visible && after.hasFocus && after.mode == "focused",
+                        "panel.show from \(start.mode), round \(round), left it \(after.mode), focus \(after.hasFocus)")
+            }
+        }
+        await runtime.stop()
+    }
 }

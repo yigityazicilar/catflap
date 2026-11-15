@@ -1,11 +1,23 @@
 @testable import CatflapCore
 import Foundation
+import Synchronization
 import Testing
 #if os(Linux)
 import Glibc
 #else
 import Darwin
 #endif
+
+/// Holds every request in its handler until it is opened, and counts those that came.
+private final class HandlerGate: Sendable {
+    private let state = Mutex((entered: 0, open: false))
+    var entered: Int { state.withLock { $0.entered } }
+    func open() { state.withLock { $0.open = true } }
+    func pass() async {
+        state.withLock { $0.entered += 1 }
+        while !state.withLock({ $0.open }) { try? await Task.sleep(for: .milliseconds(5)) }
+    }
+}
 
 /// A connection that writes and reads raw bytes, so a test can hold a frame half sent.
 private final class RawClient: @unchecked Sendable {
@@ -201,5 +213,51 @@ private func paddedRequest(_ size: Int) throws -> Data {
         try await until("the whole budget free again") { server.inFlightBytes == 0 }
         #expect(try await ControlClient.requestAsync(.init("status"), socket: paths.socket).ok)
         server.stop(); await task.value
+    }
+
+    /// A connection beyond the 32 served at once is answered with a sentence that says so
+    /// before it is closed, not cut without a word; the 32 are answered once their handlers
+    /// end.
+    @Test func testConnectionBeyondThe32ServedIsToldTheAgentIsBusy() async throws {
+        let paths = try storeTestPaths()
+        defer { removeStoreTestPaths(paths) }
+        let server = try ControlServer(paths: paths, lock: AgentLock(paths: paths))
+        let gate = HandlerGate()
+        let task = Task { await server.run { _ in await gate.pass(); return (try? ControlResponse(value: "answered")) ?? ControlResponse(error: .storage) } }
+        let frame = try ControlJSON.encoder.encode(ControlRequest("status")) + Data([10])
+        let held = try (0..<32).map { _ in try RawClient(paths.socket) }
+        for client in held { #expect(try await onThread { client.write(frame) }, "a held request was refused") }
+        try await until("32 requests in their handlers") { gate.entered == 32 }
+
+        let refused = try? await ControlClient.requestAsync(.init("status"), socket: paths.socket)
+        #expect(refused?.ok == false && refused?.error == ControlServer.crowded, "the 33rd connection got: \(refused?.error ?? "no reply")")
+
+        gate.open()
+        let replies = try await withThrowingTaskGroup(of: ControlResponse?.self) { group in
+            for client in held { group.addTask { try await onThread { client.reply() } } }
+            return try await group.reduce(into: [ControlResponse?]()) { $0.append($1) }
+        }
+        #expect(replies.allSatisfy { $0?.ok == true }, "\(replies.map { $0?.error ?? ($0 == nil ? "no reply" : "answered") })")
+        server.stop(); await task.value
+    }
+
+    /// Once `run` has returned after `stop()`, the socket is gone and the folder's lock is
+    /// free, although the server object itself still lives, as it may while a thread of its
+    /// own is ending: a new agent can start in that folder at once. Many rounds, each after
+    /// served requests, each with a new server and a new lock.
+    @Test func testStoppedServerFreesItsFolderWhenRunReturns() async throws {
+        let paths = try storeTestPaths()
+        defer { removeStoreTestPaths(paths) }
+        for round in 1...20 {
+            let server = try ControlServer(paths: paths, lock: AgentLock(paths: paths))
+            let task = serve(server)
+            for _ in 1...3 { #expect(try await ControlClient.requestAsync(.init("status"), socket: paths.socket).ok) }
+            server.stop(); await task.value
+            #expect(!FileManager.default.fileExists(atPath: paths.socket.path), "round \(round): the socket is still there")
+            let next = try? AgentLock(paths: paths)
+            #expect(next != nil, "round \(round): the folder was still locked")
+            withExtendedLifetime(server) {}
+            if next == nil { break }
+        }
     }
 }

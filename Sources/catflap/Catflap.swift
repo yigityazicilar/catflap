@@ -133,14 +133,19 @@ struct Agent: AsyncParsableCommand {
             throw ExitCode.failure
         }
     }
-    /// Asks the agent that runs for `paths` to show its panel: a hidden one is opened with
-    /// `toggle`, a shown one is left as it is. False if that agent cannot be asked.
+    /// Asks the agent that runs for `paths` to show its panel with `panel.show`, which opens it
+    /// focused and never hides it. An agent from before that command refuses it as invalid;
+    /// that one is asked for the panel's state, and a hidden panel is opened with `toggle`.
+    /// False if that agent cannot be asked.
     private static func showPanel(of paths: AgentPaths) async -> Bool {
+        guard let shown = try? await ControlClient.requestAsync(.init("panel.show"), socket: paths.socket) else { return false }
+        if shown.ok { return true }
+        guard shown.error == AgentError.invalidRequest.rawValue else { return false }
         guard let state = try? await ControlClient.requestAsync(.init("ui.state"), socket: paths.socket), state.ok,
               let shape = (try? JSONSerialization.jsonObject(with: state.payload)) as? [String: Any] else { return false }
         if shape["visible"] as? Bool == true { return true }
-        guard let shown = try? await ControlClient.requestAsync(.init("toggle"), socket: paths.socket) else { return false }
-        return shown.ok
+        guard let toggled = try? await ControlClient.requestAsync(.init("toggle"), socket: paths.socket) else { return false }
+        return toggled.ok
     }
 }
 struct Status: ParsableCommand {
