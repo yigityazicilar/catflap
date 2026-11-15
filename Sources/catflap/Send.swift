@@ -55,7 +55,7 @@ struct Send: AsyncParsableCommand, AgentFeature {
     private func request(_ request: ControlRequest) async throws -> ControlResponse {
         let response: ControlResponse
         do { response = try await ControlClient.requestAsync(request, socket: options.socket) }
-        catch { try fail(AgentError.control.rawValue, code: 1) }
+        catch { let failure = AgentError.unanswered(error); try fail(failure.message, code: failure.code) }
         guard response.ok else { try fail(response.error ?? "Control request failed.", code: response.exitCode) }
         return response
     }

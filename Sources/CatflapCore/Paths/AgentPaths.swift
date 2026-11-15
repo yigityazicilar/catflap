@@ -11,6 +11,8 @@ public enum AgentError: String, Error, LocalizedError, Sendable {
     case storage = "Cannot access the local store."
     case identity = "Cannot access the device identity."
     case control = "Cannot reach the agent control channel."
+    /// The agent took the request and gave no reply within the client's reply wait.
+    case noAnswer = "The agent did not answer in time."
     case invalidRequest = "Invalid control request."
     case unsupported = "This command is not available yet."
     public var errorDescription: String? { rawValue }

@@ -51,6 +51,16 @@ enum CommandBoundary {
 /// A successful reply whose payload is not what the command expects.
 struct UnreadableReply: Error {}
 
+extension AgentError {
+    /// What a command says when its request to the agent failed: that the agent did not
+    /// answer in time, with status 69 (`EX_UNAVAILABLE`), or else that it cannot be reached,
+    /// with status 1. 75 is kept for a send that is waiting for a device that is away.
+    static func unanswered(_ error: any Error) -> (message: String, code: Int32) {
+        if error as? AgentError == .noAnswer { return (AgentError.noAnswer.rawValue, 69) }
+        return (AgentError.control.rawValue, 1)
+    }
+}
+
 extension ControlResponse {
     /// Decodes the payload, or throws `UnreadableReply`.
     func expect<T: Decodable>(_ type: T.Type) throws -> T {

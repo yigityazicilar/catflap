@@ -103,7 +103,7 @@ struct PairClient {
     func send<T: Decodable>(_ command: String, _ arguments: [String: String] = [:], as type: T.Type) throws -> T {
         let response: ControlResponse
         do { response = try ControlClient.request(.init(command, arguments: arguments), socket: options.socket) }
-        catch { try fail(AgentError.control.rawValue, code: ExitCode.failure) }
+        catch { let failure = AgentError.unanswered(error); try fail(failure.message, code: ExitCode(failure.code)) }
         guard response.ok else { try fail(response.error ?? "Control request failed.", code: ExitCode(response.exitCode)) }
         return try response.expect(type)
     }

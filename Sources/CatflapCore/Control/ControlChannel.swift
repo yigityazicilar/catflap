@@ -82,21 +82,32 @@ private enum LocalSocket {
     }
     /// More bytes than the server's budget for all connections together.
     struct OverBudget: Error {}
-    /// How long a frame may take to arrive: five seconds, and one more for each 64 KiB that
+    /// The other side took or gave nothing within the socket's wait, or a frame did not
+    /// arrive whole within its allowance.
+    struct TimedOut: Error {}
+    /// Sets how long one send or read on `fd` waits for the other side.
+    static func setWait(_ fd: Int32, _ wait: Duration) {
+        var timeout = timeval(tv_sec: time_t(wait.components.seconds), tv_usec: suseconds_t(wait.components.attoseconds / 1_000_000_000_000))
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+    }
+    /// How long a frame may take to arrive: `wait`, and one second more for each 64 KiB that
     /// has arrived. A large frame that keeps arriving on a busy machine is read whole, and one
-    /// that stops is still cut off: a read waits at most five seconds for the next bytes.
-    static func frameAllowance(received: Int) -> Duration {
-        .seconds(5) + .seconds(Double(received) / 65_536)
+    /// that stops is still cut off: a read waits only as long as the socket's wait for the
+    /// next bytes.
+    static func frameAllowance(received: Int, wait: Duration = .seconds(5)) -> Duration {
+        wait + .seconds(Double(received) / 65_536)
     }
     /// Reads one frame of fewer than `limit` bytes. `hold` is asked before each piece is kept,
     /// and may refuse it.
-    static func readFrame(_ fd: Int32, limit: Int = maxFrame, hold: (Int) -> Bool = { _ in true }) throws -> Data {
+    static func readFrame(_ fd: Int32, limit: Int = maxFrame, wait: Duration = .seconds(5), hold: (Int) -> Bool = { _ in true }) throws -> Data {
         var data = Data()
         var buffer = [UInt8](repeating: 0, count: 16_384)
         let started = ContinuousClock.now
-        while data.count < limit && started.duration(to: .now) < frameAllowance(received: data.count) {
+        while data.count < limit && started.duration(to: .now) < frameAllowance(received: data.count, wait: wait) {
             let count = buffer.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, 0) }
             if count < 0 && errno == EINTR { continue }
+            if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) { throw TimedOut() }
             guard count > 0 else { throw AgentError.control }
             guard hold(count) else { throw OverBudget() }
             if let newline = buffer[..<count].firstIndex(of: 10) {
@@ -106,6 +117,7 @@ private enum LocalSocket {
             }
             data.append(contentsOf: buffer[..<count])
         }
+        if data.count < limit { throw TimedOut() }
         throw AgentError.invalidRequest
     }
     /// Writes one frame. Without `waiting`, a send that would have to wait fails at once.
@@ -122,6 +134,7 @@ private enum LocalSocket {
                 let count = send(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset, pace)
                 #endif
                 if count < 0 && errno == EINTR { continue }
+                if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) { throw TimedOut() }
                 guard count > 0 else { throw AgentError.control }
                 offset += count
             }
@@ -142,14 +155,30 @@ private enum LocalSocket {
 }
 
 public enum ControlClient {
+    /// How long a client waits for the agent once its request has reached an agent that is
+    /// there and belongs to this user: for the agent to take each next piece of the request,
+    /// and for each next piece of its reply. The agent answers from memory or its store and
+    /// does slow work (pairing, sends, dials) after it has replied. The longest a command
+    /// waits on purpose is 5 s (`clip send --latest`, for a copy still being read; unpair
+    /// waits 4 s), and on one core shared with 64 busy loops a near-limit `clip get` took up
+    /// to 13.5 s to start its reply: both met the 5 s this wait used to be. 60 s leaves a busy
+    /// agent four times the slowest seen, and still ends a request to an agent that hangs.
+    static let replyWait: Duration = .seconds(60)
     @available(*, noasync, message: "Use requestAsync from asynchronous code.")
     public static func request(_ request: ControlRequest, socket url: URL) throws -> ControlResponse {
-        try ControlThread.wait { try perform(request, socket: url) }
+        try ControlThread.wait { try perform(request, socket: url, replyWait: replyWait) }
     }
     public static func requestAsync(_ request: ControlRequest, socket url: URL) async throws -> ControlResponse {
-        try await ControlThread.run { try perform(request, socket: url) }
+        try await requestAsync(request, socket: url, replyWait: replyWait)
     }
-    private static func perform(_ request: ControlRequest, socket url: URL) throws -> ControlResponse {
+    /// The same request with another reply wait, for tests.
+    static func requestAsync(_ request: ControlRequest, socket url: URL, replyWait wait: Duration) async throws -> ControlResponse {
+        try await ControlThread.run { try perform(request, socket: url, replyWait: wait) }
+    }
+    /// Throws `control` when the agent cannot be reached: no socket, one that is not this
+    /// user's, a refused connection, or one closed before any reply. Throws `noAnswer` when
+    /// the agent took part of the exchange and then nothing more came within `wait`.
+    private static func perform(_ request: ControlRequest, socket url: URL, replyWait wait: Duration) throws -> ControlResponse {
         var info = stat()
         guard lstat(url.path, &info) == 0, info.st_uid == getuid(),
               (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFSOCK), info.st_mode & 0o077 == 0 else { throw AgentError.control }
@@ -160,16 +189,22 @@ public enum ControlClient {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
         }
         guard connected == 0, LocalSocket.owner(fd) else { throw AgentError.control }
-        do { try LocalSocket.writeFrame(frame, fd) }
-        catch AgentError.control {
-            // The agent refuses some requests part way through (too large, busy) and closes
-            // the connection once it has answered, so the answer may be here although the
-            // send failed. Only without one is the agent unreachable.
-            guard let reply = try? LocalSocket.readFrame(fd),
-                  let response = try? ControlJSON.decoder.decode(ControlResponse.self, from: reply) else { throw AgentError.control }
-            return response
+        // The agent is there and is this user's: from here on, a slow answer is a busy agent.
+        LocalSocket.setWait(fd, wait)
+        do {
+            do { try LocalSocket.writeFrame(frame, fd) }
+            catch AgentError.control {
+                // The agent refuses some requests part way through (too large, busy) and closes
+                // the connection once it has answered, so the answer may be here although the
+                // send failed. Only without one is the agent unreachable.
+                guard let reply = try? LocalSocket.readFrame(fd, wait: wait),
+                      let response = try? ControlJSON.decoder.decode(ControlResponse.self, from: reply) else { throw AgentError.control }
+                return response
+            }
+            return try ControlJSON.decoder.decode(ControlResponse.self, from: LocalSocket.readFrame(fd, wait: wait))
+        } catch is LocalSocket.TimedOut {
+            throw AgentError.noAnswer
         }
-        return try ControlJSON.decoder.decode(ControlResponse.self, from: LocalSocket.readFrame(fd))
     }
 }
 
