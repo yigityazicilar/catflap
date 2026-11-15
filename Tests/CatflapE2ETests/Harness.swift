@@ -20,7 +20,13 @@ struct CommandResult {
     var command = ""
     func decode<T: Decodable>(_ type: T.Type) throws -> T {
         do { return try ControlJSON.decoder.decode(type, from: output) }
-        catch { throw CommandOutputError(command: command, code: code, output: output.count, error: error, standardError: self.error) }
+        catch {
+            // Only the `error` field of a JSON error reply: the rest can be a transfer record,
+            // which carries device ids.
+            let object = (try? JSONSerialization.jsonObject(with: output)) as? [String: Any]
+            let reply = object?["ok"] as? Bool == false ? object?["error"] as? String : nil
+            throw CommandOutputError(command: command, code: code, output: output.count, error: error, standardError: self.error, reply: reply)
+        }
     }
 }
 
@@ -32,9 +38,12 @@ struct CommandOutputError: Error, CustomStringConvertible {
     let output: Int
     let error: any Error
     let standardError: Data
+    /// The `error` field of a JSON error reply on standard output, if it was one.
+    var reply: String? = nil
     var description: String {
         let said = String(decoding: standardError.prefix(1200), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        return "`catflap \(command)` exited with status \(code) and printed \(output) bytes on standard output; "
+        return "`catflap \(command)` exited with status \(code) and printed \(output) bytes on standard output"
+            + (reply.map { " (error: \($0.prefix(400)))" } ?? "") + "; "
             + "standard error: \(said.isEmpty ? "(empty)" : said); decoding: \(error)"
     }
 }
@@ -181,6 +190,13 @@ final class AgentHarness {
         if waitForEnd(of: child, limit: 5) == .stillRunning { reportFault("agent \(pid) is still running 5 s after SIGKILL") }
     }
     func restart() throws { stop(); try start() }
+    /// Ends this harness's own agent with SIGKILL, as a crash would, and waits for it.
+    func killAgent() {
+        guard let child = process else { return }
+        process = nil
+        kill(child.processIdentifier, SIGKILL)
+        _ = waitForEnd(of: child, limit: 10)
+    }
     func command(_ arguments: [String], timeout: TimeInterval = 30) throws -> CommandResult {
         try runHarnessProcess(executable, arguments: arguments + ["--data-dir", dataDirectory.path, "--json"], timeout: timeout)
     }

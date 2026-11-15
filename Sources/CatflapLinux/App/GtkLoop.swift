@@ -23,9 +23,9 @@ final class GtkLoop: @unchecked Sendable {
     }
 
     private func run(_ ready: CheckedContinuation<Bool, Never>) {
-        // Only the session's own display server: under Wayland an X11 fallback (XWayland) would
-        // bypass layer-shell, and X11 is used only in a session without Wayland.
-        gdk_set_allowed_backends(DesktopSession.current.gdkBackends)
+        // Only Wayland: an X11 fallback would bypass layer-shell and could reach a display the
+        // agent was not given.
+        gdk_set_allowed_backends("wayland")
         // The names screen readers and the compositor show for the agent's windows.
         g_set_prgname("catflap")
         g_set_application_name("Catflap")

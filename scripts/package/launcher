@@ -1,6 +1,0 @@
-#!/bin/sh
-# The source CLI calls this command "version"; accept the standard package alias.
-if [ "$#" -eq 1 ] && [ "$1" = --version ]; then
-    set -- version
-fi
-exec /usr/lib/catflap/catflap "$@"

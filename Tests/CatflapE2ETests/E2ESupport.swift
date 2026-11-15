@@ -79,6 +79,43 @@ final class AgentDouble: @unchecked Sendable {
     func stop() async { server.stop(); await task.value }
 }
 
+/// A value several tasks and threads share.
+final class SharedValue<T: Sendable>: Sendable {
+    private let value: Mutex<T>
+    init(_ initial: T) { value = Mutex(initial) }
+    func get() -> T { value.withLock { $0 } }
+    func update(_ change: @Sendable (inout T) -> Void) { value.withLock { change(&$0) } }
+}
+
+/// A stand-in agent that keeps every request it is sent and answers each with what `answer`
+/// gives for it.
+final class RecordingAgentDouble: @unchecked Sendable {
+    let harness: AgentHarness
+    private let server: ControlServer
+    private let task: Task<Void, Never>
+    private let log = SharedValue<[ControlRequest]>([])
+    init(answer: @escaping @Sendable (ControlRequest) -> ControlResponse) throws {
+        harness = try AgentHarness()
+        let paths = try AgentPaths(directory: harness.dataDirectory)
+        let server = try ControlServer(paths: paths, lock: AgentLock(paths: paths))
+        self.server = server
+        let log = self.log
+        task = Task { [server] in
+            await server.run { request in
+                log.update { $0.append(request) }
+                return answer(request)
+            }
+        }
+    }
+    var requests: [ControlRequest] { log.get() }
+    func stop() async { server.stop(); await task.value }
+}
+
+/// A successful reply carrying `value`.
+func answering<T: Encodable>(_ value: T) -> ControlResponse {
+    (try? ControlResponse(value: value)) ?? ControlResponse(error: .storage)
+}
+
 /// What a `--json` command printed: exactly one JSON object, or nil.
 func jsonObject(_ output: Data) -> [String: Any]? {
     let trimmed = String(decoding: output, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)

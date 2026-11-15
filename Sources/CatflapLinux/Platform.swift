@@ -13,7 +13,7 @@ import Foundation
 /// report it with `runtime.updatePlatformStatus(_:)` and carry on. Throw only for a fault that
 /// should stop the agent. `stop()` ends every thread and connection `start(on:)` opened.
 public actor Platform {
-    private var clipboard: (any ClipboardWatcher)?
+    private var clipboard: DataControlWatcher?
     private var panel: Task<PanelController?, Never>?
 
     public static func start(on runtime: AgentRuntime) async throws -> Platform {
@@ -28,7 +28,7 @@ public actor Platform {
             await runtime.updatePlatformStatus { $0.clipboardCapture = "failed" }
             return
         }
-        let watcher = DesktopBackends.clipboardWatcher(history: history, runtime: runtime)
+        let watcher = DataControlWatcher(history: history, runtime: runtime)
         clipboard = watcher
         await watcher.start()
     }

@@ -88,59 +88,6 @@ private func paddedRequest(_ size: Int) throws -> Data {
     try ControlJSON.encoder.encode(ControlRequest("status", arguments: ["pad": String(repeating: "p", count: size)]))
 }
 
-/// This process's descriptors that refer to the folder's lock file, by device and inode.
-private func lockDescriptors(_ paths: AgentPaths) -> [Int32] {
-    var target = stat()
-    guard stat(paths.lock.path, &target) == 0 else { return [] }
-    #if os(Linux)
-    let candidates = ((try? FileManager.default.contentsOfDirectory(atPath: "/proc/self/fd")) ?? []).compactMap { Int32($0) }
-    #else
-    let candidates = Array(0..<Int32(min(getdtablesize(), 1 << 16)))
-    #endif
-    return candidates.sorted().filter { fd in
-        var info = stat()
-        return fcntl(fd, F_GETFD) != -1 && fstat(fd, &info) == 0 && info.st_dev == target.st_dev && info.st_ino == target.st_ino
-    }
-}
-
-/// A child process that holds a copy of one descriptor, as every process spawned from this
-/// one holds all of them from its fork until its exec closes those marked close-on-exec. It
-/// waits on its standard input and ends when that is closed.
-private final class DescriptorCopyHolder {
-    private let pid: pid_t
-    private var input: Int32
-    init(holding descriptor: Int32) throws {
-        var ends: [Int32] = [-1, -1]
-        guard pipe(&ends) == 0 else { throw AgentError.storage }
-        for end in ends { _ = fcntl(end, F_SETFD, FD_CLOEXEC) }
-        #if os(Linux)
-        var actions = posix_spawn_file_actions_t()
-        #else
-        var actions: posix_spawn_file_actions_t?
-        #endif
-        posix_spawn_file_actions_init(&actions)
-        defer { posix_spawn_file_actions_destroy(&actions) }
-        posix_spawn_file_actions_adddup2(&actions, ends[0], 0)
-        posix_spawn_file_actions_adddup2(&actions, descriptor, descriptor == 64 ? 65 : 64)
-        let arguments: [UnsafeMutablePointer<CChar>?] = [strdup("/bin/cat"), nil]
-        defer { arguments.forEach { free($0) } }
-        var environment: [UnsafeMutablePointer<CChar>?] = [nil]
-        var child: pid_t = 0
-        let result = posix_spawn(&child, "/bin/cat", &actions, nil, arguments, &environment)
-        close(ends[0])
-        guard result == 0 else { close(ends[1]); throw AgentError.storage }
-        pid = child; input = ends[1]
-    }
-    /// Closes the child's input and reaps it; `cat` ends at once on end of input.
-    func end() {
-        guard input >= 0 else { return }
-        close(input); input = -1
-        var status: Int32 = 0
-        while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
-    }
-    deinit { end() }
-}
-
 @Suite(.serialized, .timeLimit(.minutes(5))) struct ControlListenerTests {
     private func serve(_ server: ControlServer) -> Task<Void, Never> {
         Task { await server.run { _ in (try? ControlResponse(value: "answered")) ?? ControlResponse(error: .storage) } }
@@ -294,53 +241,23 @@ private final class DescriptorCopyHolder {
         server.stop(); await task.value
     }
 
-    /// Once `run` has returned after `stop()`, the socket is gone and the server has let go of
-    /// the folder's lock, although the server object itself still lives, as it may while a
-    /// thread of its own is ending: a new agent can start in that folder at once. Many rounds,
-    /// each after served requests, each in a new folder with a new server and a new lock. The
-    /// lock is checked through a weak reference, not by locking the folder again: other suites
-    /// in this process spawn processes, and each holds the lock until its exec (see `AgentLock`).
+    /// Once `run` has returned after `stop()`, the socket is gone and the folder's lock is
+    /// free, although the server object itself still lives, as it may while a thread of its
+    /// own is ending: a new agent can start in that folder at once. Many rounds, each after
+    /// served requests, each with a new server and a new lock.
     @Test func testStoppedServerFreesItsFolderWhenRunReturns() async throws {
-        for round in 1...20 {
-            let paths = try storeTestPaths()
-            defer { removeStoreTestPaths(paths) }
-            var lock: AgentLock? = try AgentLock(paths: paths)
-            weak var given = lock
-            let server = try ControlServer(paths: paths, lock: lock!)
-            lock = nil
-            let task = serve(server)
-            for _ in 1...3 { #expect(try await ControlClient.requestAsync(.init("status"), socket: paths.socket).ok) }
-            #expect(given != nil, "round \(round): the server did not keep the lock while it ran")
-            server.stop(); await task.value
-            #expect(!FileManager.default.fileExists(atPath: paths.socket.path), "round \(round): the socket is still there")
-            #expect(given == nil, "round \(round): the server still held the folder's lock; descriptors of this process on the lock file: \(lockDescriptors(paths))")
-            withExtendedLifetime(server) {}
-            if given != nil { break }
-        }
-    }
-
-    /// A known limit, kept as the lock's documentation says: a process that holds a copy of the
-    /// lock's descriptor holds the flock lock too, as every process spawned from this one does
-    /// from its fork until its exec. So the folder is still refused after `run` has returned
-    /// while such a child lives, although this process no longer has the file open.
-    @Test func testChildHoldingACopyOfTheLockDescriptorKeepsTheFolderLocked() async throws {
         let paths = try storeTestPaths()
         defer { removeStoreTestPaths(paths) }
-        let server = try ControlServer(paths: paths, lock: AgentLock(paths: paths))
-        let task = serve(server)
-        #expect(try await ControlClient.requestAsync(.init("status"), socket: paths.socket).ok)
-        let held = lockDescriptors(paths)
-        try #require(held.count == 1, "descriptors of this process on the lock file: \(held)")
-        let child = try DescriptorCopyHolder(holding: held[0])
-        server.stop(); await task.value
-        #expect(lockDescriptors(paths).isEmpty, "this process still holds the lock file open")
-        var failure = "none"
-        do { withExtendedLifetime(try AgentLock(paths: paths)) {} } catch {
-            let code = errno
-            failure = "\(error) (errno \(code): \(String(cString: strerror(code))))"
+        for round in 1...20 {
+            let server = try ControlServer(paths: paths, lock: AgentLock(paths: paths))
+            let task = serve(server)
+            for _ in 1...3 { #expect(try await ControlClient.requestAsync(.init("status"), socket: paths.socket).ok) }
+            server.stop(); await task.value
+            #expect(!FileManager.default.fileExists(atPath: paths.socket.path), "round \(round): the socket is still there")
+            let next = try? AgentLock(paths: paths)
+            #expect(next != nil, "round \(round): the folder was still locked")
+            withExtendedLifetime(server) {}
+            if next == nil { break }
         }
-        #expect(failure.hasPrefix("alreadyRunning"), "while the child lived, a new lock got: \(failure)")
-        child.end()
-        withExtendedLifetime(server) {}
     }
 }

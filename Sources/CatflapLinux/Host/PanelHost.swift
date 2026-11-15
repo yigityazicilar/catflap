@@ -4,7 +4,6 @@
 ///
 /// Every method is called on the GTK thread.
 protocol PanelHost: AnyObject {
-    var closesOnKeyboardLoss: Bool { get }
     /// What `catflap status` reports as `desktop`.
     var desktop: String { get }
     /// Whether the compositor can blur behind the panel, so a translucent background is readable.
@@ -25,10 +24,6 @@ protocol PanelHost: AnyObject {
     var triggerDisplays: [String] { get }
     /// How the window is placed, for `ui invoke describe`.
     func placement(of window: OpaquePointer) -> PanelPlacement
-}
-
-extension PanelHost {
-    var closesOnKeyboardLoss: Bool { true }
 }
 
 public struct PanelPlacement: Sendable, Codable, Equatable {

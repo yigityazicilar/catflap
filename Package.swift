@@ -31,11 +31,7 @@ targets += [
     .systemLibrary(name: "CWayland", path: "Sources/CGtk/Wayland", pkgConfig: "wayland-client", providers: [.apt(["libwayland-dev"])]),
     .target(name: "CDataControl", dependencies: ["CWayland"], path: "Sources/CDataControl"),
     .target(name: "CGtkShim", dependencies: ["CGtk", "CAdwaita", "CGtkLayerShell", "CWayland"], path: "Sources/CGtkShim"),
-    // Xlib and XFixes for the X11 desktops. gtk4-x11 is GTK's own X11 module: it requires x11
-    // and adds GDK's X11 header; the modulemap links Xfixes.
-    .systemLibrary(name: "CX11", path: "Sources/CX11", pkgConfig: "gtk4-x11",
-                   providers: [.apt(["libx11-dev", "libxfixes-dev", "libgtk-4-dev"])]),
-    .target(name: "CatflapLinux", dependencies: ["CatflapCore", "CGtk", "CAdwaita", "CGtkLayerShell", "CWayland", "CDataControl", "CGtkShim", "CX11"]),
+    .target(name: "CatflapLinux", dependencies: ["CatflapCore", "CGtk", "CAdwaita", "CGtkLayerShell", "CWayland", "CDataControl", "CGtkShim"]),
     .testTarget(name: "CatflapLinuxTests", dependencies: ["CatflapLinux", "CatflapCore", "catflap"]),
 ]
 executableDependencies.append("CatflapLinux")

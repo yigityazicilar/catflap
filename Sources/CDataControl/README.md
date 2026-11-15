@@ -1,17 +1,11 @@
 # Data-control client
 
-The bundled `ext-data-control-v1.xml`, `wlr-data-control-unstable-v1.xml` and
-`wlr-foreign-toplevel-management-unstable-v1.xml` are the protocol sources of truth;
-their copyright and permission notices are retained.
-Regenerate the checked-in C bindings from this directory:
+The bundled `ext-data-control-v1.xml` is the protocol source of truth; its copyright and
+permission notice are retained. Regenerate the checked-in C bindings from this directory:
 
 ```
 wayland-scanner client-header ext-data-control-v1.xml ext-data-control-v1-client-protocol.h
 wayland-scanner private-code ext-data-control-v1.xml ext-data-control-v1-protocol.c
-wayland-scanner client-header wlr-data-control-unstable-v1.xml wlr-data-control-unstable-v1-client-protocol.h
-wayland-scanner private-code wlr-data-control-unstable-v1.xml wlr-data-control-unstable-v1-protocol.c
-wayland-scanner client-header wlr-foreign-toplevel-management-unstable-v1.xml wlr-foreign-toplevel-management-unstable-v1-client-protocol.h
-wayland-scanner private-code wlr-foreign-toplevel-management-unstable-v1.xml wlr-foreign-toplevel-management-unstable-v1-protocol.c
 ```
 
 The wrapper has one serial owner, except `cf_dc_cancel`, which only sets an atomic flag and

@@ -76,12 +76,6 @@ public struct AgentPaths: Sendable {
     }
 }
 
-/// The folder's lock: an flock lock on `agent.lock`, which belongs to the open file, not to
-/// this process. Every process holding a copy of the descriptor holds the lock too, and a
-/// child spawned while the lock is held has a copy from its fork until its exec closes it. So
-/// when the lock is let go of while such a child is starting, a start at that exact moment is
-/// refused once as already running. A POSIX record lock would avoid that, but it is dropped
-/// whenever this process closes any descriptor of the file, as the disk audit does.
 public final class AgentLock: @unchecked Sendable {
     private let fd: Int32
     public init(paths: AgentPaths) throws {
