@@ -13,6 +13,9 @@ final class ClipboardWriter: @unchecked Sendable {
         guard let display = gdk_display_get_default() else { return nil }
         return gdk_display_get_clipboard(display)
     }
+    /// Counts what this writer put on the clipboard. A whole item fetched after a later Copy
+    /// started must not replace that later one.
+    private var generation = 0
 
     func set(text: String, secret: Bool = false) {
         var providers = [Self.provider(Data(text.utf8), "text/plain;charset=utf-8"), Self.provider(Data(text.utf8), "text/plain")]
@@ -27,8 +30,25 @@ final class ClipboardWriter: @unchecked Sendable {
         set([Self.provider(list, "text/uri-list"), Self.provider(paths, "text/plain;charset=utf-8")])
     }
 
-    /// A clipboard history item as it was copied.
+    /// A clipboard history item as it was copied. The panel's list holds previews, without an
+    /// image's bytes and with only the start of a long text; such an item is fetched whole
+    /// with `clip.get` first, and written when it arrives unless another Copy came after it.
     func set(_ item: ClipboardItem) {
+        generation &+= 1
+        guard item.truncated else { write(item); return }
+        guard let runtime = AgentRuntime.process else { return }
+        let ticket = generation, id = item.id
+        Task { [weak self] in
+            let response = await runtime.handle(ControlRequest("clip.get", arguments: ["id": id]))
+            guard response.ok, let whole = try? response.decode(ClipboardItem.self), !whole.truncated else { return }
+            GLib.idle { [weak self] in
+                guard let self, self.generation == ticket else { return }
+                self.write(whole)
+            }
+        }
+    }
+
+    private func write(_ item: ClipboardItem) {
         switch item.kind {
         case .text: set(text: item.text ?? "")
         case .url:
@@ -49,6 +69,7 @@ final class ClipboardWriter: @unchecked Sendable {
     }
 
     private func set(_ providers: [UnsafeMutablePointer<GdkContentProvider>]) {
+        generation &+= 1
         guard let clipboard else { return }
         var list: [UnsafeMutablePointer<GdkContentProvider>?] = providers
         let union = list.withUnsafeMutableBufferPointer { buffer in

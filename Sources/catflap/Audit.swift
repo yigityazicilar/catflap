@@ -19,11 +19,11 @@ struct Audit: AsyncParsableCommand, AgentFeature {
             } catch is ExitCode { throw ExitCode.failure }
             catch { try fail("Cannot read audit input file.", code: 1) }
         }
-        var progress = try await request(.init("audit", arguments: arguments)).decode(AuditProgress.self)
+        var progress = try await request(.init("audit", arguments: arguments)).expect(AuditProgress.self)
         let deadline = ContinuousClock.now + .seconds(3600)
         while progress.status == "running", ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(200))
-            progress = try await request(.init("audit.status", arguments: ["id": progress.id])).decode(AuditProgress.self)
+            progress = try await request(.init("audit.status", arguments: ["id": progress.id])).expect(AuditProgress.self)
         }
         guard let findings = progress.findings else { try fail(progress.error ?? "Audit did not finish within an hour.", code: 1) }
         print(try ControlJSON.text(findings))

@@ -132,10 +132,15 @@ private final class ClipboardSession {
         try ControlJSON.decoder.decode([ClipboardItem].self, from: command(["clip", "list"]))
     }
 
+    /// One item whole: `clip list` has previews, without image bodies or long texts' ends.
+    func item(_ id: String) throws -> ClipboardItem {
+        try ControlJSON.decoder.decode(ClipboardItem.self, from: command(["clip", "get", id]))
+    }
+
     func waitForText(_ text: String, seconds: TimeInterval = 2) throws -> Bool {
         let end = Date().addingTimeInterval(seconds)
         repeat {
-            if try items().contains(where: { $0.text == text }) { return true }
+            if try items().contains(where: { listed in try (listed.truncated ? item(listed.id) : listed).text == text }) { return true }
             Thread.sleep(forTimeInterval: 0.02)
         } while Date() < end
         return false
@@ -456,7 +461,10 @@ final class LinuxClipboardE2E: XCTestCase {
         let end = Date().addingTimeInterval(5)
         var captured = false
         repeat {
-            captured = try session.items().contains { $0.kind == .image && $0.mime == "image/png" && $0.content == png }
+            captured = try session.items().contains { listed in
+                guard listed.kind == .image, listed.mime == "image/png" else { return false }
+                return try session.item(listed.id).content == png
+            }
             if captured { break }
             Thread.sleep(forTimeInterval: 0.02)
         } while Date() < end

@@ -16,12 +16,18 @@ public struct TransferInbox: Sendable {
     private static func prepare(_ directory: URL) throws {
         _ = try AgentPaths(directory: directory)
     }
+    /// Where received files go when the person has not chosen a folder.
+    public static var defaultDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads/Catflap")
+    }
+    /// The most UTF-8 bytes a cleaned name, and so every numbered alternative, may have.
+    public static let nameLimit = 180
     public static func clean(_ name: String) -> String {
         let last = name.replacingOccurrences(of: "\\", with: "/").split(separator: "/").last.map(String.init) ?? "item"
         var result = String(last.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) && $0 != ":" })
         while result.hasPrefix(".") { result.removeFirst() }
         if result.isEmpty { result = "item" }
-        while result.utf8.count > 180 { result.removeLast() }
+        while result.utf8.count > nameLimit { result.removeLast() }
         return result
     }
     public func url(_ name: String) throws -> URL {
@@ -37,9 +43,22 @@ public struct TransferInbox: Sendable {
         var candidate = clean
         var number = 1
         while excluding.contains(candidate) || exists(candidate) || FileManager.default.fileExists(atPath: directory.appendingPathComponent(candidate + ".part").path) {
-            candidate = stem + " (\(number))" + (ext.isEmpty ? "" : "." + ext); number += 1
+            candidate = Self.numbered(stem: stem, ext: ext, number: number); number += 1
         }
         return candidate
+    }
+    /// `stem (n).ext` within `nameLimit` bytes. The suffix's bytes are reserved by shortening
+    /// the stem, down to one character, and then the extension, a whole character at a time,
+    /// so no character is ever split.
+    private static func numbered(stem: String, ext: String, number: Int) -> String {
+        let suffix = " (\(number))"
+        var stem = stem, ext = ext
+        while stem.utf8.count + suffix.utf8.count + (ext.isEmpty ? 0 : ext.utf8.count + 1) > nameLimit {
+            if stem.count > 1 { stem.removeLast() }
+            else if !ext.isEmpty { ext.removeLast() }
+            else { break }
+        }
+        return stem + suffix + (ext.isEmpty ? "" : "." + ext)
     }
     public func exists(_ name: String) -> Bool {
         guard let url = try? url(name) else { return false }
