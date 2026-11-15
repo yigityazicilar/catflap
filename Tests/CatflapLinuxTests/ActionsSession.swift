@@ -513,6 +513,7 @@ struct ActionsDescription: Decodable {
     let openedFrom: String
     let placement: Placement
     let field: String
+    let rows: [String]
     let sendLabel: String
     let page: String
     let attachments: [String]
@@ -543,7 +544,7 @@ struct ActionsDescription: Decodable {
         }
     }
     enum CodingKeys: String, CodingKey {
-        case visible, mode, shortcut, placement, field, page, attachments, message, pairing, settings, tray, controls
+        case visible, mode, shortcut, placement, field, rows, page, attachments, message, pairing, settings, tray, controls
         case hasFocus = "has_focus", sendClipboardShortcut = "send_clipboard_shortcut", openedFrom = "opened_from"
         case sendLabel = "send_label", messageActions = "message_actions"
     }

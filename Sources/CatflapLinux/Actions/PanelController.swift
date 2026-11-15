@@ -89,6 +89,8 @@ final class PanelController: @unchecked Sendable {
     private(set) var focusLostToSystemDialog = false
     private var timers: [PanelMachine.Timer: UInt32] = [:]
     private var waiters: [(id: Int, mode: PanelMode, resume: () -> Void)] = []
+    /// `panel.show` calls waiting for the panel they opened to get the keyboard.
+    private var keyboardWaiters: [(id: Int, resume: () -> Void)] = []
     private var nextWaiter = 0
     private var wasActive = false
     private var refreshPending: UInt32 = 0
@@ -146,6 +148,8 @@ final class PanelController: @unchecked Sendable {
             if refreshPending != 0 { GLib.cancel(refreshPending); refreshPending = 0 }
             for waiter in waiters { waiter.resume() }
             waiters = []
+            for waiter in keyboardWaiters { waiter.resume() }
+            keyboardWaiters = []
             shortcut.stop()
             sendShortcut.stop()
             host.stopTriggers()
@@ -223,7 +227,12 @@ final class PanelController: @unchecked Sendable {
             guard let self else { return }
             let active = gtk_window_is_active(window.cast()) != 0
             defer { wasActive = active; publish() }
-            if active { focusLostToSystemDialog = false }
+            if active {
+                focusLostToSystemDialog = false
+                let ready = keyboardWaiters
+                keyboardWaiters = []
+                for waiter in ready { waiter.resume() }
+            }
             guard wasActive && !active && !dialogOpen && machine.mode == .focused else { return }
             // On Wayland a click outside shows up as the panel losing keyboard focus. While a
             // shortcut request is open, the system may show its question about it at any moment
@@ -475,6 +484,7 @@ final class PanelController: @unchecked Sendable {
             })
         }
         await runtime.register("ui.invoke") { [self] request in await invoke(request) }
+        await runtime.register("panel.show") { [self] _ in await showPanel() }
     }
 
     private func invoke(_ request: ControlRequest) async -> ControlResponse {
@@ -503,6 +513,31 @@ final class PanelController: @unchecked Sendable {
         default:
             return await PanelActionArguments.invoke(action, request.arguments, on: self)
         }
+    }
+
+    /// `panel.show`: opens the panel focused if it is hidden or shown without the keyboard
+    /// (hover, drag). A focused panel stays as it is, also one waiting for the system's
+    /// shortcut question, and the panel is never hidden. Answers with the UI state once the
+    /// panel it opened has the keyboard, or after two seconds with whatever state it is in.
+    private func showPanel() async -> ControlResponse {
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            GLib.idle { [self] in
+                let before = machine.mode
+                ensureFocused()
+                guard before != .focused, machine.mode == .focused, !stopped,
+                      gtk_window_is_active(view.window.cast()) == 0 else { return done.resume() }
+                nextWaiter += 1
+                let id = nextWaiter
+                var resumed = false
+                let finish = { if !resumed { resumed = true; done.resume() } }
+                keyboardWaiters.append((id, finish))
+                _ = GLib.timeout(milliseconds: 2000) { [weak self] in
+                    self?.keyboardWaiters.removeAll { $0.id == id }
+                    finish()
+                }
+            }
+        }
+        return (try? ControlResponse(value: await loop.perform { self.state() })) ?? ControlResponse(error: .storage)
     }
 
     /// Runs `body` on the GTK thread, then answers with the UI state. With `mode`, answers once
@@ -550,8 +585,22 @@ final class PanelController: @unchecked Sendable {
 }
 
 extension PanelController: PanelActions {
+    /// Return or the send button, to the device the panel shows. Nothing goes until the agent's
+    /// own list says that device is still paired; when the list cannot be read, nothing is
+    /// sent and the panel says so, as for a `ui invoke` send.
     func send(_ payload: PanelPayload, to device: PanelDevice, keep: Bool) {
-        sender.send(payload, to: device, keep: keep)
+        let runtime = runtime, loop = loop
+        track(Task { [weak self] in
+            let outcome = await PanelActionArguments.target(device.id, runtime: runtime, selected: device,
+                                                             missing: "No paired device has that id.")
+            await loop.perform { [weak self] in
+                guard let self, !stopped else { return }
+                switch outcome {
+                case .success(let paired): sender.send(payload, to: paired, keep: keep)
+                case .failure(let refusal): extras.setMessage(refusal.message)
+                }
+            }
+        })
     }
 
     func attach() { extras.pickFiles() }

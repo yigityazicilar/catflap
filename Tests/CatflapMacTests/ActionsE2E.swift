@@ -426,8 +426,9 @@ private struct PasteboardSnapshot {
 extension MacPanelE2E {
 @Suite(.serialized)
 struct MacActionsE2E {
-    /// A panel agent and a peer, each with its inbox inside its own data directory.
-    private func withAgents(peer: Bool = true, _ body: (ActionsAgent, ActionsAgent?) async throws -> Void) async throws {
+    /// A panel agent and a peer, each with its inbox inside its own data directory. With
+    /// `hooks`, the panel agent answers the test hooks (CATFLAP_TEST_HOOKS=on).
+    private func withAgents(peer: Bool = true, hooks: Bool = false, _ body: (ActionsAgent, ActionsAgent?) async throws -> Void) async throws {
         let panel = try ActionsAgent(platform: true)
         let other = peer ? try ActionsAgent(platform: false) : nil
         var failure: (any Error)?
@@ -436,7 +437,7 @@ struct MacActionsE2E {
                 let store = try Store(paths: AgentPaths(directory: agent.directory))
                 try await store.setSetting("inbox", value: agent.inbox.path)
             }
-            try await actionsOffPool { try panel.start(); try other?.start() }
+            try await actionsOffPool { try panel.start(environment: hooks ? ["CATFLAP_TEST_HOOKS": "on"] : [:]); try other?.start() }
             try await body(panel, other)
         } catch { failure = error }
         let problems = (try? await actionsOffPool { panel.close() + (other?.close() ?? []) }) ?? ["could not stop the agents"]
@@ -502,7 +503,14 @@ struct MacActionsE2E {
         let listed = try await actionsOffPool { (try panel.devices().count, try peer.devices().count) }
         #expect(listed.0 == 1 && listed.1 == 1, "each device lists the other")
         _ = try await actionsOffPool { try panel.invoke("pair-close") }
-        print("MacActionsE2E pairing: digits shown on both and equal=\(same) paired=\(ended.0)")
+        // The panel's own lists, not only the agent, have the peer: the panel was closed while
+        // pairing, so only the reload when pairing completes puts it there before the panel
+        // opens. Sends from the panel's controls need it as their target.
+        let known = try await actionsOffPool {
+            try panel.waitFor("the closed panel to list the peer") { try panel.field("devices") == "1" ? true : nil }
+        }
+        #expect(known, "the closed panel lists the device just paired")
+        print("MacActionsE2E pairing: digits shown on both and equal=\(same) paired=\(ended.0) panel_lists_peer=\(known)")
     }
 
     /// Waits until `agent` has a history row matching `match` with status ok.
@@ -1105,10 +1113,17 @@ struct MacActionsE2E {
             let idle = try await actionsOffPool { try panel.field("glyph") }
             #expect(idle == "cf-idle")
 
-            // The send button with a file attached.
+            // The send button with a file attached, pressed once it names the peer.
             let file = panel.directory.appendingPathComponent("large-\(UUID().uuidString.prefix(6)).bin")
             try Data(count: 32 << 20).write(to: file)
-            _ = try await actionsOffPool { try panel.reply("attach", ["files": file.path]) }
+            let attached = try await actionsOffPool { try panel.reply("attach", ["files": file.path]) }
+            let named = try await actionsOffPool {
+                try panel.waitFor("the send button to name the peer") { () -> Bool? in
+                    try panel.field("send_label")?.hasSuffix(" to \(peerName)") == true ? true : nil
+                }
+            }
+            #expect(named, "Send names the peer before it is pressed")
+            print("MacActionsE2E glyph: send label named the peer at attach=\(attached.state.ui.sendLabel.hasSuffix(" to \(peerName)"))")
             let pressed = try await actionsOffPool { try panel.press("send") }
             #expect(pressed.ok, "press send: \(pressed.error ?? "")")
             #expect(stateField(pressed.payload, "glyph") == "cf-moving", "the glyph while the file goes")
@@ -1158,8 +1173,14 @@ struct MacActionsE2E {
             #expect(try await actionsOffPool { try panel.field("glyph") } == "cf-idle", "the panel opened")
 
             // Retry on the failed row, with the panel open: the line says how it went, and there
-            // is no notification beside it.
+            // is no notification beside it. The panel opened a moment ago, and its lists come
+            // from its own refresh: Retry is pressed once the panel lists every history row.
             let notified = afterFailure.actions.notifications.count
+            let historyCount = try await actionsOffPool { try panel.history().count }
+            let listed = try await actionsOffPool {
+                try panel.waitFor("the open panel to list the failed row") { try panel.field("history_rows") == "\(historyCount)" ? true : nil }
+            }
+            #expect(listed, "the open panel lists the failed row")
             _ = try await actionsOffPool { try panel.reply("select", ["id": failedRow]) }
             let retried = try await actionsOffPool { try panel.press("retry", row: failedRow) }
             #expect(retried.ok, "press retry: \(retried.error ?? "")")
@@ -1345,6 +1366,58 @@ struct MacActionsE2E {
         if let failure { throw failure }
     }
 
+    /// Recording a shortcut in settings unregisters Catflap's shortcuts, so the keys reach the
+    /// recorder; when recording ends they register again, and one whose combination was taken
+    /// meanwhile is a conflict, as at the start and on a rebind. Here a test hook takes the
+    /// panel's combination during recording with a second registration inside the agent's
+    /// process, which RegisterEventHotKey refuses while another holds the combination
+    /// (eventHotKeyExistsErr). A combination macOS keeps would mean changing this Mac's own
+    /// shortcuts, so the in-process registration stands in for another holder. Recording then
+    /// stops without a new combination: the panel's shortcut is refused, `ui state` and settings
+    /// say conflict, never bound, and the agent keeps running.
+    @Test func testAShortcutTakenWhileRecordingIsAConflictWhenRecordingEnds() async throws {
+        let agent = try ActionsAgent(platform: true)
+        var failure: (any Error)?
+        do {
+            try await actionsOffPool {
+                for key in [Self.panelKey, Self.sendKey] { try agent.writePreference(key, nil) }
+                try agent.start(environment: ["CATFLAP_TEST_HOOKS": "on"])
+            }
+            let first = try await actionsOffPool { try agent.request("ui.state").payload }
+            #expect(stateField(first, "shortcut") == "bound", "the panel's shortcut is registered at the start")
+            let early = try await actionsOffPool { try agent.invoke("test-hold-shortcut", ["which": "panel"]) }
+            #expect(!early.ok, "a second registration of the registered combination is refused")
+
+            let recording = try await actionsOffPool { try agent.reply("test-press-recorder", ["which": "panel"]) }
+            #expect(recording.message == "recording" && recording.state.actions.settingsOpen, "the recorder in settings listens")
+            let held = try await actionsOffPool { try agent.invoke("test-hold-shortcut", ["which": "panel"]) }
+            #expect(held.ok, "recording unregistered the panel's shortcut, so another registration takes it: \(held.error ?? "")")
+            let stopped = try await actionsOffPool { try agent.reply("test-press-recorder", ["which": "panel"]) }
+            #expect(stopped.message == "not recording", "the second click stops recording")
+
+            let after = try await actionsOffPool { try agent.request("ui.state").payload }
+            print("MacActionsE2E recorder resume: held=\(held.ok) panel=\(stateField(after, "shortcut") ?? "none") settings=\(settingsField(after, "panel_shortcut_state") ?? "none") send=\(stateField(after, "send_shortcut") ?? "none")")
+            #expect(stateField(after, "shortcut") == "conflict", "the shortcut refused when recording ends is a conflict, not bound")
+            #expect(stateField(after, "shortcut_keys") == Self.panelDefault.description, "it keeps its combination")
+            #expect(settingsField(after, "panel_shortcut_state") == "conflict", "settings show the conflict")
+            #expect(stateField(after, "send_shortcut") == "bound" && settingsField(after, "send_shortcut_state") == "bound",
+                    "the other shortcut registered again")
+
+            // The agent goes on: it answers, and a setting changes.
+            let status = try await actionsOffPool { try agent.request("status") }
+            #expect(status.ok, "the agent still answers beside the conflict")
+            let changed = try await actionsOffPool { try agent.reply("set", ["key": "hover_band", "value": "off"]) }
+            #expect(!changed.state.actions.settings.hoverBand, "a settings change beside the conflict")
+            _ = try await actionsOffPool { try agent.invoke("test-release-shortcut") }
+            _ = try await actionsOffPool { try agent.invoke("settings-close") }
+        } catch { failure = error }
+        let problems = try await actionsOffPool { agent.close() }
+        for problem in problems { Issue.record(Comment(rawValue: problem)) }
+        print("MacActionsE2E recorder resume: agent_exit=\(agent.exitStatus.map { "\($0)" } ?? "none")")
+        #expect(agent.exitStatus == 0, "the agent kept running and stops cleanly on SIGTERM")
+        if let failure { throw failure }
+    }
+
     // MARK: Don't keep, copied
 
     /// Waits until the general pasteboard holds `text`; the deadline only guards against a hang.
@@ -1433,6 +1506,53 @@ struct MacActionsE2E {
                     try panel.waitFor("the kept text in clipboard history") { try panel.clipTexts().contains(keptText) ? true : nil }
                 }
                 #expect(recorded, "clipboard history records a kept text")
+            }
+        } catch { failure = error }
+        await MainActor.run { saved.restore() }
+        if let failure { throw failure }
+    }
+
+    /// Presses Copy on the arrival notification of `row` (`device/id`) once it is posted. The
+    /// hook enters the function Notification Center's delegate calls, with the userInfo the
+    /// agent posted that notification with; a press before it was posted is refused.
+    private func pressNotificationCopy(_ row: String, on panel: ActionsAgent, _ step: String) async throws {
+        let pressed = try await actionsOffPool {
+            try panel.waitFor("\(step): the arrival notification to press") { () -> Bool? in
+                try panel.invoke("notification-press", ["id": row, "button": "copy"]).ok ? true : nil
+            }
+        }
+        #expect(pressed, "\(step): Copy pressed on the arrival notification")
+    }
+
+    /// The Copy button of an arrival notification: a text that was not kept (Don't keep on
+    /// the sender) goes on the clipboard marked concealed, and clipboard history never reads or
+    /// records it; a kept text is an ordinary copy, which history records.
+    @Test func testNotificationCopyOfATextNotKeptIsConcealedAndNeverRecorded() async throws {
+        let saved = try await MainActor.run { try PasteboardSnapshot() }
+        var failure: (any Error)?
+        do {
+            try await withAgents(hooks: true) { panel, peer in
+                let peer = try #require(peer)
+                try await pairFromPanel(panel, peer)
+                let panelID = try #require(try await actionsOffPool { try peer.devices().first?.id })
+
+                let notKept = "not kept, notification copy " + UUID().uuidString
+                let notKeptRow = try await receive(notKept, keep: false, from: peer, on: panel, to: panelID)
+                try await pressNotificationCopy(notKeptRow, on: panel, "not kept")
+                try await waitForPasteboard(notKept, "the text that was not kept, copied from its notification")
+                try await expectConcealedAndUnrecorded(notKept, on: panel, "notification Copy")
+
+                let kept = "kept, notification copy " + UUID().uuidString
+                let keptRow = try await receive(kept, keep: true, from: peer, on: panel, to: panelID)
+                try await pressNotificationCopy(keptRow, on: panel, "kept")
+                try await waitForPasteboard(kept, "the kept text, copied from its notification")
+                let ordinary = await MainActor.run { !(NSPasteboard.general.types?.contains(.init("org.nspasteboard.ConcealedType")) ?? false) }
+                #expect(ordinary, "a kept text copied from its notification is an ordinary copy")
+                let recorded = try await actionsOffPool {
+                    try panel.waitFor("the kept text in clipboard history") { try panel.clipTexts().contains(kept) ? true : nil }
+                }
+                #expect(recorded, "clipboard history records a kept text")
+                print("MacActionsE2E notification Copy: kept ordinary=\(ordinary) recorded=\(recorded)")
             }
         } catch { failure = error }
         await MainActor.run { saved.restore() }

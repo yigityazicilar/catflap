@@ -237,8 +237,13 @@ enum PanelActionArguments {
     /// The paired devices as the agent lists them now, most recently used first; nil when the
     /// agent could not be asked or its answer could not be read.
     static func pairedDevices(_ runtime: AgentRuntime) async -> [PanelDevice]? {
-        await PanelController.request([DeviceSummary].self, "devices", runtime)?.map { PanelDevice(id: $0.id, name: $0.name) }
+        if let path = devicesFault, FileManager.default.fileExists(atPath: path) { return nil }
+        return await PanelController.request([DeviceSummary].self, "devices", runtime)?.map { PanelDevice(id: $0.id, name: $0.name) }
     }
+
+    /// Tests only: while the file this names exists, the read above fails as an agent error
+    /// would, and only that read, so the panel's own lists stay as they were. Unset outside tests.
+    private static let devicesFault = ProcessInfo.processInfo.environment["CATFLAP_TEST_DEVICES_FAULT"].flatMap { $0.isEmpty ? nil : $0 }
 
     /// The device a `ui invoke` action goes to, from the agent's own list as it is now: the
     /// panel's copy follows the store a moment later, so a send right after pairing would find
