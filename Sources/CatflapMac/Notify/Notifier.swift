@@ -22,6 +22,28 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             case .retry: "retry"
             }
         }
+
+        /// What the notification carries, so its button works however long it stays in
+        /// Notification Center, across restarts of the agent too.
+        var userInfo: [String: String] {
+            switch self {
+            case .copy(let deviceID, let id), .retry(let deviceID, let id): ["action": key, "device_id": deviceID, "id": id]
+            case .reveal(let path): ["action": key, "path": path]
+            }
+        }
+
+        init?(userInfo info: [String: String]) {
+            switch info["action"] {
+            case "copy", "retry":
+                guard let deviceID = info["device_id"], let id = info["id"] else { return nil }
+                self = info["action"] == "copy" ? .copy(deviceID: deviceID, id: id) : .retry(deviceID: deviceID, id: id)
+            case "reveal":
+                guard let path = info["path"] else { return nil }
+                self = .reveal(path)
+            default:
+                return nil
+            }
+        }
     }
 
     /// What was shown, newest last: title, body, the action offered, and whether it went to
@@ -35,7 +57,9 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     private(set) var shown: [Record] = []
     var perform: ((Action) -> Void)?
-    private var actions: [String: Action] = [:]
+    /// With test hooks on only: the userInfo of each notification posted with an action, as
+    /// posted, newest last. `ui invoke notification-press` presses a button with it.
+    private(set) var postedUserInfo: [[String: String]] = []
     private let center: UNUserNotificationCenter?
 
     static var canDeliver: Bool { Bundle.main.bundleIdentifier != nil && Bundle.main.bundleURL.pathExtension == "app" }
@@ -76,24 +100,29 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     private func post(title: String, body: String, action: Action?) {
         shown.append(Record(title: title, body: body, action: action?.key, delivered: center != nil))
         if shown.count > 20 { shown.removeFirst() }
+        let userInfo = action?.userInfo ?? [:]
+        if MacTestHooks.on, action != nil {
+            postedUserInfo.append(userInfo)
+            if postedUserInfo.count > 20 { postedUserInfo.removeFirst() }
+        }
         guard let center else { return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = nil
+        content.userInfo = userInfo
         if let action { content.categoryIdentifier = action.key }
-        let identifier = UUID().uuidString
-        if let action { actions[identifier] = action }
-        if actions.count > 50, let oldest = actions.keys.first { actions[oldest] = nil }
-        center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil)) { _ in }
+        center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { _ in }
     }
 
     func clearRecords() { shown.removeAll() }
 
-    private func respond(identifier: String, action: String) {
-        guard let stored = actions[identifier] else { return }
+    /// What a press on a notification does, given the userInfo it was posted with and the
+    /// action identifier of what was pressed.
+    func respond(userInfo: [String: String], action button: String) {
+        guard let stored = Action(userInfo: userInfo) else { return }
         // A click on the notification itself does what its button does.
-        if action == stored.key || action == UNNotificationDefaultActionIdentifier { perform?(stored) }
+        if button == stored.key || button == UNNotificationDefaultActionIdentifier { perform?(stored) }
     }
 
     static func preview(_ text: String) -> String {
@@ -105,10 +134,12 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                             withCompletionHandler completionHandler: @escaping () -> Void) {
-        let identifier = response.notification.request.identifier
-        let action = response.actionIdentifier
+        let userInfo = response.notification.request.content.userInfo.reduce(into: [String: String]()) { result, entry in
+            if let key = entry.key as? String, let text = entry.value as? String { result[key] = text }
+        }
+        let button = response.actionIdentifier
         completionHandler()
-        Task { @MainActor in self.respond(identifier: identifier, action: action) }
+        Task { @MainActor in self.respond(userInfo: userInfo, action: button) }
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,

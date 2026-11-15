@@ -102,6 +102,11 @@ public actor AgentRuntime {
             case "toggle":
                 toggle()
                 return try ControlResponse(value: ui)
+            case "panel.show":
+                // Opens the panel focused, as `toggle` does when it opens it; a focused panel
+                // is left as it is, and the panel is never hidden.
+                if !(ui.visible && ui.hasFocus) { ui.visible = true; ui.mode = "focused"; ui.hasFocus = true }
+                return try ControlResponse(value: ui)
             case "ui.invoke":
                 switch request.arguments["action"] {
                 case "toggle": toggle()

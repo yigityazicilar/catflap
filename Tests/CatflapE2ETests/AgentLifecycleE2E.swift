@@ -65,8 +65,8 @@ func runCatflap(_ executable: URL, _ arguments: [String], environment: [String: 
     }
 
     /// A launch that means "open Catflap" (the app started again) shows the running agent's
-    /// panel and exits 0, and again leaves it shown; an explicit second `catflap agent` is
-    /// still refused.
+    /// panel focused and exits 0, and again leaves it focused; an explicit second
+    /// `catflap agent` is still refused.
     @Test func testSecondAppLaunchShowsThePanelAndASecondAgentIsRefused() async throws {
         let agent = try AgentHarness(); defer { agent.stop() }
         try await onThread { try agent.start() }
@@ -74,7 +74,8 @@ func runCatflap(_ executable: URL, _ arguments: [String], environment: [String: 
             let shown = try await onThread { try runCatflap(agent.executable, ["agent", "--show-if-running", "--data-dir", agent.dataDirectory.path]) }
             #expect(shown.code == 0, "launch \(round) ended with status \(shown.code)")
             let state = try await onThread { try agent.command(["ui", "state"]) }.decode(UIState.self)
-            #expect(state.visible && state.mode != "hidden", "launch \(round) left the panel \(state.mode)")
+            #expect(state.visible && state.hasFocus && state.mode == "focused",
+                    "launch \(round) left the panel \(state.mode), focus \(state.hasFocus)")
         }
         let second = try await onThread { try runCatflap(agent.executable, ["agent", "--data-dir", agent.dataDirectory.path]) }
         #expect(second.code == 1)

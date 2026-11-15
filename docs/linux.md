@@ -155,6 +155,11 @@ runs, which is how the tests check it:
 The control channel also takes arguments for these actions (`text`, `files`, `id`, `device`,
 `keep`, `code`, `key`, `value`); the command line passes only the action name so far.
 
+The control command `panel.show` (no arguments) opens the panel with the keyboard in the field
+when it is hidden or open without the keyboard (from the hover band or a drag). A panel that
+already has the keyboard, or is waiting for one of the shortcut questions above, stays as it
+is; `panel.show` never hides the panel. It answers with what `catflap ui state` prints.
+
 A send goes to a device from the agent's own list of paired devices, read when you send. If
 that list cannot be read, nothing is sent and the panel says "Catflap could not read your
 paired devices. Try again." A send of several files that did not all start fails (exit 1)

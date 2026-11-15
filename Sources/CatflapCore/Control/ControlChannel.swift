@@ -88,18 +88,19 @@ private enum LocalSocket {
     static func frameAllowance(received: Int) -> Duration {
         .seconds(5) + .seconds(Double(received) / 65_536)
     }
-    /// Reads one frame. `hold` is asked before each piece is kept, and may refuse it.
-    static func readFrame(_ fd: Int32, hold: (Int) -> Bool = { _ in true }) throws -> Data {
+    /// Reads one frame of fewer than `limit` bytes. `hold` is asked before each piece is kept,
+    /// and may refuse it.
+    static func readFrame(_ fd: Int32, limit: Int = maxFrame, hold: (Int) -> Bool = { _ in true }) throws -> Data {
         var data = Data()
         var buffer = [UInt8](repeating: 0, count: 16_384)
         let started = ContinuousClock.now
-        while data.count < maxFrame && started.duration(to: .now) < frameAllowance(received: data.count) {
+        while data.count < limit && started.duration(to: .now) < frameAllowance(received: data.count) {
             let count = buffer.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, 0) }
             if count < 0 && errno == EINTR { continue }
             guard count > 0 else { throw AgentError.control }
             guard hold(count) else { throw OverBudget() }
             if let newline = buffer[..<count].firstIndex(of: 10) {
-                guard data.count + newline < maxFrame, newline == count - 1 else { throw AgentError.invalidRequest }
+                guard data.count + newline < limit, newline == count - 1 else { throw AgentError.invalidRequest }
                 data.append(contentsOf: buffer[..<newline])
                 return data
             }
@@ -107,16 +108,18 @@ private enum LocalSocket {
         }
         throw AgentError.invalidRequest
     }
-    static func writeFrame(_ data: Data, _ fd: Int32) throws {
+    /// Writes one frame. Without `waiting`, a send that would have to wait fails at once.
+    static func writeFrame(_ data: Data, _ fd: Int32, waiting: Bool = true) throws {
         guard data.count < maxFrame else { throw AgentError.invalidRequest }
         let frame = data + Data([10])
+        let pace = waiting ? Int32(0) : Int32(MSG_DONTWAIT)
         try frame.withUnsafeBytes { bytes in
             var offset = 0
             while offset < bytes.count {
                 #if os(Linux)
-                let count = send(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset, Int32(MSG_NOSIGNAL))
+                let count = send(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset, pace | Int32(MSG_NOSIGNAL))
                 #else
-                let count = send(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset, 0)
+                let count = send(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset, pace)
                 #endif
                 if count < 0 && errno == EINTR { continue }
                 guard count > 0 else { throw AgentError.control }
@@ -150,13 +153,22 @@ public enum ControlClient {
         var info = stat()
         guard lstat(url.path, &info) == 0, info.st_uid == getuid(),
               (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFSOCK), info.st_mode & 0o077 == 0 else { throw AgentError.control }
+        let frame = try ControlJSON.encoder.encode(request)
         let fd = try LocalSocket.create(); defer { close(fd) }
         var address = try LocalSocket.address(url.path)
         let connected = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
         }
         guard connected == 0, LocalSocket.owner(fd) else { throw AgentError.control }
-        try LocalSocket.writeFrame(ControlJSON.encoder.encode(request), fd)
+        do { try LocalSocket.writeFrame(frame, fd) }
+        catch AgentError.control {
+            // The agent refuses some requests part way through (too large, busy) and closes
+            // the connection once it has answered, so the answer may be here although the
+            // send failed. Only without one is the agent unreachable.
+            guard let reply = try? LocalSocket.readFrame(fd),
+                  let response = try? ControlJSON.decoder.decode(ControlResponse.self, from: reply) else { throw AgentError.control }
+            return response
+        }
         return try ControlJSON.decoder.decode(ControlResponse.self, from: LocalSocket.readFrame(fd))
     }
 }
@@ -222,14 +234,21 @@ public final class ControlServer: Sendable {
     /// replies are far smaller, and 32 connections hold at most 32 times this.
     public static let smallFrame = 1_048_576
     public static let busy = "The agent is busy with other large requests. Try again in a moment."
+    /// The answer to a connection beyond the 32 served at once.
+    public static let crowded = "The agent is busy with too many requests at once. Try again in a moment."
     public static let listenerFailure = "The agent's control channel stopped working, so the agent stopped. Start it again."
     private let fd: Int32
     private let wakeRead: Int32
     private let wakeWrite: Int32
     private let url: URL
-    // Retain the lock until the socket has closed, including shutdown/error paths.
-    private let lock: AgentLock
+    /// The folder's lock, which this server lets go of when `run` ends (or, if it never runs,
+    /// when it goes). The lock is freed then unless whoever took it still holds it too, as
+    /// the agent does until its runtime has stopped.
+    private let folderLock: Mutex<AgentLock?>
     private let byteBudget: Int
+    /// The largest request frame read, `LocalSocket.maxFrame` but in tests, which lower it to
+    /// reach the refusal of a frame too large without sending 40 MiB.
+    private let frameLimit: Int
     private struct State: Sendable {
         var started = false
         var stopped = false
@@ -242,6 +261,8 @@ public final class ControlServer: Sendable {
         var reserved = 0
         var peakReserved = 0
         var refused = 0
+        /// The listening socket is closed and its path removed.
+        var gaveUpFolder = false
     }
     /// What one connection holds: up to `smallFrame` bytes of its own, or else one whole-frame
     /// reservation from the budget. A frame that grows past `smallFrame` reserves a whole
@@ -272,8 +293,9 @@ public final class ControlServer: Sendable {
     public convenience init(paths: AgentPaths, lock: AgentLock) throws {
         try self.init(paths: paths, lock: lock, byteBudget: Self.defaultByteBudget)
     }
-    init(paths: AgentPaths, lock: AgentLock, byteBudget: Int) throws {
-        self.lock = lock; url = paths.socket; self.byteBudget = byteBudget
+    init(paths: AgentPaths, lock: AgentLock, byteBudget: Int, frameLimit: Int? = nil) throws {
+        folderLock = Mutex<AgentLock?>(lock); url = paths.socket; self.byteBudget = byteBudget
+        self.frameLimit = frameLimit ?? LocalSocket.maxFrame
         let descriptor = try LocalSocket.create()
         var wake = [Int32](repeating: -1, count: 2)
         guard pipe(&wake) == 0 else { close(descriptor); throw AgentError.control }
@@ -293,7 +315,24 @@ public final class ControlServer: Sendable {
         } catch { close(descriptor); close(wake[0]); close(wake[1]); throw error }
         fd = descriptor; wakeRead = wake[0]; wakeWrite = wake[1]
     }
-    deinit { close(fd); close(wakeRead); close(wakeWrite); _ = unlink(url.path) }
+    deinit {
+        close(wakeRead); close(wakeWrite)
+        if !state.withLock({ $0.gaveUpFolder }) { close(fd); _ = unlink(url.path) }
+    }
+    /// Closes the listening socket, removes its path, then lets go of the lock, in that order,
+    /// so that a new agent can start in the folder as soon as `run` returns, however long this
+    /// object lives on. Without that, a server that a thread of its own still held kept the
+    /// folder locked, and its late deinit removed the next server's socket.
+    private func giveUpFolder() {
+        let first = state.withLock { value in
+            guard !value.gaveUpFolder else { return false }
+            value.gaveUpFolder = true
+            return true
+        }
+        guard first else { return }
+        close(fd); _ = unlink(url.path)
+        folderLock.withLock { $0 = nil }
+    }
 
     /// Wakes the dedicated accept thread and interrupts every connection, including handler waits.
     public func stop() {
@@ -356,11 +395,16 @@ public final class ControlServer: Sendable {
             guard LocalSocket.owner(client) else { close(client); continue }
             let id = UUID()
             let session = ControlSession(client)
-            let admitted = state.withLock { value in
-                guard !value.stopped, value.sessions.count < 32 else { return false }
+            let (admitted, full) = state.withLock { value -> (Bool, Bool) in
+                guard !value.stopped else { return (false, false) }
+                guard value.sessions.count < 32 else { return (false, true) }
                 value.sessions[id] = session
-                return true
+                return (true, false)
             }
+            // One connection too many is told so before it is closed, without waiting: the
+            // accept loop must never stall on a client. A stopping agent closes without a word,
+            // since it no longer answers anything.
+            if full { try? LocalSocket.writeFrame(ControlJSON.encoder.encode(ControlResponse(failure: Self.crowded)), client, waiting: false) }
             guard admitted else { close(client); continue }
             workers.enter()
             Thread.detachNewThread {
@@ -376,7 +420,7 @@ public final class ControlServer: Sendable {
                     workers.leave()
                 }
                 do {
-                    let request = try ControlJSON.decoder.decode(ControlRequest.self, from: LocalSocket.readFrame(client) { self.hold($0, &holding) })
+                    let request = try ControlJSON.decoder.decode(ControlRequest.self, from: LocalSocket.readFrame(client, limit: self.frameLimit) { self.hold($0, &holding) })
                     // The frame itself is gone once decoded.
                     if !holding.reserved { self.release(&holding) }
                     let task = Task {
@@ -411,6 +455,7 @@ public final class ControlServer: Sendable {
         }
         stop()
         workers.wait()
+        giveUpFolder()
     }
     /// Waits `duration` unless `stop()` is called first; true if it was.
     private func pause(_ duration: Duration) -> Bool {
