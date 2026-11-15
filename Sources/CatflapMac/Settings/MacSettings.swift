@@ -48,8 +48,9 @@ enum LoginItem {
 }
 
 /// The settings the panel offers, each kept where it survives a restart: the agent's settings
-/// table for the switches and the inbox, the preferences domain (through KeyboardShortcuts)
-/// for the two shortcuts, and macOS's own login items for start at login.
+/// table for the switches and the inbox, the preferences domain for the two shortcuts, and
+/// macOS's own login items for start at login. Each shortcut's state says whether it works:
+/// `bound`, `unbound`, or `conflict` when macOS or another app has its keys.
 struct MacSettings: Codable, Sendable, Equatable {
     var hoverBand = true
     var hoverFullScreen = false
@@ -59,12 +60,23 @@ struct MacSettings: Codable, Sendable, Equatable {
     var startAtLogin = "unavailable"
     var panelShortcut = ""
     var sendShortcut = ""
+    var panelShortcutState = "unavailable"
+    var sendShortcutState = "unavailable"
 
     enum CodingKeys: String, CodingKey {
         case inbox
         case hoverBand = "hover_band", hoverFullScreen = "hover_full_screen"
         case receivedTextToClipboard = "received_text_to_clipboard", startAtLogin = "start_at_login"
         case panelShortcut = "panel_shortcut", sendShortcut = "send_shortcut"
+        case panelShortcutState = "panel_shortcut_state", sendShortcutState = "send_shortcut_state"
+    }
+
+    @MainActor
+    mutating func noteShortcuts(panel: ShortcutBinding, send: ShortcutBinding) {
+        panelShortcut = panel.keys
+        panelShortcutState = panel.state
+        sendShortcut = send.keys
+        sendShortcutState = send.state
     }
 
     /// The keys `ui invoke set` takes. `hover_band` and `hover_full_screen` are the keys the

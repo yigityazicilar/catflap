@@ -50,14 +50,20 @@ struct MacStateReport: Encodable, Sendable {
     }
 }
 
-/// What a `ui invoke` action of this task answers: the rows it started, what it copied, the
-/// sentence it ended with, and the state after it.
+/// What a `ui invoke` action of this task answers: the rows it started, the attached files
+/// that did not start (with why), what it copied, the sentence it ended with, and the state
+/// after it.
 struct MacActionResult: Encodable, Sendable {
     let action: String
     let transfers: [TransferRecord]
+    let notSent: [NotSent]
     let copied: String?
     let message: String
     let state: MacStateReport
+    enum CodingKeys: String, CodingKey {
+        case action, transfers, copied, message, state
+        case notSent = "not_sent"
+    }
 }
 
 /// The `ui invoke` actions, each doing what the matching control does. Optional arguments
@@ -105,29 +111,30 @@ extension PanelActions {
         let status = pairing.status
         var current = settings
         current.startAtLogin = LoginItem.state
-        current.panelShortcut = panelShortcut.keys
-        current.sendShortcut = sendShortcut?.keys ?? ""
+        current.noteShortcuts(panel: panelShortcut, send: sendShortcut)
         let state = MacActionState(
             wired: wired, dontKeep: dontKeep, paused: paused, pickerOpen: picker.isOpen,
             settingsOpen: settingsWindow?.isOpen ?? false, pairingOpen: pairingWindow?.isOpen ?? false,
             pairing: MacPairingState(state: status.state.rawValue, role: status.role?.rawValue, digits: status.digits,
                                      peerName: status.peerName, hasCode: status.code != nil, error: status.error ?? pairing.message),
-            settings: current, sendShortcut: sendShortcut?.state ?? "unavailable", sendShortcutKeys: sendShortcut?.keys ?? "",
+            settings: current, sendShortcut: sendShortcut.state, sendShortcutKeys: sendShortcut.keys,
             panelShortcutKeys: panelShortcut.keys, notifications: notifier.shown,
             notificationDelivery: Notifier.canDeliver ? "notification_center" : "recorded_only", lastMessage: message)
         return MacStateReport(ui: ui, actions: state)
     }
 
-    private func answer(_ action: String, transfers: [TransferRecord] = [], copied: String? = nil, message text: String? = nil) async -> ControlResponse {
-        let value = MacActionResult(action: action, transfers: transfers, copied: copied, message: text ?? message, state: await report())
+    private func answer(_ action: String, transfers: [TransferRecord] = [], notSent: [NotSent] = [], copied: String? = nil,
+                        message text: String? = nil) async -> ControlResponse {
+        let value = MacActionResult(action: action, transfers: transfers, notSent: notSent, copied: copied, message: text ?? message,
+                                    state: await report())
         return (try? ControlResponse(value: value)) ?? ControlResponse(error: .storage)
     }
 
     private func refuse(_ refusal: ActionRefusal) -> ControlResponse { ControlResponse(failure: refusal.message) }
 
-    private func answer(_ action: String, _ outcome: Result<[TransferRecord], ActionRefusal>) async -> ControlResponse {
+    private func answer(_ action: String, _ outcome: Result<SendStart, ActionRefusal>) async -> ControlResponse {
         switch outcome {
-        case .success(let rows): return await answer(action, transfers: rows)
+        case .success(let begun): return await answer(action, transfers: begun.rows, notSent: begun.notSent)
         case .failure(let refusal): return refuse(refusal)
         }
     }
@@ -148,7 +155,7 @@ extension PanelActions {
     private func finishPanelAction(_ action: String, message text: String?) async -> ControlResponse {
         if let send = takePanelSend() {
             switch await send.value {
-            case .success(let rows): return await answer(action, transfers: rows, message: text)
+            case .success(let begun): return await answer(action, transfers: begun.rows, notSent: begun.notSent, message: text)
             case .failure(let refusal): return refuse(refusal)
             }
         }
