@@ -47,9 +47,10 @@ struct ClientOptions: ParsableArguments {
         let response: ControlResponse
         do { response = try ControlClient.request(.init(command, arguments: arguments), socket: socket) }
         catch {
-            if json { print(try ControlJSON.text(ClientErrorOutput(error: AgentError.control.rawValue))) }
-            else { FileHandle.standardError.write(Data("Cannot reach the agent control channel.\n".utf8)) }
-            throw ExitCode.failure
+            let failure = AgentError.unanswered(error)
+            if json { print(try ControlJSON.text(ClientErrorOutput(error: failure.message))) }
+            else { FileHandle.standardError.write(Data((failure.message + "\n").utf8)) }
+            throw ExitCode(failure.code)
         }
         guard response.ok else {
             if json {

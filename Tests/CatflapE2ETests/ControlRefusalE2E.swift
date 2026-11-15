@@ -24,6 +24,28 @@ private final class RefusingAgent: @unchecked Sendable {
     func stop() async { server.stop(); await task.value }
 }
 
+/// A stand-in agent that takes every request and answers none of them until it is stopped,
+/// as a busy agent would look from outside if it never got round to answering.
+private final class SilentAgent: @unchecked Sendable {
+    let harness: AgentHarness
+    private let server: ControlServer
+    private let task: Task<Void, Never>
+    init() throws {
+        harness = try AgentHarness()
+        let paths = try AgentPaths(directory: harness.dataDirectory)
+        let server = try ControlServer(paths: paths, lock: AgentLock(paths: paths))
+        self.server = server
+        task = Task { [server] in
+            await server.run { _ in
+                // Ends only when the server stops and cancels it.
+                try? await Task.sleep(for: .seconds(3600))
+                return ControlResponse(error: .unsupported)
+            }
+        }
+    }
+    func stop() async { server.stop(); await task.value }
+}
+
 /// A listening socket where the agent's would be. It takes one connection, reads a piece of
 /// the request and closes the connection without a reply.
 private final class DroppingAgent: @unchecked Sendable {
@@ -117,5 +139,25 @@ private final class DroppingAgent: @unchecked Sendable {
         #expect(result.code == 1, "catflap ended with status \(result.code)")
         #expect(jsonObject(result.output)?["ok"] as? Bool == false)
         #expect(said(result) == AgentError.control.rawValue, "catflap said: \(said(result))")
+    }
+
+    /// An agent that takes the request and stays silent past the reply wait the command ships
+    /// with: `catflap --json` says the agent did not answer in time and ends with status 69,
+    /// not that it cannot be reached. Two commands, through the two ways a command asks.
+    @Test func testSilentAgentDidNotAnswerInTime() async throws {
+        let agent = try SilentAgent()
+        let executable = agent.harness.executable, folder = agent.harness.dataDirectory.path
+        // The production wait, plus room for a loaded machine; only a guard against a hang.
+        let limit = Double(ControlClient.replyWait.components.seconds) + 90
+        async let status = onThread { try runCatflap(executable, ["status", "--json", "--data-dir", folder], timeout: limit) }
+        async let listed = onThread { try runCatflap(executable, ["clip", "list", "--json", "--data-dir", folder], timeout: limit) }
+        let results: [CommandResult]
+        do { results = try await [status, listed] } catch { await agent.stop(); throw error }
+        await agent.stop()
+        for result in results {
+            #expect(result.code == 69, "catflap \(result.command) ended with status \(result.code)")
+            #expect(jsonObject(result.output)?["ok"] as? Bool == false)
+            #expect(said(result) == AgentError.noAnswer.rawValue, "catflap \(result.command) said: \(said(result))")
+        }
     }
 }
