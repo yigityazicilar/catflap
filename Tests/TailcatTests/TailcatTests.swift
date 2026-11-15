@@ -31,12 +31,6 @@ private func clearHooks() {
     TestHooks.current.withLock { $0 = TestHooks() }
 }
 
-/// Whether a hook report is a ping of `client`'s. The hooks are process-wide and other
-/// targets' tests ping in the same process, so a hook acts only on its own client's calls.
-private func isOwnPing(_ report: CallReport, _ client: TailcatClient) -> Bool {
-    report.operation == "client.ping" && report.resource == client.handle
-}
-
 /// A started server with one listener, admitting `clientKeys`.
 private struct Tunnel {
     let serverKeys: TailcatKeys
@@ -98,26 +92,6 @@ private func closeStatus(_ handle: tc_handle) -> Int32 {
 
 @Suite(.serialized)
 struct TailcatTests {
-    @Test func testHooksActOnlyOnTheirOwnClientsPings() async throws {
-        let tunnel = try await Tunnel.start()
-        let own = try TailcatClient(address: tunnel.info.address, key: tunnel.clientKeys)
-        let foreign = try TailcatClient(address: tunnel.info.address, key: tunnel.clientKeys)
-        let actedOn = Shared<[tc_handle]>([])
-        installHooks(TestHooks(beforeCCall: { report in
-            guard isOwnPing(report, own) else { return }
-            actedOn.update { $0.append(report.resource) }
-        }, afterCReturn: { report in
-            guard isOwnPing(report, own) else { return }
-            actedOn.update { $0.append(report.resource) }
-        }))
-        defer { clearHooks() }
-        // Another client's ping inside the hooked window, as another test's would be, then ours.
-        _ = try? await foreign.ping(timeout: generous)
-        _ = try? await own.ping(timeout: generous)
-        #expect(actedOn.value == [own.handle, own.handle], "the hooks acted on another client's ping")
-        await own.close(); await foreign.close(); await tunnel.server.close()
-    }
-
     @Test func testDiscoPingReturnsLatencyAndPathWithoutEndpoint() async throws {
         let tunnel = try await Tunnel.start()
         let client = try TailcatClient(address: tunnel.info.address, key: tunnel.clientKeys)
@@ -145,11 +119,11 @@ struct TailcatTests {
         let events = Shared<[String]>([])
         let token = Shared<tc_handle>(0)
         installHooks(TestHooks(beforeCCall: { report in
-            guard isOwnPing(report, client) else { return }
+            guard report.operation == "client.ping" else { return }
             token.update { $0 = report.token }; entered.update { $0 = true }
             release.wait()
         }, afterCReturn: { report in
-            guard isOwnPing(report, client) else { return }
+            guard report.operation == "client.ping" else { return }
             events.update { $0.append("c-returned") }
         }))
         defer { clearHooks() }
@@ -174,7 +148,7 @@ struct TailcatTests {
         let returned = Shared(false)
         let release = DispatchSemaphore(value: 0)
         installHooks(TestHooks(afterCReturn: { report in
-            guard isOwnPing(report, client) else { return }
+            guard report.operation == "client.ping" else { return }
             returned.update { $0 = true }; release.wait()
         }))
         defer { clearHooks() }
@@ -194,7 +168,7 @@ struct TailcatTests {
         await tunnel.server.close()
         let returned = Shared(false)
         installHooks(TestHooks(afterCReturn: { report in
-            if isOwnPing(report, client) { returned.update { $0 = true } }
+            if report.operation == "client.ping" { returned.update { $0 = true } }
         }))
         defer { clearHooks() }
         let error = await #expect(throws: TailcatError.self) { _ = try await client.ping(timeout: .seconds(3)) }
@@ -209,7 +183,7 @@ struct TailcatTests {
         let tokens = Shared<Set<tc_handle>>([])
         let entered = Shared(0)
         installHooks(TestHooks(beforeCCall: { report in
-            guard isOwnPing(report, client) else { return }
+            guard report.operation == "client.ping" else { return }
             tokens.update { $0.insert(report.token) }; entered.update { $0 += 1 }
         }))
         defer { clearHooks() }

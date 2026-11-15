@@ -15,7 +15,7 @@ second. At the end, lines starting "stall-watch:" say whether the sampler itself
 (then the whole machine paused) and what the machine looked like around each long silence of
 the test output. They are information only and never fail a run.
 
-  CATFLAP_TEST_LIMIT     seconds allowed for one run of the suite (default 1500)
+  CATFLAP_TEST_LIMIT     seconds allowed for one run of the suite (default 600)
   CATFLAP_TEST_REPEAT    times to run the suite, stopping at the first failure (default 1)
   CATFLAP_STALL_SILENCE  seconds without test output that count as a silence (default 10)
 
@@ -443,7 +443,7 @@ def main():
     if sys.argv[1:2] == ["--stall-sampler"]:
         sample(sys.argv[2], int(sys.argv[3]))
         return 0
-    limit = int(os.environ.get("CATFLAP_TEST_LIMIT", "1500"))
+    limit = int(os.environ.get("CATFLAP_TEST_LIMIT", "600"))
     repeat = int(os.environ.get("CATFLAP_TEST_REPEAT", "1"))
     built = subprocess.run(["swift", "build", "--build-tests"])
     if built.returncode != 0:

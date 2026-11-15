@@ -92,7 +92,7 @@ private final class ClipAgents: @unchecked Sendable {
         let image = try await clipOffPool { try agents.first.command(["clip", "add", "--kind", "image", "--file", imageFile.path]) }.decode(ClipboardIngestResult.self)
         let imageID = try #require(image.id)
         let imageSent = try await clipOffPool { try agents.first.command(["clip", "send", imageID], timeout: 90) }.decode(TransferRecord.self)
-        #expect(imageSent.status == "ok" && imageSent.kind == "image")
+        #expect(imageSent.status == "ok" && imageSent.kind == "file")
         let outbox = agents.first.dataDirectory.appendingPathComponent("outbox")
         #expect(try FileManager.default.contentsOfDirectory(atPath: outbox.path).isEmpty)
         let reference = try await clipOffPool { try agents.first.command(["clip", "add", "--kind", "files", "--file", imageFile.path]) }.decode(ClipboardIngestResult.self)

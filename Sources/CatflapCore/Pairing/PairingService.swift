@@ -266,7 +266,6 @@ public actor PairingService {
 
     private func runInitiator(_ id: UUID, _ events: AsyncStream<Event>, expiry: ContinuousClock.Instant) async {
         var wire: WireConnection?
-        var handedOver = false
         do {
             let joinKeys = try TailcatKeys.generate()
             // The throwaway server admits only the one-time key carried in the code.
@@ -352,16 +351,10 @@ public actor PairingService {
                 throw PairingFailure.protocolViolation
             }
             let transcript = PairingDigits.transcript(joinerHello: revealed.header, initiatorHello: mine)
-            handedOver = true
             try await confirmAndExchange(id, wire, events, role: .initiator, peer: peer, exchangeKey: exchangeKey,
                                          transcript: transcript, readDeadline: expiry)
         } catch {
             await fail(id, error, wire: wire)
-            // Before confirmation the joiner may already show digits: end this side of the
-            // stream so it reads the end and fails too, instead of waiting for a tunnel teardown
-            // that may never reach it. The same as the confirmation path: half-close, a bounded
-            // drain, then close. `confirmAndExchange` has already done this for its own failures.
-            if let wire, !handedOver { await wire.finish(timeout: .seconds(3)) }
         }
         await end(id, wire)
     }
@@ -510,18 +503,6 @@ public actor PairingService {
                                                                address: opened.address, pairSecret: secret, build: peer.build))
                     pendingKey = nil
                     update(id) { $0.state = .paired; $0.deviceID = peer.deviceID }
-                    // Confirm right away with an authenticated Open: only a side that stored the
-                    // pairing can answer it with the pair secret. (A ping would not do: the other
-                    // server also answers this key while it is merely pending there.)
-                    let peerID = peer.deviceID
-                    Task.detached { [peers] in
-                        // The other side stores a moment after this one, once this side's
-                        // `pair_done` reaches it: a few tries, spaced 1, 2, 4 and 8 s apart.
-                        for attempt in 0..<5 {
-                            if await peers.confirm(deviceID: peerID) { break }
-                            try? await Task.sleep(for: .seconds(1 << attempt))
-                        }
-                    }
                     // Let the peer read everything before the tunnel closes: wait for its end.
                     await wire.closeWrite()
                     let drained = Task<Void, Error> { await reader.value }

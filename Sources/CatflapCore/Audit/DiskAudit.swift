@@ -48,10 +48,8 @@ public struct DiskAudit: Sendable {
     public let inbox: URL
     /// The inbox chosen for the next start, scanned as `pending-inbox/…` when it is another folder.
     public let pendingInbox: URL?
-    /// More folders to scan, each under its label: those that hold parts of interrupted receives.
-    public let extraRoots: [(url: URL, label: String)]
-    public init(directory: URL, inbox: URL, pendingInbox: URL? = nil, extraRoots: [(url: URL, label: String)] = []) {
-        self.directory = directory; self.inbox = inbox; self.pendingInbox = pendingInbox; self.extraRoots = extraRoots
+    public init(directory: URL, inbox: URL, pendingInbox: URL? = nil) {
+        self.directory = directory; self.inbox = inbox; self.pendingInbox = pendingInbox
     }
     public func scan(needles: [AuditNeedle], devices: [DeviceRecord] = []) throws -> [AuditFinding] {
         let needles = needles.filter { !$0.bytes.isEmpty }
@@ -67,9 +65,6 @@ public struct DiskAudit: Sendable {
         let databaseFiles = Set(["store.sqlite", "store.sqlite-wal", "store.sqlite-shm", "store.sqlite-journal"].map { Array($0.utf8) })
         var roots: [(url: URL, label: String, required: Bool)] = [(directory, "data", true), (inbox, "inbox", false)]
         if let pendingInbox, Self.canonical(pendingInbox) != Self.canonical(inbox) { roots.append((pendingInbox, "pending-inbox", false)) }
-        for extra in extraRoots where !roots.contains(where: { Self.canonical($0.url) == Self.canonical(extra.url) }) {
-            roots.append((extra.url, extra.label, false))
-        }
         for root in roots {
             // Walk the resolved folder: names are relative to it, and on Linux a link given as
             // the root would otherwise not be followed.

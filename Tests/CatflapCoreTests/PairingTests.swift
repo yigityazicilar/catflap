@@ -303,7 +303,7 @@ struct PairingTests {
             if started.state == .starting { started = try await waitForStatus(a) { $0.state != .starting } }
             _ = try await b.pairing.join(code: try #require(started.code))
             let aEnd = try await waitForStatus(a) { $0.state == .confirm || !$0.isActive }
-            let bEnd = try await waitForStatus(b) { !$0.isActive }
+            let bEnd = try await waitForStatus(b) { $0.state == .confirm || !$0.isActive }
             let machine = try #require(dishonest.machine)
             #expect(machine.placedBetween)
             #expect(machine.brokeCommitment)

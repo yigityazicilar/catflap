@@ -65,9 +65,7 @@ public actor PeerService {
         sessions[key] = (nil, nil, connection)
         let store = runtime.store
         let localID = await runtime.identityServer.identity.id
-        let outcome = await PeerOpen.accept(connection, localID: localID, version: version, build: build, mismatched: { [weak self] id, peerVersion in
-            await self?.noteMismatch(deviceID: id, peerVersion: peerVersion)
-        }) { id in
+        let outcome = await PeerOpen.accept(connection, localID: localID, version: version) { id in
             // Read the store each time, so a device removed a moment ago cannot authenticate.
             try? await store.devices().first { $0.id == id }
         }
@@ -78,8 +76,6 @@ public actor PeerService {
         if hello.build != device.build {
             try? await store.execute("UPDATE devices SET build=? WHERE id=?", bindings: [.text(hello.build), .text(device.id)])
         }
-        // An authenticated session from it proves it admits this device.
-        await noteContact(device.id)
         let session = PeerSession(device: device, connection: connection, client: nil)
         sessions[key] = (device.id, session, connection)
         if let sessionHandler {
@@ -98,114 +94,9 @@ public actor PeerService {
             throw PeerError.refused(device: deviceID)
         }
         let identity = await runtime.identityServer.identity
-        let session: PeerSession
-        do { session = try await PeerOpen.dial(device, identity: identity, build: build, version: version, timeout: timeout) }
-        catch let error as PeerError {
-            switch error {
-            case .updateNeeded: await setPeerState(device.id, "update_peer")
-            case .updateThisDevice: await setPeerState(device.id, "update_this_device")
-            case .wrongDevice: await setPeerState(device.id, "wrong_device")
-            case .unreachable:
-                // A device that never showed it admits this one may not have this pairing.
-                if await !isConfirmed(device.id) { throw PeerError.unreachableUnconfirmed(device: device.name) }
-            default: break
-            }
-            throw error
-        }
+        let session = try await PeerOpen.dial(device, identity: identity, build: build, version: version, timeout: timeout)
         sessions[session.id] = (device.id, session, session.connection)
-        await noteContact(device.id)
         return session
-    }
-
-    /// Called when another part of the agent heard from a device: a presence check it answered.
-    /// That makes its waiting items due. It does not confirm a new pairing (a pending key is
-    /// answered too), so an unconfirmed one is checked with an authenticated Open.
-    public func answered(deviceID: String) async {
-        await contactHandler?(deviceID)
-        if await !isConfirmed(deviceID) { Task { _ = await self.confirm(deviceID: deviceID) } }
-    }
-
-    /// Confirms a pairing with proof only a stored pairing gives: an Open authenticated with the
-    /// pair secret both ways. A ping is not enough, because the other server answers a key it
-    /// holds pending during an exchange it may never finish. True when confirmed.
-    public func confirm(deviceID: String, timeout: Duration = .seconds(10)) async -> Bool {
-        if await isConfirmed(deviceID) { return true }
-        if let session = try? await open(deviceID: deviceID, timeout: timeout) { await release(session) }
-        return await isConfirmed(deviceID)
-    }
-
-    /// Pings a paired device through a client of this device's, bounded by `timeout`. An
-    /// answer proves its server admits this device. Only "direct" or the relay region leaves
-    /// here, never an endpoint.
-    public func ping(deviceID: String, timeout: Duration) async throws -> PeerPing {
-        guard let device = try await runtime.store.devices().first(where: { $0.id == deviceID }) else {
-            throw PeerError.refused(device: deviceID)
-        }
-        let unreachable = PeerError.unreachable(device: device.name, lastSeenBuild: device.build)
-        let identity = await runtime.identityServer.identity
-        let client: TailcatClient
-        do { client = try TailcatClient(address: device.address, key: identity.clientKeys) } catch { throw unreachable }
-        let result: TailcatPing
-        do { result = try await client.ping(timeout: timeout) }
-        catch {
-            // `tc_close` has no deadline: the client goes off the caller's path.
-            Task.detached { await client.close() }
-            if error is CancellationError { throw error }
-            if let error = error as? TailcatError, error.code == .cancelled { throw CancellationError() }
-            throw unreachable
-        }
-        Task.detached { await client.close() }
-        // An answer makes waiting items due; it proves the key is admitted, not that the other
-        // side stored this pairing, so it confirms nothing.
-        await contactHandler?(device.id)
-        let path: PeerPath
-        switch result.path {
-        case .direct: path = .direct
-        case .relayed(_, let code): path = .relayed(regionCode: code)
-        }
-        return PeerPing(latency: .milliseconds(Int64((result.latency * 1000).rounded())), path: path)
-    }
-
-    // MARK: What this device knows of each peer
-
-    public typealias ContactHandler = @Sendable (_ deviceID: String) async -> Void
-    private var contactHandler: ContactHandler?
-    /// Called whenever a device answered: an authenticated session either way, or a ping.
-    public func setContactHandler(_ handler: ContactHandler?) { contactHandler = handler }
-
-    /// The peer state and confirmation of each device that has a row; others are `ok` and
-    /// confirmed.
-    public func deviceStates() async -> [String: (peerState: String, confirmed: Bool)] {
-        let rows = (try? await runtime.store.query("SELECT device_id, peer_state, confirmed FROM device_state")) ?? []
-        var states: [String: (String, Bool)] = [:]
-        for row in rows {
-            guard case .text(let id) = row["device_id"], case .text(let state) = row["peer_state"], case .integer(let confirmed) = row["confirmed"] else { continue }
-            states[id] = (state, confirmed != 0)
-        }
-        return states
-    }
-    func isConfirmed(_ deviceID: String) async -> Bool {
-        await deviceStates()[deviceID]?.confirmed ?? true
-    }
-    /// An authenticated session, either way: the only proof that confirms a pairing, because
-    /// each side authenticates with the pair secret it has stored.
-    func noteContact(_ deviceID: String) async {
-        try? await runtime.store.execute("""
-        INSERT INTO device_state(device_id, peer_state, confirmed, changed_at) SELECT ?, 'ok', 1, ? WHERE EXISTS (SELECT 1 FROM devices WHERE id=?)
-        ON CONFLICT(device_id) DO UPDATE SET confirmed=1, peer_state='ok', changed_at=excluded.changed_at
-        """, bindings: [.text(deviceID), .real(Date().timeIntervalSince1970), .text(deviceID)])
-        await contactHandler?(deviceID)
-    }
-    private func setPeerState(_ deviceID: String, _ state: String) async {
-        try? await runtime.store.execute("""
-        INSERT INTO device_state(device_id, peer_state, changed_at) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM devices WHERE id=?)
-        ON CONFLICT(device_id) DO UPDATE SET peer_state=excluded.peer_state, changed_at=excluded.changed_at
-        """, bindings: [.text(deviceID), .text(state), .real(Date().timeIntervalSince1970), .text(deviceID)])
-    }
-    /// A hello of another version named a paired device. Unauthenticated, so it only drives
-    /// the hint `devices` shows; it never changes or deletes a pairing.
-    private func noteMismatch(deviceID: String, peerVersion: Int) async {
-        await setPeerState(deviceID, peerVersion < version ? "update_peer" : "update_this_device")
     }
 
     public func release(_ session: PeerSession) async {
@@ -263,12 +154,6 @@ public actor PeerService {
             record.lastSentAt = existing.lastSentAt
         }
         try await runtime.store.saveDevice(record)
-        // Stored here; until the other device shows it admits this one, the pairing may have
-        // finished on this side only.
-        try await runtime.store.execute("""
-        INSERT INTO device_state(device_id, peer_state, confirmed, changed_at) VALUES (?, 'ok', 0, ?)
-        ON CONFLICT(device_id) DO UPDATE SET peer_state='ok', confirmed=0, changed_at=excluded.changed_at
-        """, bindings: [.text(record.id), .real(Date().timeIntervalSince1970)])
         pendingKeys.remove(device.clientPublicKey)
         // Re-pairing a device that had another key leaves the old key admitted: rebuild then.
         if try await Set(allowlist()) != activeAllowlist { try await rebuildLocked() }

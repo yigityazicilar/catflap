@@ -26,7 +26,7 @@ import Darwin
         try AgentPaths.writePrivate(Data("old inbox audit sentinel".utf8), to: old.appendingPathComponent("received-old.txt"))
         try AgentPaths.writePrivate(Data("new inbox audit sentinel".utf8), to: new.appendingPathComponent("received-new.txt"))
         try AgentPaths.writePrivate(Data("old inbox audit sentinel\nnew inbox audit sentinel\n".utf8), to: extras)
-        // Chosen while running: it applies at once, so the old inbox, which holds no part of a receive, is no longer scanned.
+        // Chosen while running: it applies from the next start.
         try await store.setSetting("inbox", value: new.path)
 
         func audit() async throws -> CommandResult { try await onThread { try agent.command(["audit", "--also", extras.path], timeout: 120) } }
@@ -34,7 +34,7 @@ import Darwin
 
         let before = try await audit()
         #expect(before.code == 1)
-        #expect(lines(try before.decode([AuditFinding].self)) == ["2 inbox/received-new.txt"])
+        #expect(lines(try before.decode([AuditFinding].self)) == ["1 inbox/received-old.txt", "2 pending-inbox/received-new.txt"])
         try await onThread { try agent.restart() }
         let after = try await audit()
         #expect(after.code == 1)

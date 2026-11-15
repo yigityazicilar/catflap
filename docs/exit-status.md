@@ -12,7 +12,7 @@ exit status is the same either way.
 | 1 | The command failed. The sentence says why: the agent's own refusal, or "Cannot reach the agent control channel." when no agent runs for the folder, its socket refuses the connection or belongs to another account, or the connection closes before any reply. |
 | 64 | The command line or its arguments are not valid, or the command is not available. |
 | 69 | "The agent did not answer in time." The agent took the request but gave no reply within 60 seconds. It is running and may be busy; try the command again. 69 is `EX_UNAVAILABLE` in `sysexits.h`. |
-| 75 | `catflap send`: at least one target device is away and the send waits for it at the door, with none failed. Catflap delivers it when the device answers, for up to 7 days; `catflap transfers list --waiting` lists it. `--now` and `--dont-keep` never wait, so they never give 75. 75 is `EX_TEMPFAIL` in `sysexits.h`. |
+| 75 | Reserved for `catflap send` when at least one target device is away and the send waits for it, with none failed; the transfer work adds it. |
 
 ## How long a command waits
 

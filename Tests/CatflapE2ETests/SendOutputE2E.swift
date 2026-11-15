@@ -10,14 +10,6 @@ private final class SendOutcome: Sendable {
     func get() -> TransferRecord? { row.withLock { $0 } }
 }
 
-/// The batch `transfers.send` answers with.
-private struct StandInBatch: Encodable {
-    let sendID = "batch"
-    let transfers: [TransferRecord]
-    let refused: [String] = []
-    enum CodingKeys: String, CodingKey { case sendID = "send_id", transfers, refused }
-}
-
 private func sendOffPool<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
     try await withCheckedThrowingContinuation { continuation in
         Thread.detachNewThread { continuation.resume(with: Result { try body() }) }
@@ -38,18 +30,11 @@ struct SendOutputE2E {
         let outcome = SendOutcome()
         let serving = Task.detached {
             await server.run { request in
-                if request.command == "devices" {
-                    let device = DeviceRecord(id: "peer", name: "Device B", clientPublicKey: "unused", address: "unused", pairSecret: Data([1]), build: "test")
-                    return (try? ControlResponse(value: [DeviceSummary(device)])) ?? ControlResponse(error: .invalidRequest)
-                }
-                guard var row = outcome.get(), ["send", "send.status", "transfers.send", "transfers.get"].contains(request.command) else {
+                guard var row = outcome.get(), ["send", "send.status"].contains(request.command) else {
                     return ControlResponse(error: .invalidRequest, exitCode: 64)
                 }
                 // The first answer is the row as a send starts; the poll that follows gets its end.
-                if request.command == "send" || request.command == "transfers.send" { row.status = "sending"; row.error = nil }
-                if request.command == "transfers.send" {
-                    return (try? ControlResponse(value: StandInBatch(transfers: [row]))) ?? ControlResponse(error: .invalidRequest)
-                }
+                if request.command == "send" { row.status = "sending"; row.error = nil }
                 return (try? ControlResponse(value: row)) ?? ControlResponse(error: .invalidRequest)
             }
         }
@@ -88,25 +73,6 @@ struct SendOutputE2E {
             #expect(plain.code == 1)
             #expect(String(decoding: plain.error, as: UTF8.self) == ending.said + "\n")
             #expect(try plain.decode(TransferRecord.self).status == ending.status)
-        }
-
-        // A send whose device is away waits for it: the row, status 75, and without --json a
-        // line that says what happens next.
-        var waiting = TransferRecord(id: "probe", deviceID: "peer", direction: "sent", kind: "text", size: 1, status: "waiting")
-        waiting.error = "Cannot reach Device B: asleep, offline, or on an older Catflap (last seen on build test)"
-        outcome.set(waiting)
-        let waitingJSON = try await send(json: true)
-        #expect(waitingJSON.code == 75)
-        #expect(waitingJSON.error.isEmpty)
-        #expect(try waitingJSON.decode(TransferRecord.self).status == "waiting")
-        let waitingPlain = try await send(json: false)
-        #expect(waitingPlain.code == 75)
-        #expect(String(decoding: waitingPlain.error, as: UTF8.self) == "Waiting at the door: Device B is away. Catflap delivers it when Device B answers, for up to 7 days.\n")
-        #expect(try waitingPlain.decode(TransferRecord.self).status == "waiting")
-        // Cancelled and expired sends did not arrive.
-        for status in ["cancelled", "expired"] {
-            outcome.set(TransferRecord(id: "probe", deviceID: "peer", direction: "sent", kind: "text", size: 1, status: status))
-            #expect(try await send(json: true).code == 1, "\(status)")
         }
 
         // A send that ends well prints the row itself, either way.

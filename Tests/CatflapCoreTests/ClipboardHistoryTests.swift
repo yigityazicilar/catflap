@@ -259,17 +259,4 @@ struct ClipboardFixture {
         try await reopened.delete(id: found[0].id)
         #expect(try await reopened.items().count == 3)
     }
-    @Test func testClipboardImageIsSentAsKindImageWithItsMime() async throws {
-        let f = try TransferFixture(); defer { f.cleanup() }
-        try await f.store.saveDevice(DeviceRecord(id: "peer", name: "Device B", clientPublicKey: "unused", address: "unused",
-                                                  pairSecret: Data(repeating: 3, count: 32), build: "0.1.0-dev"))
-        let history = ClipboardHistory(store: f.store)
-        let service = ClipboardService(history: history, transfers: f.service, store: f.store, directory: f.directory)
-        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + Data(repeating: 1, count: 64)
-        let stored = try await history.ingest(offeredTypes: ["image/png"], kind: .image) { .init(kind: .image, data: png, mime: "image/png") }
-        let row = try await service.send(id: try #require(stored.id), deviceID: "peer")
-        // A clipboard image travels as an image, not as a file, so both sides can show it as one.
-        #expect(row.kind == "image")
-        #expect(row.path?.hasSuffix(".png") == true)
-    }
 }

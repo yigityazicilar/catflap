@@ -21,9 +21,6 @@ import Testing
         ["clip", "keep"], ["clip", "delete"], ["clip", "get"], ["clip", "pause", "maybe"], ["clip", "send", "--latest", "id"],
         ["clip", "list", "--latest"],
         ["audit", "--also"], ["audit", "extra"],
-        ["transfers", "no-such-action"], ["transfers", "list", "--waiting", "--active"], ["transfers", "list", "--limit", "0"],
-        ["transfers", "show"], ["transfers", "cancel"], ["transfers", "cancel", "id", "--send", "sid"], ["transfers", "retry"],
-        ["inbox", "extra"], ["inbox", "--set"], ["send", "--to", "device", "relative/path"], ["ui", "invoke", "attach", "relative"],
         ["version", "extra"], ["agent", "--no-such-option"], ["erase-identity", "--no-such-option"],
         ["no-such-command"],
     ]
@@ -37,9 +34,6 @@ import Testing
         ["clip", "keep", "id"], ["clip", "delete", "id"], ["clip", "pause"], ["clip", "pause", "on"],
         ["clip", "send", "id", "--to", "device"], ["clip", "send", "id"], ["clip", "send", "--latest"],
         ["audit"],
-        ["transfers", "list"], ["transfers", "list", "--waiting"], ["transfers", "show", "id", "--to", "device"], ["transfers", "show", "id"],
-        ["transfers", "cancel", "id", "--to", "device"], ["transfers", "cancel", "--send", "sid"], ["transfers", "retry", "id", "--to", "device"],
-        ["inbox"], ["inbox", "--set", "/nonexistent/inbox"],
     ]
     /// Successful envelopes whose payload is null, the wrong type, or cut short.
     static let payloads = ["null", "\"wrong type\"", "{\"id\":\"cut"]

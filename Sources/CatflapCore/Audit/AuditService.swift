@@ -65,15 +65,12 @@ public actor AuditService {
             needles.append(.init(bytes: Data(line.utf8), kind: "extra", line: index + 1))
         }
         let paths = await store.paths
-        // A new inbox applies at once, so the inbox is the one the setting names. Parts of
-        // interrupted receives finish in the folder they started in: each such folder is
-        // scanned too, under its own label.
-        let transfers = await runtime.service(TransferService.self)
-        let configured = try await store.setting("inbox").flatMap { $0.isEmpty ? nil : $0 }
-        let current = try await transfers?.currentInbox().directory ?? configured.map { URL(fileURLWithPath: $0) } ?? TransferInbox.defaultDirectory
-        let partFolders = (try await transfers?.partDirectories() ?? []).filter { $0.resolvingSymlinksInPath().path != current.resolvingSymlinksInPath().path }
-        let extras = partFolders.enumerated().map { (url: $0.element, label: "part-inbox-\($0.offset + 1)") }
-        let scanner = DiskAudit(directory: paths.directory, inbox: current, extraRoots: extras)
+        // The receiver keeps the inbox it started with; a new choice applies from the next
+        // start. Both are scanned while they differ, the next one as `pending-inbox`.
+        let configured = try await store.setting("inbox")
+        let pending = configured.map { URL(fileURLWithPath: $0) } ?? TransferInbox.defaultDirectory
+        let live = await runtime.service(TransferService.self)?.inbox.directory
+        let scanner = DiskAudit(directory: paths.directory, inbox: live ?? pending, pendingInbox: live == nil ? nil : pending)
         // Filesystem scanning is synchronous and can include multi-gigabyte inbox files.
         return try await withCheckedThrowingContinuation { continuation in
             Thread.detachNewThread { [needles] in continuation.resume(with: Result { try scanner.scan(needles: needles, devices: devices) }) }

@@ -72,8 +72,7 @@ private func actionsRun(_ tool: String, _ arguments: [String], environment: [Str
     try child.run()
     guard let code = actionsWait(child, seconds: seconds) else {
         kill(child.processIdentifier, SIGKILL); _ = actionsWait(child, seconds: 5)
-        // The subcommand's first word only: the rest can be a text being sent or a code.
-        throw ActionsTestError.timeout(URL(fileURLWithPath: tool).lastPathComponent + (arguments.first.map { " " + $0 } ?? ""))
+        throw ActionsTestError.timeout(URL(fileURLWithPath: tool).lastPathComponent)
     }
     return ActionsCommand(code: code, output: try Data(contentsOf: outputURL), error: try Data(contentsOf: errorURL))
 }
@@ -137,8 +136,8 @@ private final class ActionsAgent: @unchecked Sendable {
     var socket: URL { directory.appendingPathComponent("control.sock") }
     var inbox: URL { directory.appendingPathComponent("inbox") }
 
-    func command(_ arguments: [String], input: Data? = nil, seconds: TimeInterval = 30) throws -> ActionsCommand {
-        try actionsRun(executable.path, arguments + ["--data-dir", directory.path, "--json"], input: input, in: directory, seconds: seconds)
+    func command(_ arguments: [String], input: Data? = nil) throws -> ActionsCommand {
+        try actionsRun(executable.path, arguments + ["--data-dir", directory.path, "--json"], input: input, in: directory)
     }
 
     func request(_ command: String, _ arguments: [String: String] = [:]) throws -> ControlResponse {
@@ -1441,11 +1440,7 @@ struct MacActionsE2E {
     /// `text` sent from `peer` to the panel agent, kept or not; returns its history row on the
     /// panel (`device/id`) once it has arrived.
     private func receive(_ text: String, keep: Bool, from peer: ActionsAgent, on panel: ActionsAgent, to panelID: String) async throws -> String {
-        // A hang guard past the send's longest legitimate path before `catflap send` returns:
-        // PeerService.open's dial (`TransferLimits.dial`, 30 s) and its two Open reads
-        // (`PeerOpen.handshakeTimeout`, 10 s each), then the wait for the accept and for the
-        // acknowledgement (`TransferLimits.idle`, 30 s each): 110 s.
-        let sent = try await actionsOffPool { try peer.command(["send", "--to", panelID, "--text", text] + (keep ? [] : ["--dont-keep"]), seconds: 120) }
+        let sent = try await actionsOffPool { try peer.command(["send", "--to", panelID, "--text", text] + (keep ? [] : ["--dont-keep"])) }
         #expect(sent.code == 0, "send from the peer: \(sent.errorText)")
         let id = try ControlJSON.decoder.decode(TransferRecord.self, from: sent.output).id
         let arrived = try await row(on: panel, "the peer's text on the panel") { $0.direction == "received" && $0.id == id }

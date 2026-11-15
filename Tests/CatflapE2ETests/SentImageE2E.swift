@@ -25,7 +25,7 @@ private func canonical(_ path: String) -> String { URL(fileURLWithPath: path).re
         let added = try await onThread { try first.command(["clip", "add", "--kind", "image", "--file", source.path]) }.decode(ClipboardIngestResult.self)
         let imageID = try #require(added.id)
         let sent = try await onThread { try first.command(["clip", "send", imageID], timeout: 120) }.decode(TransferRecord.self)
-        #expect(sent.status == "ok" && sent.kind == "image" && sent.keep)
+        #expect(sent.status == "ok" && sent.kind == "file" && sent.keep)
         // The outbox holds nothing once the send is confirmed.
         let outbox = first.dataDirectory.appendingPathComponent("outbox")
         #expect(((try? FileManager.default.contentsOfDirectory(atPath: outbox.path)) ?? []).isEmpty)

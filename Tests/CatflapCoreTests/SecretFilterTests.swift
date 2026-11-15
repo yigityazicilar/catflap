@@ -134,19 +134,46 @@ import Testing
     }
     /// The scaling check itself: work that reads from every position to the end, as a pattern
     /// that restarts at every word start does, fails it, and one pass over the input passes.
+    /// Quadratic work reaches a ratio near 1024 only when nothing but the comparisons grows
+    /// with n squared: the old loop, which made a slice per start, came out near 930 on a quiet
+    /// machine in a debug build. Both loops read one buffer with no slice or allocation per
+    /// step. What a call costs whatever its input, about 2 µs on macOS, is under 1 % of the
+    /// small sample. Each loop returns whether it counted every match, and that is checked
+    /// once, so the timed work is the whole pass.
     @Test func testScalingCheckFailsOnQuadraticWork() async throws {
         let make: @Sendable (Int) -> String = { String(repeating: "a", count: $0) }
+        let quadratic: @Sendable (String) -> Bool = { text in
+            Array(text.utf8).withUnsafeBufferPointer { bytes in
+                var matches = 0
+                var start = 0
+                while start < bytes.count {
+                    var index = start
+                    while index < bytes.count {
+                        if bytes[index] == bytes[start] { matches += 1 }
+                        index += 1
+                    }
+                    start += 1
+                }
+                return matches == bytes.count * (bytes.count + 1) / 2
+            }
+        }
+        let linear: @Sendable (String) -> Bool = { text in
+            Array(text.utf8).withUnsafeBufferPointer { bytes in
+                var matches = 0
+                var index = 0
+                while index < bytes.count {
+                    if bytes[index] == UInt8(ascii: "a") { matches += 1 }
+                    index += 1
+                }
+                return matches == bytes.count
+            }
+        }
+        #expect(quadratic(make(512)), "the quadratic loop missed matches")
+        #expect(linear(make(64 * 1024)), "the linear loop missed matches")
         await withKnownIssue("quadratic work must fail the scaling check") {
             // An error from the helper is recorded as itself, so it cannot pass for the known issue.
             do {
-                try await expectLinearScaling("quadratic work", small: 128, make: make) { text in
-                    let bytes = Array(text.utf8)
-                    var matches = 0
-                    for start in bytes.indices {
-                        for byte in bytes[start...] where byte == bytes[start] { matches += 1 }
-                    }
-                    return matches == 0
-                }
+                try await expectLinearScaling("quadratic work", small: 512, make: make, work: quadratic)
             } catch {
                 Issue.record(error)
             }
@@ -154,11 +181,7 @@ import Testing
             if case .expectationFailed = issue.kind { return true }
             return false
         }
-        try await expectLinearScaling("linear work", small: 128, make: make) { text in
-            var matches = 0
-            for byte in text.utf8 where byte == UInt8(ascii: "a") { matches += 1 }
-            return matches == 0
-        }
+        try await expectLinearScaling("linear work", small: 64 * 1024, make: make, work: linear)
     }
     /// A copy that nearly matches a pattern is checked in linear time: 32 times the input
     /// takes about 32 times as long. As a regex the JWT check took 22 s on 128 KiB of "eyJ-"

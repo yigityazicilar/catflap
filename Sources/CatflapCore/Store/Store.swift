@@ -28,7 +28,7 @@ public actor Store {
             sqlite3_busy_timeout(connection, 5000)
             try Self.execute(connection, "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")
             let version = try Self.version(connection)
-            guard version <= 2 else { throw AgentError.storage }
+            guard version <= 1 else { throw AgentError.storage }
             if version == 0 {
                 try Self.execute(connection, """
                 BEGIN IMMEDIATE;
@@ -54,81 +54,12 @@ public actor Store {
                 COMMIT;
                 """)
             }
-            // v2 only adds: columns to `history`, and the waiting queue, part files, peer state
-            // and forgotten ids. `devices`, `clipboard` and `settings` keep their v1 layout.
-            if version <= 1 { try Self.execute(connection, Self.migrationToV2) }
         } catch {
             sqlite3_close(connection)
             throw AgentError.storage
         }
         self.connection = SQLiteConnection(connection)
     }
-    static let migrationToV2 = """
-    BEGIN IMMEDIATE;
-    ALTER TABLE history ADD COLUMN send_id TEXT;
-    ALTER TABLE history ADD COLUMN mime TEXT;
-    ALTER TABLE history ADD COLUMN intent TEXT NOT NULL DEFAULT 'deliver';
-    ALTER TABLE history ADD COLUMN clip_kind TEXT;
-    ALTER TABLE history ADD COLUMN recovery_id TEXT;
-    ALTER TABLE history ADD COLUMN error TEXT;
-    ALTER TABLE history ADD COLUMN entries INTEGER;
-    ALTER TABLE history ADD COLUMN skipped TEXT;
-    ALTER TABLE history ADD COLUMN updated_at REAL;
-    UPDATE history SET updated_at = timestamp;
-    CREATE INDEX history_send ON history(send_id) WHERE send_id IS NOT NULL;
-    CREATE UNIQUE INDEX history_recovery ON history(recovery_id) WHERE recovery_id IS NOT NULL;
-    CREATE TABLE queue (
-        device_id TEXT NOT NULL,
-        id TEXT NOT NULL,
-        queued_at REAL NOT NULL,
-        expires_at REAL NOT NULL,
-        next_attempt_at REAL NOT NULL,
-        attempts INTEGER NOT NULL DEFAULT 0,
-        source TEXT NOT NULL CHECK (source IN ('row_text', 'file', 'folder', 'owned_copy')),
-        source_path TEXT,
-        source_size INTEGER,
-        source_mtime_ns INTEGER,
-        source_dev INTEGER,
-        source_ino INTEGER,
-        source_sha256 TEXT,
-        manifest_path TEXT,
-        sent_bytes INTEGER NOT NULL DEFAULT 0,
-        unconfirmed INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (device_id, id),
-        FOREIGN KEY (device_id, id) REFERENCES history(device_id, id) ON DELETE CASCADE
-    );
-    CREATE INDEX queue_due ON queue(next_attempt_at);
-    CREATE TABLE parts (
-        device_id TEXT NOT NULL,
-        id TEXT NOT NULL,
-        recovery_id TEXT NOT NULL UNIQUE,
-        directory TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ('file', 'image', 'folder')),
-        size INTEGER NOT NULL,
-        identity TEXT NOT NULL,
-        synced_bytes INTEGER NOT NULL DEFAULT 0,
-        created_at REAL NOT NULL,
-        expires_at REAL NOT NULL,
-        PRIMARY KEY (device_id, id),
-        FOREIGN KEY (device_id, id) REFERENCES history(device_id, id) ON DELETE CASCADE
-    );
-    CREATE TABLE device_state (
-        device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
-        peer_state TEXT NOT NULL DEFAULT 'ok'
-            CHECK (peer_state IN ('ok', 'update_peer', 'update_this_device', 'wrong_device')),
-        peer_version INTEGER,
-        confirmed INTEGER NOT NULL DEFAULT 1,
-        changed_at REAL NOT NULL
-    );
-    CREATE TABLE forget (
-        device_id TEXT NOT NULL,
-        id TEXT NOT NULL,
-        created_at REAL NOT NULL,
-        PRIMARY KEY (device_id, id)
-    );
-    PRAGMA user_version=2;
-    COMMIT;
-    """
     private static func execute(_ db: OpaquePointer, _ sql: String) throws {
         guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else { throw AgentError.storage }
     }
