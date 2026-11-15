@@ -166,6 +166,12 @@ paired devices. Try again." A send of several files that did not all start fails
 with a sentence naming each file that did not go; over the control channel its reply still
 lists the sends that started and, under `outcomes`, how each file went.
 
+When the agent cannot answer for one of the panel's lists, the panel keeps showing that list
+as it last read it, and the file manager's menu and the settings keep their devices; the next
+read that works brings the list up to date. `catflap ui state --json` names the lists whose
+latest read failed under `unreadable` (`devices`, `clipboard`, `history`, `pause`), an empty
+array when all were read.
+
 ## Known limits
 
 - The footer shows whether the selected device answers (Reachable, Not reachable,

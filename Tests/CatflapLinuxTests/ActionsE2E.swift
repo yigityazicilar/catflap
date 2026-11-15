@@ -202,6 +202,68 @@ final class LinuxActionsE2E: XCTestCase {
         XCTAssertEqual(try session.describe().attachments, ["stays.txt"])
     }
 
+    /// The panel's reads of its lists fail while the store changes: the panel keeps showing the
+    /// device, the send button still names it, the clipboard rows and Dolphin's menu stay as
+    /// they were, and `ui state` names the lists it could not read. Readable again, the next
+    /// read shows the change and `ui state` names none.
+    func testAFailedListReadKeepsTheLastListsAndTheFileManagerMenu() throws {
+        let session = try ActionsSession()
+        // While this file exists, the panel's reads of the lists it names fail as an error from
+        // the agent would.
+        let fault = session.root.appendingPathComponent("lists-fault")
+        session.environment["CATFLAP_TEST_LISTS_FAULT"] = fault.path
+        try session.start()
+        try session.confirmShortcuts()
+        try session.pairWithCommandLine()
+        let device = try XCTUnwrap(session.devices().first)
+        let menu = session.root.appendingPathComponent("share/kio/servicemenus/io.github.yigityazicilar.Catflap.desktop")
+        XCTAssertTrue(session.eventually {
+            ((try? String(contentsOf: menu, encoding: .utf8)) ?? "").contains("send --to \(device.id) --file %f")
+        }, "Dolphin's menu does not list the paired device")
+        _ = try session.catflap(["clip", "add", "--text", "listed before the fault"])
+        _ = try session.catflap(["toggle"])
+        var before = try session.describe()
+        XCTAssertTrue(try session.eventually {
+            before = try session.describe()
+            return before.visible && before.devices == [device.name] && before.rows.contains { $0.contains("listed before the fault") }
+        }, "the open panel shows \(before.devices.count) devices and \(before.rows.count) clipboard rows")
+        XCTAssertTrue(before.sendLabel.hasSuffix("to \(device.name)"), "the send button does not name the device")
+        let menuBefore = try String(contentsOf: menu, encoding: .utf8)
+
+        let all = ["devices", "clipboard", "history", "pause"]
+        try (all.joined(separator: "\n") + "\n").write(to: fault, atomically: true, encoding: .utf8)
+        _ = try session.catflap(["clip", "add", "--text", "added while unreadable"])
+        let agentList = try ControlJSON.decoder.decode([ClipboardItem].self, from: session.catflap(["clip", "list"]))
+        XCTAssertTrue(agentList.contains { $0.text == "added while unreadable" }, "the agent does not list the new row")
+        // The store changed, so the panel reads its lists again: wait for that read.
+        var during = try session.describe()
+        XCTAssertTrue(try session.eventually(30) {
+            during = try session.describe()
+            return try session.unreadable() == all || during.devices != before.devices || during.rows != before.rows
+        }, "the panel did not read its lists again after the store changed")
+        XCTAssertTrue(during.devices == before.devices, "the panel shows \(during.devices.count) paired devices, \(before.devices.count) before")
+        XCTAssertTrue(during.sendLabel == before.sendLabel, "the send button says: \(during.sendLabel)")
+        XCTAssertTrue(during.rows == before.rows, "the panel shows \(during.rows.count) clipboard rows, \(before.rows.count) before")
+        let menuDuring = (try? String(contentsOf: menu, encoding: .utf8)) ?? ""
+        XCTAssertTrue(menuDuring == menuBefore,
+                      "Dolphin's menu was rewritten; it lists the device: \(menuDuring.contains("send --to \(device.id) --file %f"))")
+        XCTAssertEqual(try session.unreadable() ?? ["no field"], all)
+
+        // Readable again: the next read shows what changed meanwhile, and names no list.
+        try FileManager.default.removeItem(at: fault)
+        _ = try session.catflap(["clip", "add", "--text", "added once readable"])
+        var after = try session.describe()
+        XCTAssertTrue(try session.eventually(30) {
+            after = try session.describe()
+            return after.rows.contains { $0.contains("added while unreadable") } && after.rows.contains { $0.contains("added once readable") }
+        }, "the panel shows \(after.rows.count) clipboard rows after the lists became readable")
+        XCTAssertTrue(try session.eventually { try session.unreadable() == [] },
+                      "ui state names: \(((try? session.unreadable()) ?? nil)?.joined(separator: ",") ?? "no field")")
+        XCTAssertTrue(after.devices == before.devices, "the panel shows \(after.devices.count) paired devices, \(before.devices.count) before")
+        XCTAssertTrue(after.sendLabel == before.sendLabel, "the send button says: \(after.sendLabel)")
+        XCTAssertTrue(((try? String(contentsOf: menu, encoding: .utf8)) ?? "") == menuBefore, "Dolphin's menu changed")
+    }
+
     func testArrivalNotifiesQuietlyWithCopyAndShowInFolder() throws {
         let session = try ActionsSession()
         try session.start()

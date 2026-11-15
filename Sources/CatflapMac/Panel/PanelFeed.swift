@@ -4,32 +4,51 @@ import Foundation
 
 /// Reads the panel's lists from the agent it runs in: paired devices in the store's order
 /// (most recently sent to first), clipboard history and transfer history. Nothing is cached
-/// here; the panel asks again while it is open, so new rows appear without reopening it.
+/// here; the panel asks again while it is open, so new rows appear without reopening it, and
+/// keeps what it had for a list that could not be read.
 struct PanelFeed: Sendable {
     let runtime: AgentRuntime
 
+    /// A list is nil when it could not be read.
     struct Snapshot: Sendable {
-        var devices: [PanelDevice] = []
-        var clipboard: [PanelRow] = []
-        var history: [PanelRow] = []
+        var devices: [PanelDevice]? = []
+        var clipboard: [PanelRow]? = []
+        var history: [PanelRow]? = []
         var paused = false
+        /// The lists that could not be read, by name.
+        var unreadable: [String] {
+            [("devices", devices == nil), ("clipboard", clipboard == nil), ("history", history == nil)].filter { $0.1 }.map { $0.0 }
+        }
     }
 
-    func load(now: Date = Date()) async -> Snapshot {
+    /// `known` names history rows when the devices cannot be read. `failing` names the lists
+    /// whose reads fail as a store error would; only the test hooks set it
+    /// (`ui invoke test-fail-reads`).
+    func load(now: Date = Date(), known: [PanelDevice] = [], failing: Set<String> = []) async -> Snapshot {
         var snapshot = Snapshot()
         let store = await runtime.store
-        let summaries = ((try? await store.devices()) ?? []).map(DeviceSummary.init)
-        let pairing = await runtime.service(PairingService.self)
-        for device in summaries {
-            let check = await pairing?.checkStatus(deviceID: device.id)
-            snapshot.devices.append(PanelDevice(id: device.id, name: device.name, reach: Self.reach(check?.state)))
+        let stored = failing.contains("devices") ? nil : (try? await store.devices())
+        let summaries = stored?.map(DeviceSummary.init)
+        if let summaries {
+            let pairing = await runtime.service(PairingService.self)
+            var devices: [PanelDevice] = []
+            for device in summaries {
+                let check = await pairing?.checkStatus(deviceID: device.id)
+                devices.append(PanelDevice(id: device.id, name: device.name, reach: Self.reach(check?.state)))
+            }
+            snapshot.devices = devices
+        } else {
+            snapshot.devices = nil
         }
         if let clipboard = await runtime.service(ClipboardHistory.self) {
             snapshot.paused = await clipboard.isPaused()
-            snapshot.clipboard = ((try? await clipboard.items(now: now)) ?? []).map(Self.row)
+            let items = failing.contains("clipboard") ? nil : (try? await clipboard.items(now: now))
+            snapshot.clipboard = items?.map(Self.row)
         }
-        let names = Dictionary(summaries.map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
-        snapshot.history = ((try? await TransferHistory(store: store).rows()) ?? []).map { Self.row($0, names: names) }
+        let named = summaries?.map { ($0.id, $0.name) } ?? known.map { ($0.id, $0.name) }
+        let names = Dictionary(named, uniquingKeysWith: { first, _ in first })
+        let records = failing.contains("history") ? nil : (try? await TransferHistory(store: store).rows())
+        snapshot.history = records?.map { Self.row($0, names: names) }
         return snapshot
     }
 

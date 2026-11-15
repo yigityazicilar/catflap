@@ -63,6 +63,8 @@ final class PanelActions {
     /// The row action (Copy, Delete, Reveal) the panel started most recently.
     private var lastRowAction: Task<Void, Never>?
     private var deviceNames: [String: String] = [:]
+    /// The paired devices as last read, for the settings window while a read fails.
+    private var knownDevices: [DeviceSummary] = []
     private var stopped = false
     /// The registration `ui invoke test-hold-shortcut` made; test hooks only.
     var testHeldShortcut: HotKeyRegistrar.Registration?
@@ -123,35 +125,51 @@ final class PanelActions {
 
     // MARK: Devices
 
+    /// Reads the devices again for the names and the settings rows. A read that fails keeps the
+    /// devices last read, so neither empties for a moment.
     func refreshDevices() async {
-        let devices = ((try? await runtime.store.devices()) ?? []).map(DeviceSummary.init)
-        deviceNames = Dictionary(devices.map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
-        if let chosen = chosenDevice, deviceNames[chosen] == nil { chosenDevice = nil }
-        if let window = settingsWindow { window.render(settings, devices: devices, message: settingsMessage) }
+        if let list = await devices() {
+            knownDevices = list
+            deviceNames = Dictionary(list.map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
+            if let chosen = chosenDevice, deviceNames[chosen] == nil { chosenDevice = nil }
+        }
+        if let window = settingsWindow { window.render(settings, devices: knownDevices, message: settingsMessage) }
     }
 
-    func devices() async -> [DeviceSummary] {
-        ((try? await runtime.store.devices()) ?? []).map(DeviceSummary.init)
+    /// The paired devices as the store lists them now; nil when they could not be read.
+    func devices() async -> [DeviceSummary]? {
+        if MacTestHooks.failingReads.contains("devices") { return nil }
+        return (try? await runtime.store.devices())?.map(DeviceSummary.init)
     }
 
     func name(of deviceID: String) -> String { deviceNames[deviceID] ?? "the other device" }
 
+    /// What a send answers when the paired devices cannot be read.
+    static let unreadableDevices = "Catflap could not read your paired devices. Try again."
+
     /// A device by id or by name; without one, the device chosen in the panel, else the most
-    /// recently used one, which the store lists first.
-    func resolveDevice(_ text: String?) async -> DeviceSummary? {
-        let list = await devices()
-        if let text { return list.first { $0.id == text } ?? list.first { $0.name == text } }
-        if let chosen = chosenDevice, let device = list.first(where: { $0.id == chosen }) { return device }
-        return list.first
+    /// recently used one, which the store lists first. `missing` is the refusal when no device
+    /// matches; when the devices cannot be read, nothing is chosen and the refusal says so.
+    func resolveDevice(_ text: String?, missing: String) async -> Result<DeviceSummary, ActionRefusal> {
+        guard let list = await devices() else { return .failure(ActionRefusal(message: Self.unreadableDevices)) }
+        let found: DeviceSummary?
+        if let text { found = list.first { $0.id == text } ?? list.first { $0.name == text } }
+        else if let chosen = chosenDevice, let match = list.first(where: { $0.id == chosen }) { found = match }
+        else { found = list.first }
+        guard let device = found else { return .failure(ActionRefusal(message: missing)) }
+        return .success(device)
     }
 
     // MARK: Sending
 
-    /// Return or the send button in the panel.
+    /// Return or the send button in the panel. Nothing goes while the paired devices cannot be
+    /// read, as for a `ui invoke` send.
     func panelSend(_ payload: PanelPayload, to deviceID: String, keep: Bool) {
         let task = Task { [weak self] () -> Result<SendStart, ActionRefusal> in
             guard let self else { return .failure(ActionRefusal(message: "Catflap is stopping.")) }
-            let outcome = await self.send(payload, to: deviceID, keep: keep)
+            let outcome: Result<SendStart, ActionRefusal>
+            if await self.devices() == nil { outcome = .failure(ActionRefusal(message: Self.unreadableDevices)) }
+            else { outcome = await self.send(payload, to: deviceID, keep: keep) }
             switch outcome {
             case .success(let start):
                 // What was sent leaves the field, the attachment row and the selection. An
@@ -423,7 +441,7 @@ final class PanelActions {
     func attachFromElsewhere(_ urls: [URL]) {
         attach(urls)
         Task { [weak self] in
-            guard let self, let first = await self.devices().first else { return }
+            guard let self, let first = await self.devices()?.first else { return }
             self.chosenDevice = first.id
             self.controller.viewSelectDevice(first.id)
         }

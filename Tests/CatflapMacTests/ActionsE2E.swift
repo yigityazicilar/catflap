@@ -310,6 +310,14 @@ private func settingsField(_ payload: Data, _ name: String) -> String? {
     return (state["settings"] as? [String: Any])?[name].map { "\($0)" }
 }
 
+/// The lists `ui state`, or the `state` in an action's reply, says the panel could not read at
+/// its latest refresh; nil when the agent does not report them.
+private func unreadableLists(_ payload: Data) -> [String]? {
+    guard let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else { return nil }
+    let state = (object["state"] as? [String: Any]) ?? object
+    return state["unreadable"] as? [String]
+}
+
 /// The attached files an action's reply says did not start, each with its reason.
 private func notSentFiles(_ payload: Data) -> [(file: String, reason: String)] {
     guard let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
@@ -1606,6 +1614,102 @@ struct MacActionsE2E {
             let counts = (received.filter { $0.sha256 == goodHash }.count, received.filter { $0.sha256 == goneHash }.count)
             #expect(counts.0 == 1 && counts.1 == 1, "each file arrived exactly once: good=\(counts.0) second=\(counts.1)")
             print("MacActionsE2E two attachments: first_started=\(started.count) not_sent=\(notSent.count) attached_after=\(stateField(first.payload, "attachments") ?? "none") again=\(again.count) arrived good=\(counts.0) second=\(counts.1)")
+        }
+    }
+
+    // MARK: Lists that cannot be read
+
+    /// The panel's reads of its lists fail while the store changes: the panel still lists the
+    /// device, the send button still names it, the clipboard and history rows stay as they were,
+    /// and `ui state` names the lists it could not read. Readable again, the next read shows
+    /// the change and names none.
+    @Test func testAFailedListReadKeepsTheLastLists() async throws {
+        try await withAgents(hooks: true) { panel, peer in
+            let peer = try #require(peer)
+            try await pairFromPanel(panel, peer)
+            let peerName = try #require(try await actionsOffPool { try panel.devices().first?.name })
+            // The field filters the clipboard list to this test's own rows, and gives the send
+            // button something to name.
+            let token = "kept" + UUID().uuidString.prefix(8).lowercased()
+            let first = try await actionsOffPool { try panel.command(["clip", "add", "--text", token + " listed before"]) }
+            #expect(first.code == 0, "clip add: \(first.errorText)")
+            _ = try await actionsOffPool { try panel.reply("type", ["text": token]) }
+            let before = try await actionsOffPool {
+                try panel.waitFor("the open panel to list the device and the clipboard row") { () -> Data? in
+                    let payload = try panel.request("ui.state").payload
+                    let shown = stateField(payload, "devices") == "1" && stateField(payload, "list") == "clipboard" && stateField(payload, "rows") == "1"
+                    return shown ? payload : nil
+                }
+            }
+            #expect(stateField(before, "send_label")?.hasSuffix(" to \(peerName)") == true, "the send button names the device")
+
+            let all = ["devices", "clipboard", "history"]
+            let faulted = try await actionsOffPool { try panel.invoke("test-fail-reads", ["lists": all.joined(separator: ",")]) }
+            #expect(faulted.ok, "test-fail-reads: \(faulted.error ?? "")")
+            let added = try await actionsOffPool { try panel.command(["clip", "add", "--text", token + " added while unreadable"]) }
+            #expect(added.code == 0, "clip add: \(added.errorText)")
+            #expect(try await actionsOffPool { try panel.clipTexts() }.contains(token + " added while unreadable"), "the agent has the new row")
+            // The panel reads its lists again after the change, and they still cannot be read.
+            let read = try await actionsOffPool { try panel.invoke("test-fail-reads", ["lists": all.joined(separator: ",")]) }
+            #expect(read.ok, "test-fail-reads: \(read.error ?? "")")
+            let during = read.payload
+            #expect(stateField(during, "devices") == "1", "the panel lists \(stateField(during, "devices") ?? "no") paired devices")
+            #expect(stateField(during, "send_label") == stateField(before, "send_label"), "the send button says: \(stateField(during, "send_label") ?? "nothing")")
+            #expect(stateField(during, "rows") == "1" && stateField(during, "clipboard_rows") == stateField(before, "clipboard_rows"),
+                    "clipboard rows: \(stateField(during, "rows") ?? "none") of this test, \(stateField(during, "clipboard_rows") ?? "none") in all, \(stateField(before, "clipboard_rows") ?? "none") before")
+            #expect(stateField(during, "history_rows") == stateField(before, "history_rows"), "history rows: \(stateField(during, "history_rows") ?? "none")")
+            #expect(unreadableLists(during) == all, "ui state names: \(unreadableLists(during)?.joined(separator: ",") ?? "no field")")
+
+            // Readable again: the next read shows the row added meanwhile, and names no list.
+            let cleared = try await actionsOffPool { try panel.invoke("test-fail-reads", ["lists": ""]) }
+            #expect(cleared.ok, "test-fail-reads: \(cleared.error ?? "")")
+            let after = cleared.payload
+            #expect(stateField(after, "rows") == "2", "clipboard rows of this test once readable: \(stateField(after, "rows") ?? "none")")
+            #expect(stateField(after, "devices") == "1" && stateField(after, "send_label") == stateField(before, "send_label"), "the device once readable")
+            #expect(unreadableLists(after) == [], "ui state names: \(unreadableLists(after)?.joined(separator: ",") ?? "no field")")
+            print("MacActionsE2E unreadable lists: devices_during=\(stateField(during, "devices") ?? "none") rows_during=\(stateField(during, "rows") ?? "none") unreadable_during=\(unreadableLists(during)?.joined(separator: ",") ?? "no field") rows_after=\(stateField(after, "rows") ?? "none") unreadable_after=\(unreadableLists(after)?.joined(separator: ",") ?? "no field")")
+        }
+    }
+
+    /// Send while the paired devices cannot be read: nothing is sent, the panel says why, and
+    /// the field and the attached file stay. Readable again, Send sends the file and send-text
+    /// sends what the field still holds.
+    @Test func testASendWhileThePairedDevicesCannotBeReadSendsNothing() async throws {
+        try await withAgents(hooks: true) { panel, peer in
+            let peer = try #require(peer)
+            try await pairFromPanel(panel, peer)
+            let file = panel.directory.appendingPathComponent("stays-\(UUID().uuidString.prefix(6)).txt")
+            try Data(("stays attached " + UUID().uuidString).utf8).write(to: file)
+            let expected = try TransferInbox.hash(file)
+            let typed = "stays in the field " + UUID().uuidString
+            let attached = try await actionsOffPool { try panel.reply("attach", ["files": file.path]) }
+            #expect(attached.state.ui.attachments == 1, "the file is attached")
+            _ = try await actionsOffPool { try panel.reply("type", ["text": typed]) }
+            let unreadable = "Catflap could not read your paired devices. Try again."
+            let faulted = try await actionsOffPool { try panel.invoke("test-fail-reads", ["lists": "devices"]) }
+            #expect(faulted.ok, "test-fail-reads: \(faulted.error ?? "")")
+
+            let pressed = try await actionsOffPool { try panel.invoke("send") }
+            #expect(!pressed.ok && pressed.error == unreadable, "Send answered: \(pressed.error ?? "it sent")")
+            let typedSend = try await actionsOffPool { try panel.invoke("send-text") }
+            #expect(!typedSend.ok && typedSend.error == unreadable, "send-text answered: \(typedSend.error ?? "it sent")")
+            let state = try await actionsOffPool { try panel.request("ui.state").payload }
+            #expect(stateField(state, "attachments") == "1", "the attached file stays")
+            let line = stateField(state, "send_line") ?? ""
+            #expect(line.hasSuffix(unreadable), "the panel's line says: \(line)")
+            let sent = try await actionsOffPool { try panel.history() }.filter { $0.direction == "sent" }.count
+            #expect(sent == 0, "\(sent) sends started")
+
+            // Readable again: Send sends the file, and send-text the text the field kept.
+            let cleared = try await actionsOffPool { try panel.invoke("test-fail-reads", ["lists": ""]) }
+            #expect(cleared.ok, "test-fail-reads: \(cleared.error ?? "")")
+            let again = try await actionsOffPool { try panel.invoke("send") }
+            #expect(again.ok, "Send once readable: \(again.error ?? "")")
+            let arrived = try await row(on: peer, "the attached file on the peer") { $0.direction == "received" && $0.sha256 == expected }
+            let text = try await actionsOffPool { try panel.invoke("send-text") }
+            #expect(text.ok, "send-text once readable: \(text.error ?? "")")
+            let typedArrived = try await row(on: peer, "the field's text on the peer") { $0.direction == "received" && $0.text == typed }
+            print("MacActionsE2E unreadable devices: send=\(pressed.error == unreadable ? "refused" : pressed.error ?? "sent") send_text=\(typedSend.error == unreadable ? "refused" : typedSend.error ?? "sent") attachments_kept=\(stateField(state, "attachments") ?? "none") started=\(sent) file_after=\(arrived.status) text_after=\(typedArrived.status)")
         }
     }
 

@@ -15,6 +15,8 @@ final class StoreWatcher: @unchecked Sendable {
     private var seeded = false
     private var known: [String: String] = [:]
     private var devices: [DeviceSummary] = []
+    /// Whether `devices` holds a list the agent answered with, not the empty one it starts as.
+    private var devicesRead = false
     /// Sends the panel started and reports itself while it is shown.
     private var fromPanel: Set<String> = []
     private var reading = false
@@ -65,12 +67,12 @@ final class StoreWatcher: @unchecked Sendable {
         let runtime = controller.runtime, loop = controller.loop
         let snapshot = known
         task = Task { [weak self] in
-            async let history = PanelController.request([TransferRecord].self, "history", runtime)
-            async let paired = PanelController.request([DeviceSummary].self, "devices", runtime)
-            let rows = await history ?? [], list = await paired ?? []
+            async let history = PanelController.read([TransferRecord].self, list: "history", "history", runtime)
+            async let paired = PanelController.read([DeviceSummary].self, list: "devices", "devices", runtime)
+            let rows = await history, list = await paired
             var reasons: [String: String] = [:]
             // The sentence a failed send ended with is held in memory, not stored.
-            for row in rows where row.direction == "sent" && row.canRetry && snapshot[row.deviceID + "/" + row.id] != row.status {
+            for row in rows ?? [] where row.direction == "sent" && row.canRetry && snapshot[row.deviceID + "/" + row.id] != row.status {
                 if let status = await PanelController.request(TransferRecord.self, "send.status", runtime,
                                                               ["device_id": row.deviceID, "id": row.id]), let error = status.error {
                     reasons[row.deviceID + "/" + row.id] = error
@@ -86,21 +88,26 @@ final class StoreWatcher: @unchecked Sendable {
         }
     }
 
-    private func apply(_ rows: [TransferRecord], _ list: [DeviceSummary], _ reasons: [String: String]) {
+    /// Nil for a list that could not be read: it is left as it was, and compared again at the
+    /// next read that works.
+    private func apply(_ rows: [TransferRecord]?, _ list: [DeviceSummary]?, _ reasons: [String: String]) {
         let visible = controller.machine.mode != .hidden
-        if list.map({ $0.id + "\u{0}" + $0.name }) != devices.map({ $0.id + "\u{0}" + $0.name }) || !seeded {
+        // Only the agent's answer rewrites the file manager's menu and the settings rows, so a
+        // failed read never takes the devices out of them.
+        if let list, list.map({ $0.id + "\u{0}" + $0.name }) != devices.map({ $0.id + "\u{0}" + $0.name }) || !devicesRead {
             devices = list
+            devicesRead = true
             ServiceMenu.write(devices: list, executable: Autostart.executable)
             controller.settingsPage?.update(devices: list.map { PanelDevice(id: $0.id, name: $0.name) })
         }
         var sending = false
-        for row in rows {
+        for row in rows ?? [] {
             let key = row.deviceID + "/" + row.id
             let before = known[key]
             known[key] = row.status
             if row.status == "sending" { sending = true }
             guard seeded, before != row.status else { continue }
-            let name = list.first { $0.id == row.deviceID }?.name ?? "the other device"
+            let name = devices.first { $0.id == row.deviceID }?.name ?? "the other device"
             if row.direction == "received", row.status == "ok" {
                 controller.tray.set(.arrived)
                 controller.notifier.arrived(row, from: name)
@@ -117,7 +124,7 @@ final class StoreWatcher: @unchecked Sendable {
             }
         }
         if sending { controller.tray.set(.moving) }
-        seeded = true
+        if rows != nil { seeded = true }
         if visible { controller.refresh() }
     }
 }

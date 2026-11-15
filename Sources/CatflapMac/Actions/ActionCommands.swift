@@ -7,6 +7,9 @@ import CatflapCore
 /// they are unknown actions, and nothing is kept for them.
 enum MacTestHooks {
     static let on = ProcessInfo.processInfo.environment["CATFLAP_TEST_HOOKS"] == "on"
+    /// The panel's reads that fail as a store error would, by list (`devices`, `clipboard`,
+    /// `history`), as `ui invoke test-fail-reads` last set them. Always empty without the hooks.
+    @MainActor static var failingReads: Set<String> = []
 }
 
 /// The pairing in progress as `ui state` shows it. The code itself is never included.
@@ -192,8 +195,10 @@ extension PanelActions {
         case "send-text":
             let text = arguments["text"] ?? fieldText
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return refuse(ActionRefusal(message: "Type something to send.")) }
-            guard let device = await resolveDevice(arguments["device"] ?? arguments["device_id"]) else {
-                return refuse(ActionRefusal(message: "No paired device. Pair one first."))
+            let device: DeviceSummary
+            switch await resolveDevice(arguments["device"] ?? arguments["device_id"], missing: "No paired device. Pair one first.") {
+            case .success(let found): device = found
+            case .failure(let refusal): return refuse(refusal)
             }
             let outcome = await send(.text(text), to: device.id, keep: keep())
             if case .success = outcome, arguments["text"] == nil { controller.viewFilterChanged("") }
@@ -208,8 +213,10 @@ extension PanelActions {
             guard let item = wanted.flatMap({ id in items.first { $0.id == id } }) ?? (wanted == nil ? items.first : nil) else {
                 return refuse(ActionRefusal(message: wanted == nil ? "Clipboard history is empty." : "That clipboard item is gone."))
             }
-            guard let device = await resolveDevice(arguments["device"] ?? arguments["device_id"]) else {
-                return refuse(ActionRefusal(message: "No paired device. Pair one first."))
+            let device: DeviceSummary
+            switch await resolveDevice(arguments["device"] ?? arguments["device_id"], missing: "No paired device. Pair one first.") {
+            case .success(let found): device = found
+            case .failure(let refusal): return refuse(refusal)
             }
             let outcome = await send(.row(PanelFeed.row(item)), to: device.id, keep: keep())
             if case .success = outcome, selectedRow == item.id {
@@ -324,8 +331,10 @@ extension PanelActions {
             return await answer(action)
 
         case "remove":
-            guard let device = await resolveDevice(arguments["device"] ?? arguments["device_id"] ?? "") else {
-                return refuse(ActionRefusal(message: "No paired device has that id or name."))
+            let device: DeviceSummary
+            switch await resolveDevice(arguments["device"] ?? arguments["device_id"] ?? "", missing: "No paired device has that id or name.") {
+            case .success(let found): device = found
+            case .failure(let refusal): return refuse(refusal)
             }
             if let refusal = await removeDevice(device.id) { return refuse(refusal) }
             return await answer(action)
@@ -401,6 +410,15 @@ extension PanelActions {
 
         case "test-release-shortcut" where MacTestHooks.on:
             releaseTestHeldShortcut()
+            return await answer(action)
+
+        case "test-fail-reads" where MacTestHooks.on:
+            // The panel's reads of the lists named in `lists` (comma-separated) fail as a store
+            // error would, until the next call; none named makes them work again. The panel
+            // reads its lists once more before the answer, so the answer shows that read.
+            MacTestHooks.failingReads = Set((arguments["lists"] ?? "").split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
+            await controller.reloadListsNow()
             return await answer(action)
 
         default:
