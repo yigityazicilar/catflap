@@ -2,6 +2,7 @@
 @testable import CatflapMac
 import AppKit
 import CatflapCore
+import CryptoKit
 import Darwin
 import Foundation
 import Testing
@@ -175,16 +176,52 @@ private final class ActionsAgent: @unchecked Sendable {
         throw ActionsTestError.timeout(what)
     }
 
+    /// Saves the preferences domain the agent writes to, once, so `close` can put it back.
+    /// `start` does it too; a test that changes the domain before the agent starts calls it first.
+    func savePreferences() throws {
+        guard !preferencesSaved else { return }
+        let export = try actionsRun("/usr/bin/defaults", ["export", domain, "-"], in: directory)
+        savedPreferences = export.code == 0 ? export.output : nil
+        preferencesSaved = true
+    }
+
+    /// Writes `value` as text under `key` in the agent's preferences domain, or deletes the key
+    /// when it is nil. The domain is saved first, so `close` puts it back.
+    func writePreference(_ key: String, _ value: String?) throws {
+        try savePreferences()
+        let arguments = value.map { ["write", domain, key, "-string", $0] } ?? ["delete", domain, key]
+        let result = try actionsRun("/usr/bin/defaults", arguments, in: directory)
+        // Deleting a key that is not there is no failure.
+        guard result.code == 0 || value == nil else { throw ActionsTestError.startup("defaults \(arguments[0]) exited \(result.code)") }
+    }
+
+    /// How the agent's last run ended: its exit status, or 128 plus the signal that ended it.
+    private(set) var exitStatus: Int32?
+
+    func clipTexts() throws -> [String] { try request("clip.list").decode([ClipboardItem].self).compactMap(\.text) }
+
+    /// The files in the agent's data folder (its database and write-ahead log included) that
+    /// hold `text`, by name.
+    func filesContaining(_ text: String) -> [String] {
+        let needle = Data(text.utf8)
+        guard let walk = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [.isRegularFileKey]) else {
+            return ["(the data folder could not be read)"]
+        }
+        var found: [String] = []
+        while let url = walk.nextObject() as? URL {
+            guard (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true,
+                  let data = try? Data(contentsOf: url), data.range(of: needle) != nil else { continue }
+            found.append(url.lastPathComponent)
+        }
+        return found
+    }
+
     /// `errors`, when given, keeps the agent's standard error there; a failed start quotes its end.
     /// `launcher`, when given, starts the agent through another program (sandbox-exec), with
     /// the agent's executable as its first argument; other commands still run it directly.
     func start(environment extra: [String: String] = [:], arguments prefix: [String] = [], errors: URL? = nil,
                launcher: (URL, [String])? = nil) throws {
-        if !preferencesSaved {
-            let export = try actionsRun("/usr/bin/defaults", ["export", domain, "-"], in: directory)
-            savedPreferences = export.code == 0 ? export.output : nil
-            preferencesSaved = true
-        }
+        try savePreferences()
         let child = Process()
         child.executableURL = executable
         child.arguments = prefix + ["agent", "--data-dir", directory.path]
@@ -223,11 +260,12 @@ private final class ActionsAgent: @unchecked Sendable {
         process = nil
         if child.isRunning { child.terminate() }
         // The wait only catches a hang: a slow runner must not fail this.
-        guard actionsWait(child, seconds: 30) != nil else {
+        guard let status = actionsWait(child, seconds: 30) else {
             FileHandle.standardError.write(Data("harness-error: actions agent failed to stop within 30 s\n".utf8))
             kill(child.processIdentifier, SIGKILL); _ = actionsWait(child, seconds: 5)
             return ["Actions agent failed to stop within 30 s"]
         }
+        exitStatus = status
         return []
     }
 
@@ -235,13 +273,15 @@ private final class ActionsAgent: @unchecked Sendable {
     func close() -> [String] {
         var problems = stop()
         if preferencesSaved {
-            if let saved = savedPreferences {
+            // The domain exactly as it was: what the run wrote goes, then what was there comes
+            // back. An import over it alone would keep the keys the run added.
+            _ = try? actionsRun("/usr/bin/defaults", ["delete", domain], in: directory)
+            if let saved = savedPreferences,
+               let values = try? PropertyListSerialization.propertyList(from: saved, format: nil) as? [String: Any], !values.isEmpty {
                 let file = directory.appendingPathComponent("preferences.plist")
                 if (try? saved.write(to: file)) != nil {
                     _ = try? actionsRun("/usr/bin/defaults", ["import", domain, file.path], in: directory)
                 }
-            } else {
-                _ = try? actionsRun("/usr/bin/defaults", ["delete", domain], in: directory)
             }
         }
         if FileManager.default.fileExists(atPath: directory.path) {
@@ -261,6 +301,75 @@ private func stateField(_ payload: Data, _ name: String) -> String? {
     guard let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else { return nil }
     let state = (object["state"] as? [String: Any]) ?? object
     return state[name].map { "\($0)" }
+}
+
+/// One of the settings in `ui state` (the object the settings window shows), as text.
+private func settingsField(_ payload: Data, _ name: String) -> String? {
+    guard let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else { return nil }
+    let state = (object["state"] as? [String: Any]) ?? object
+    return (state["settings"] as? [String: Any])?[name].map { "\($0)" }
+}
+
+/// The attached files an action's reply says did not start, each with its reason.
+private func notSentFiles(_ payload: Data) -> [(file: String, reason: String)] {
+    guard let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+          let list = object["not_sent"] as? [[String: Any]] else { return [] }
+    return list.map { (file: $0["file"] as? String ?? "", reason: $0["reason"] as? String ?? "") }
+}
+
+/// Catflap.app as bundle.sh builds it from this build, copied away from the build, and the
+/// sandbox profile that keeps the checkout out of reach of whatever runs under it.
+private struct InstalledApp: Sendable {
+    let folders: [URL]
+    let app: URL
+    let profile: String
+    var binary: URL { app.appendingPathComponent("Contents/MacOS/catflap") }
+    var launcher: (URL, [String]) { (URL(fileURLWithPath: "/usr/bin/sandbox-exec"), ["-p", profile]) }
+    var folder: URL { folders[folders.count - 1] }
+
+    static func make() throws -> InstalledApp {
+        let executable = try locateExecutable()
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .resolvingSymlinksInPath()
+        let output = try scratchDirectory("cq-"), moved = try scratchDirectory("cr-")
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "CATFLAP_SIGN_IDENTITY")
+        let bundle = try actionsRun("/bin/bash", [root.appendingPathComponent("packaging/macos/bundle.sh").path, "--binary", executable.path,
+                                                  "--output", output.path], environment: environment, in: output, seconds: 120)
+        guard bundle.code == 0 else { throw ActionsTestError.startup("bundle.sh exited \(bundle.code): \(bundle.errorText.suffix(300))") }
+        let app = moved.appendingPathComponent("Catflap.app")
+        let copy = try actionsRun("/usr/bin/ditto", [output.appendingPathComponent("Catflap.app").path, app.path], in: moved)
+        guard copy.code == 0 else { throw ActionsTestError.startup("ditto exited \(copy.code)") }
+        return InstalledApp(folders: [output, moved], app: app, profile: "(version 1)(allow default)(deny file-read* (subpath \"\(root.path)\"))")
+    }
+
+    func remove() { for folder in folders { try? FileManager.default.removeItem(at: folder) } }
+}
+
+/// What a login-item agent leaves on this Mac: its launchd job, the default data folder and the
+/// Keychain item of that folder's identity. Every method blocks.
+private struct DefaultAgentTraces: Sendable {
+    static let label = "io.github.yigityazicilar.Catflap.agent"
+    let target = "gui/\(getuid())/\(Self.label)"
+    let data = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Catflap").standardizedFileURL
+    /// The Keychain account of the default folder's identity, as the agent names it.
+    var account: String { SHA256.hash(data: Data(data.path.utf8)).map { String(format: "%02x", $0) }.joined() }
+    let scratch: URL
+
+    /// Whether launchd has the job, and the process it runs, if one runs.
+    func job() -> (loaded: Bool, pid: pid_t?) {
+        guard let printed = try? actionsRun("/bin/launchctl", ["print", target], in: scratch), printed.code == 0 else { return (false, nil) }
+        let line = printed.text.components(separatedBy: "\n").first { $0.trimmingCharacters(in: .whitespaces).hasPrefix("pid = ") }
+        return (true, line.flatMap { pid_t($0.trimmingCharacters(in: .whitespaces).dropFirst(6)) })
+    }
+
+    var dataExists: Bool { FileManager.default.fileExists(atPath: data.path) }
+
+    func keychainItem() -> Bool {
+        (try? actionsRun("/usr/bin/security", ["find-generic-password", "-s", "Catflap.identity.v1", "-a", account], in: scratch))?.code == 0
+    }
+
+    static func alive(_ pid: pid_t) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
 }
 
 extension ActionsAgent {
@@ -565,7 +674,7 @@ struct MacActionsE2E {
             let sentLatest = latest
             _ = try await row(on: peer, "the latest copy on the peer") { $0.direction == "received" && $0.text == sentLatest }
             let state = try await actionsOffPool { try panel.state() }
-            #expect(state.actions.sendShortcut == "bound" && state.actions.sendShortcutKeys == "\u{2303}\u{2325}\u{21E7}Space")
+            #expect(state.actions.sendShortcut == "bound" && state.actions.sendShortcutKeys == "\u{2303}\u{2325}\u{21E7}\u{2318}Space")
 
             // Remove the peer in settings: this device forgets it.
             let peerID = try #require(try await actionsOffPool { try panel.devices().first?.id })
@@ -664,8 +773,8 @@ struct MacActionsE2E {
             print("MacActionsE2E app without arguments: skipped, it runs on CI only (it uses the default data folder)")
             return
         }
-        // Declared before testBundledAppIsSignedAndRunsWithoutTheCheckout, which this serialized
-        // suite runs later: its login item starts a real agent in the default folder.
+        // Declared before testBundledAppIsSignedAndRunsWithoutTheCheckout, whose login item, on
+        // CI, starts a real agent in the default folder (and erases what it made).
         guard !FileManager.default.fileExists(atPath: data.path) else {
             Issue.record("Catflap's default data folder already exists on this runner; the test leaves it alone")
             return
@@ -796,10 +905,8 @@ struct MacActionsE2E {
         print("MacActionsE2E bundle: rpaths=\(rpaths) outside_dependencies=\(outside.count) version_without_checkout_exit=\(ran[2].code) checkout_read_exit=\(ran[1].code)")
 
         // The agent as the app runs it, with the checkout still out of reach: nothing it loads
-        // may come from the build (KeyboardShortcuts' resource bundle, for one, is looked for
-        // beside the app and in the build directory only). A bundle, so notifications go to
-        // Notification Center and the login item can be switched. The app's preferences domain
-        // is saved and put back.
+        // may come from the build. A bundle, so notifications go to Notification Center and the
+        // login item can be switched. The app's preferences domain is saved and put back.
         let bundled = try ActionsAgent(platform: true, executable: installed.appendingPathComponent("Contents/MacOS/catflap"),
                                        domain: "io.github.yigityazicilar.Catflap")
         let agentErrors = moved.appendingPathComponent("agent-stderr.txt")
@@ -813,17 +920,96 @@ struct MacActionsE2E {
             #expect(state.actions.notificationDelivery == "notification_center")
             #expect(state.ui.statusItem, "the app shows its menu bar item")
             #expect(["off", "on", "requires_approval"].contains(state.actions.settings.startAtLogin), "login item: \(state.actions.settings.startAtLogin)")
+            if ProcessInfo.processInfo.environment["CI"] == "true" {
+                try await switchLoginItemOnAndOff(bundled, binary: installed.appendingPathComponent("Contents/MacOS/catflap"))
+            } else {
+                print("MacActionsE2E login item: not switched; that runs on CI only, where no login item, data or Keychain item of a person's can change")
+            }
+        } catch { failure = error }
+        let problems = (try? await actionsOffPool { bundled.close() }) ?? ["could not stop the bundled agent"]
+        for problem in problems { Issue.record(Comment(rawValue: problem)) }
+        if let failure { throw failure }
+    }
+
+    /// Start at login switched on and off in the installed app. Switching it on makes launchd
+    /// start a second agent, `catflap agent` in the default data folder, which makes an identity
+    /// and its Keychain item there. So this runs on CI only, and only when the runner has none of
+    /// these yet. Afterwards, after a failure as well, the job is stopped and only what it made is
+    /// erased, and nothing may be left: no job, no process, no default folder, no Keychain item.
+    private func switchLoginItemOnAndOff(_ bundled: ActionsAgent, binary: URL) async throws {
+        let traces = DefaultAgentTraces(scratch: bundled.directory)
+        let before = try await actionsOffPool { () -> (job: Bool, data: Bool, key: Bool, login: String) in
+            let login = try bundled.state().actions.settings.startAtLogin
+            return (traces.job().loaded, traces.dataExists, traces.keychainItem(), login)
+        }
+        guard !before.job, !before.data, !before.key, before.login == "off" else {
+            Issue.record("Catflap's login item, default data folder or Keychain item is already on this runner (job=\(before.job) data=\(before.data) keychain=\(before.key) login=\(before.login)); the test leaves them alone")
+            return
+        }
+        var pid: pid_t?
+        var failure: (any Error)?
+        do {
             let on = try await actionsOffPool { try bundled.invoke("set", ["key": "start_at_login", "value": "on"]) }
             let afterOn = try await actionsOffPool { try bundled.state().actions.settings.startAtLogin }
             if on.ok { #expect(["on", "requires_approval"].contains(afterOn)) }
             else { #expect(on.error?.hasPrefix("macOS did not change the login item") == true, "\(on.error ?? "")") }
+            var answered = false
+            if afterOn == "on" {
+                // launchd starts the job at once (RunAtLoad). Its agent answers once it has made
+                // its identity, so all it makes is there before it is stopped.
+                (pid, answered) = try await actionsOffPool { () -> (pid_t?, Bool) in
+                    var seen: pid_t?
+                    let ok = (try? bundled.waitFor("the login item's agent", seconds: 60) { () -> Bool? in
+                        if seen == nil { seen = traces.job().pid }
+                        let status = try? ControlClient.request(ControlRequest("status"), socket: traces.data.appendingPathComponent("control.sock"))
+                        return status?.ok == true ? true : nil
+                    }) ?? false
+                    return (seen ?? traces.job().pid, ok)
+                }
+            }
             let off = try await actionsOffPool { try bundled.invoke("set", ["key": "start_at_login", "value": "off"]) }
             let afterOff = try await actionsOffPool { try bundled.state().actions.settings.startAtLogin }
             #expect(off.ok && afterOff == "off", "the login item is off again: \(off.error ?? afterOff)")
-            print("MacActionsE2E login item: on_accepted=\(on.ok) state_on=\(afterOn) state_off=\(afterOff) refusal=\(on.error ?? "none")")
+            // What switching it off leaves by itself, before this test cleans up.
+            let seen = pid
+            let left = try await actionsOffPool { () -> String in
+                "job=\(traces.job().loaded) process=\(seen.map(DefaultAgentTraces.alive) ?? false) data=\(traces.dataExists) keychain=\(traces.keychainItem())"
+            }
+            print("MacActionsE2E login item: on_accepted=\(on.ok) state_on=\(afterOn) state_off=\(afterOff) refusal=\(on.error ?? "none") agent_started=\(pid != nil) agent_answered=\(answered) left_after_switching_off: \(left)")
         } catch { failure = error }
-        let problems = (try? await actionsOffPool { bundled.close() }) ?? ["could not stop the bundled agent"]
-        for problem in problems { Issue.record(Comment(rawValue: problem)) }
+
+        // The cleanup, after a failure too: the login item off, its job out of launchd, its
+        // process ended, and the identity and folder it made erased.
+        let started = pid
+        let residue = try await actionsOffPool { () -> [String] in
+            _ = try? bundled.invoke("set", ["key": "start_at_login", "value": "off"])
+            if traces.job().loaded { _ = try? actionsRun("/bin/launchctl", ["bootout", traces.target], in: traces.scratch) }
+            var problems: [String] = []
+            if let started {
+                // A hang guard only: launchd ends the job's process when the job goes.
+                let deadline = Date().addingTimeInterval(30)
+                while DefaultAgentTraces.alive(started), Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+                if DefaultAgentTraces.alive(started) {
+                    problems.append("the login item's agent did not end with its job")
+                    kill(started, SIGKILL)
+                }
+            }
+            if traces.dataExists {
+                let erased = try? actionsRun(binary.path, ["erase-identity", "--data-dir", traces.data.path], in: traces.scratch)
+                if erased?.code != 0 { problems.append("erase-identity of the default folder exited \(erased.map { "\($0.code)" } ?? "without starting")") }
+                try? FileManager.default.removeItem(at: traces.data)
+            }
+            if traces.keychainItem() {
+                _ = try? actionsRun("/usr/bin/security", ["delete-generic-password", "-s", "Catflap.identity.v1", "-a", traces.account], in: traces.scratch)
+            }
+            if traces.job().loaded { problems.append("the login item's launchd job is still there") }
+            if let started, DefaultAgentTraces.alive(started) { problems.append("the login item's agent still runs") }
+            if traces.dataExists { problems.append("the default data folder is still there") }
+            if traces.keychainItem() { problems.append("the default folder's Keychain item is still there") }
+            return problems
+        }
+        #expect(residue.isEmpty, "the login item left: \(residue)")
+        print("MacActionsE2E login item cleanup: left=\(residue.isEmpty ? "nothing" : residue.joined(separator: "; "))")
         if let failure { throw failure }
     }
 
@@ -988,6 +1174,357 @@ struct MacActionsE2E {
                 #expect(try await actionsOffPool { try panel.field("send_line") }?.hasPrefix("Not sent to \(peerName).") == true)
             }
         }
+    }
+
+    // MARK: Shortcuts
+
+    static let appDomain = "io.github.yigityazicilar.Catflap"
+    static let panelKey = "KeyboardShortcuts_togglePanel"
+    static let sendKey = "KeyboardShortcuts_sendClipboard"
+    static let panelDefault = TestShortcut.controlOptionCommand(TestShortcut.space)
+    static let sendDefault = TestShortcut.controlOptionCommand(TestShortcut.space, shift: true)
+
+    /// Presses `open` and then `send` on the keyboard, through the window server, with the panel
+    /// closed. `send` sends the clipboard, which fails here (nothing copied, or no device), and
+    /// the menu bar glyph shows cf-problem. Keys arrive in order, so by then `open` has been
+    /// handled, and the panel must be open and focused. On CI only: the runner lets the tests
+    /// post key events, and a person's own session gets no keys from a test.
+    private func pressShortcuts(_ agent: ActionsAgent, open: TestShortcut, send: TestShortcut, _ step: String) async throws {
+        guard ProcessInfo.processInfo.environment["CI"] == "true" else {
+            print("MacActionsE2E \(step): shortcut keys not pressed; that runs on CI only")
+            return
+        }
+        guard SystemKeys.canPost else {
+            Issue.record(Comment(rawValue: "\(step): this runner does not let the tests post key events"))
+            return
+        }
+        // Opening the panel clears cf-problem; it closes again before the keys.
+        let ready = try await actionsOffPool { () -> (String?, String?) in
+            _ = try agent.invoke("hide")
+            _ = try agent.invoke("toggle")
+            _ = try agent.invoke("hide")
+            return (try agent.field("mode"), try agent.field("glyph"))
+        }
+        #expect(ready.0 == "hidden" && ready.1 != "cf-problem", "\(step): a closed panel and no cf-problem before the keys")
+        let pressed = SystemKeys.press(open) && SystemKeys.press(send)
+        #expect(pressed, "\(step): the key events were made")
+        let after = try await actionsOffPool {
+            try agent.waitFor("\(step): what \(send) does", seconds: 30) { () -> Data? in
+                let payload = try agent.request("ui.state").payload
+                return stateField(payload, "glyph") == "cf-problem" ? payload : nil
+            }
+        }
+        let mode = stateField(after, "mode") ?? "none"
+        #expect(mode == "focused" && stateField(after, "has_focus") == "1", "\(step): \(open) opened the panel, focused, before \(send) was handled")
+        print("MacActionsE2E \(step): \(open) then \(send): mode=\(mode) glyph=cf-problem")
+        _ = try await actionsOffPool { try agent.invoke("hide") }
+    }
+
+    /// A shortcut refused inside the agent's own process is a conflict that the installed app
+    /// reports and survives, with the checkout out of reach. Before the agent starts, both
+    /// shortcuts are set to one combination, written as KeyboardShortcuts wrote it: the panel's
+    /// registration takes it, and the second registration is refused (eventHotKeyExistsErr).
+    /// The agent goes on answering the command line and changing settings. Rebound to a free
+    /// combination, the refused shortcut works, and the panel's still does.
+    @Test func testARefusedShortcutIsAConflictTheInstalledAgentSurvives() async throws {
+        let installed = try await actionsOffPool { try InstalledApp.make() }
+        defer { installed.remove() }
+        let taken = TestShortcut.controlOptionCommand(TestShortcut.letterJ)
+        let free = TestShortcut.controlOptionCommand(TestShortcut.letterL)
+        let agent = try ActionsAgent(platform: true, executable: installed.binary, domain: Self.appDomain)
+        let errors = installed.folder.appendingPathComponent("agent-stderr.txt")
+        var failure: (any Error)?
+        do {
+            try await actionsOffPool {
+                for key in [Self.panelKey, Self.sendKey] { try agent.writePreference(key, taken.preference) }
+                try agent.start(errors: errors, launcher: installed.launcher)
+            }
+            let first = try await actionsOffPool { try agent.request("ui.state").payload }
+            print("MacActionsE2E refused shortcut: panel=\(stateField(first, "shortcut") ?? "none") send=\(stateField(first, "send_shortcut") ?? "none")")
+            #expect(stateField(first, "shortcut") == "bound" && stateField(first, "shortcut_keys") == taken.description, "the panel's registration holds \(taken)")
+            #expect(stateField(first, "send_shortcut") == "conflict", "the refused registration is a conflict, not bound")
+            #expect(stateField(first, "send_shortcut_keys") == taken.description)
+            #expect(settingsField(first, "send_shortcut_state") == "conflict", "settings show the conflict")
+            #expect(settingsField(first, "panel_shortcut_state") == "bound")
+
+            // The agent goes on: it answers the command line, and a setting changes.
+            let status = try await actionsOffPool {
+                try actionsRun("/usr/bin/sandbox-exec", ["-p", installed.profile, installed.binary.path, "status", "--data-dir", agent.directory.path, "--json"],
+                               in: agent.directory)
+            }
+            #expect(status.code == 0, "catflap status beside a refused shortcut: \(status.errorText)")
+            let changed = try await actionsOffPool { try agent.reply("set", ["key": "hover_band", "value": "off"]) }
+            #expect(!changed.state.actions.settings.hoverBand, "a settings change beside a refused shortcut")
+
+            // Rebound to a free combination, the refused one is bound; the panel's keeps its own.
+            let rebound = try await actionsOffPool { try agent.invoke("set", ["key": "send_shortcut", "value": "ctrl+option+cmd+l"]) }
+            #expect(rebound.ok, "rebinding the refused shortcut: \(rebound.error ?? "")")
+            let after = try await actionsOffPool { try agent.request("ui.state").payload }
+            #expect(stateField(after, "send_shortcut") == "bound" && stateField(after, "send_shortcut_keys") == free.description)
+            #expect(settingsField(after, "send_shortcut_state") == "bound")
+            #expect(stateField(after, "shortcut") == "bound" && stateField(after, "shortcut_keys") == taken.description)
+            try await pressShortcuts(agent, open: taken, send: free, "refused shortcut rebound")
+            // A rebind onto what the other one holds is refused, and the panel's stays as it was.
+            let clash = try await actionsOffPool { try agent.invoke("set", ["key": "panel_shortcut", "value": "ctrl+option+cmd+l"]) }
+            #expect(!clash.ok, "a combination the other shortcut holds is refused")
+            let kept = try await actionsOffPool { try agent.request("ui.state").payload }
+            #expect(stateField(kept, "shortcut") == "bound" && stateField(kept, "shortcut_keys") == taken.description)
+            try await pressShortcuts(agent, open: taken, send: free, "after a refused rebind")
+        } catch { failure = error }
+        let problems = try await actionsOffPool { agent.close() }
+        for problem in problems { Issue.record(Comment(rawValue: problem)) }
+        let said = (try? String(contentsOf: errors, encoding: .utf8)) ?? ""
+        let fatal = said.contains("Fatal error") || said.contains("could not load resource bundle")
+        print("MacActionsE2E refused shortcut: agent_exit=\(agent.exitStatus.map { "\($0)" } ?? "none") fatal_in_stderr=\(fatal)")
+        #expect(!fatal, "the agent did not stop on a refused shortcut")
+        #expect(agent.exitStatus == 0, "the agent stops cleanly on SIGTERM")
+        if let failure { throw failure }
+    }
+
+    /// The default shortcuts, ⌃⌥⌘Space for the panel and ⌃⌥⇧⌘Space to send the clipboard, are
+    /// free of macOS's own shortcuts on this Mac, register, and work. (The earlier ⌃⌥Space is
+    /// macOS's Select next source in Input menu.)
+    @Test func testDefaultShortcutsAreFreeOfMacOSAndWork() async throws {
+        let system = SystemKeys.systemShortcuts()
+        let candidates = [TestShortcut.controlOption(TestShortcut.space), Self.panelDefault, TestShortcut.controlOptionCommand(TestShortcut.letterK),
+                          Self.sendDefault, TestShortcut.controlOptionCommand(TestShortcut.letterK, shift: true)]
+        let listed = candidates.map { candidate -> String in "\(candidate)=" + (system.contains(candidate) ? "macOS" : "free") }
+        print("MacActionsE2E macOS shortcuts: \(system.count) enabled; \(listed.joined(separator: " ")) post_events=\(SystemKeys.canPost)")
+        #expect(!system.contains(Self.panelDefault) && !system.contains(Self.sendDefault), "macOS has no shortcut of its own on the defaults")
+        let agent = try ActionsAgent(platform: true)
+        var failure: (any Error)?
+        do {
+            try await actionsOffPool {
+                for key in [Self.panelKey, Self.sendKey] { try agent.writePreference(key, nil) }
+                try agent.start()
+            }
+            let state = try await actionsOffPool { try agent.request("ui.state").payload }
+            #expect(stateField(state, "shortcut") == "bound" && stateField(state, "shortcut_keys") == Self.panelDefault.description,
+                    "panel: \(stateField(state, "shortcut") ?? "none") \(stateField(state, "shortcut_keys") ?? "")")
+            #expect(stateField(state, "send_shortcut") == "bound" && stateField(state, "send_shortcut_keys") == Self.sendDefault.description,
+                    "send: \(stateField(state, "send_shortcut") ?? "none") \(stateField(state, "send_shortcut_keys") ?? "")")
+            try await pressShortcuts(agent, open: Self.panelDefault, send: Self.sendDefault, "default shortcuts")
+        } catch { failure = error }
+        let problems = try await actionsOffPool { agent.close() }
+        for problem in problems { Issue.record(Comment(rawValue: problem)) }
+        if let failure { throw failure }
+    }
+
+    /// A combination macOS keeps for one of its own enabled shortcuts is never claimed bound:
+    /// the panel's shortcut, set to one of this Mac's before the agent starts, is a conflict.
+    /// The agent still answers, and rebound to a free combination the panel opens on it.
+    @Test func testAShortcutMacOSKeepsIsAConflictUntilRebound() async throws {
+        let system = SystemKeys.systemShortcuts()
+        guard let taken = system.first(where: { $0.modifiers != 0 && $0 != Self.panelDefault && $0 != Self.sendDefault }) else {
+            Issue.record(Comment(rawValue: "this Mac lists no enabled macOS shortcut with modifiers (\(system.count) enabled) to test against"))
+            return
+        }
+        let agent = try ActionsAgent(platform: true)
+        var failure: (any Error)?
+        do {
+            try await actionsOffPool {
+                try agent.writePreference(Self.panelKey, taken.preference)
+                try agent.writePreference(Self.sendKey, nil)
+                try agent.start()
+            }
+            let first = try await actionsOffPool { try agent.request("ui.state").payload }
+            print("MacActionsE2E macOS shortcut \(taken): panel=\(stateField(first, "shortcut") ?? "none")")
+            #expect(stateField(first, "shortcut") == "conflict", "\(taken), which macOS keeps, is not claimed bound")
+            #expect(settingsField(first, "panel_shortcut_state") == "conflict", "settings show the conflict")
+            #expect(stateField(first, "send_shortcut") == "bound")
+            let status = try await actionsOffPool { try agent.request("status") }
+            #expect(status.ok, "the agent still answers")
+            let rebound = try await actionsOffPool { try agent.invoke("set", ["key": "panel_shortcut", "value": "ctrl+option+cmd+space"]) }
+            #expect(rebound.ok, "rebinding to a free combination: \(rebound.error ?? "")")
+            let after = try await actionsOffPool { try agent.request("ui.state").payload }
+            #expect(stateField(after, "shortcut") == "bound" && stateField(after, "shortcut_keys") == Self.panelDefault.description)
+            try await pressShortcuts(agent, open: Self.panelDefault, send: Self.sendDefault, "rebound from a macOS shortcut")
+        } catch { failure = error }
+        let problems = try await actionsOffPool { agent.close() }
+        for problem in problems { Issue.record(Comment(rawValue: problem)) }
+        if let failure { throw failure }
+    }
+
+    // MARK: Don't keep, copied
+
+    /// Waits until the general pasteboard holds `text`; the deadline only guards against a hang.
+    private func waitForPasteboard(_ text: String, _ what: String) async throws {
+        let deadline = Date().addingTimeInterval(30)
+        while await MainActor.run(body: { NSPasteboard.general.string(forType: .string) }) != text {
+            guard Date() < deadline else { throw ActionsTestError.timeout(what) }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
+    /// `text` sent from `peer` to the panel agent, kept or not; returns its history row on the
+    /// panel (`device/id`) once it has arrived.
+    private func receive(_ text: String, keep: Bool, from peer: ActionsAgent, on panel: ActionsAgent, to panelID: String) async throws -> String {
+        let sent = try await actionsOffPool { try peer.command(["send", "--to", panelID, "--text", text] + (keep ? [] : ["--dont-keep"])) }
+        #expect(sent.code == 0, "send from the peer: \(sent.errorText)")
+        let id = try ControlJSON.decoder.decode(TransferRecord.self, from: sent.output).id
+        let arrived = try await row(on: panel, "the peer's text on the panel") { $0.direction == "received" && $0.id == id }
+        #expect(arrived.keep == keep)
+        return arrived.deviceID + "/" + arrived.id
+    }
+
+    /// `text`, a text that was not kept and that the panel agent put on the clipboard, is marked
+    /// concealed, and clipboard history never reads or keeps it. The send-clipboard shortcut
+    /// reads the clipboard first, so by its answer the watcher has judged this copy: marked,
+    /// which it decides from the types alone, before reading any content, so there is nothing to
+    /// send. An ordinary copy after it, once recorded, shows the watcher has gone past it; then
+    /// nothing of `text` may be in history or in any file of the agent's data.
+    private func expectConcealedAndUnrecorded(_ text: String, on panel: ActionsAgent, _ step: String) async throws {
+        let (held, concealed) = await MainActor.run { () -> (Bool, Bool) in
+            let board = NSPasteboard.general
+            return (board.string(forType: .string) == text, board.types?.contains(.init("org.nspasteboard.ConcealedType")) ?? false)
+        }
+        #expect(held, "\(step): the text is on the clipboard")
+        #expect(concealed, "\(step): it is marked concealed")
+        let latest = try await actionsOffPool { try panel.invoke("send-latest") }
+        #expect(!latest.ok && latest.error == ClipboardFailure.latestMarked.rawValue,
+                "\(step): clipboard history judged it marked, unread: \(latest.ok ? "it was read, recorded and sent" : latest.error ?? "")")
+        let barrier = "ordinary copy " + UUID().uuidString
+        await MainActor.run {
+            NSPasteboard.general.clearContents()
+            _ = NSPasteboard.general.setString(barrier, forType: .string)
+        }
+        _ = try await actionsOffPool {
+            try panel.waitFor("\(step): the ordinary copy in clipboard history") { try panel.clipTexts().contains(barrier) ? true : nil }
+        }
+        let listed = try await actionsOffPool { try panel.clipTexts() }
+        #expect(!listed.contains(text), "\(step): not in clipboard history")
+        let files = try await actionsOffPool { panel.filesContaining(text) }
+        #expect(files.isEmpty, "\(step): in no file of the agent's data: \(files)")
+        print("MacActionsE2E don't-keep copy (\(step)): concealed=\(concealed) sent_by_shortcut=\(latest.ok) recorded=\(listed.contains(text)) files_holding_it=\(files.count)")
+    }
+
+    /// Copy of a received text that was not kept (Don't keep on the sender) puts it on the
+    /// clipboard marked concealed, so clipboard history never reads or records it: from its row
+    /// (the notification's Copy runs the same action), and on arrival with Put received text
+    /// on the clipboard on. A kept text stays an ordinary copy, which history records.
+    @Test func testDontKeepTextCopiedHereIsConcealedAndNeverRecorded() async throws {
+        let saved = try await MainActor.run { try PasteboardSnapshot() }
+        var failure: (any Error)?
+        do {
+            try await withAgents { panel, peer in
+                let peer = try #require(peer)
+                try await pairFromPanel(panel, peer)
+                let panelID = try #require(try await actionsOffPool { try peer.devices().first?.id })
+
+                let copiedText = "not kept, copied " + UUID().uuidString
+                let rowID = try await receive(copiedText, keep: false, from: peer, on: panel, to: panelID)
+                let copied = try await actionsOffPool { try panel.invoke("copy", ["id": rowID]) }
+                #expect(copied.ok, "copy: \(copied.error ?? "")")
+                try await expectConcealedAndUnrecorded(copiedText, on: panel, "Copy")
+
+                let on = try await actionsOffPool { try panel.invoke("set", ["key": "received_text_to_clipboard", "value": "on"]) }
+                #expect(on.ok, "received text to the clipboard: \(on.error ?? "")")
+                let arrivedText = "not kept, arrived " + UUID().uuidString
+                _ = try await receive(arrivedText, keep: false, from: peer, on: panel, to: panelID)
+                try await waitForPasteboard(arrivedText, "the text that was not kept on the clipboard")
+                try await expectConcealedAndUnrecorded(arrivedText, on: panel, "received text to the clipboard")
+
+                let keptText = "kept, arrived " + UUID().uuidString
+                _ = try await receive(keptText, keep: true, from: peer, on: panel, to: panelID)
+                try await waitForPasteboard(keptText, "the kept text on the clipboard")
+                let ordinary = await MainActor.run { !(NSPasteboard.general.types?.contains(.init("org.nspasteboard.ConcealedType")) ?? false) }
+                #expect(ordinary, "a kept text is an ordinary copy")
+                let recorded = try await actionsOffPool {
+                    try panel.waitFor("the kept text in clipboard history") { try panel.clipTexts().contains(keptText) ? true : nil }
+                }
+                #expect(recorded, "clipboard history records a kept text")
+            }
+        } catch { failure = error }
+        await MainActor.run { saved.restore() }
+        if let failure { throw failure }
+    }
+
+    // MARK: Several files
+
+    /// Two attached files, one of them gone just before Send: the reply names the file that did
+    /// not start and why, the other goes once, and only the one that did not start stays
+    /// attached, so Send again sends just that one. Every file arrives exactly once.
+    @Test func testTwoAttachmentsOneGoneBeforeSendReportEachFile() async throws {
+        try await withAgents { panel, peer in
+            let peer = try #require(peer)
+            try await pairFromPanel(panel, peer)
+            let suffix = String(UUID().uuidString.prefix(6))
+            let good = panel.directory.appendingPathComponent("good-\(suffix).txt")
+            let gone = panel.directory.appendingPathComponent("gone-\(suffix).txt")
+            try Data(("good file " + UUID().uuidString).utf8).write(to: good)
+            let goneBytes = Data(("gone file " + UUID().uuidString).utf8)
+            try goneBytes.write(to: gone)
+            let goodHash = try TransferInbox.hash(good), goneHash = try TransferInbox.hash(gone)
+            let attached = try await actionsOffPool { try panel.reply("attach", ["files": good.path + "\n" + gone.path]) }
+            #expect(attached.state.ui.attachments == 2)
+            try FileManager.default.removeItem(at: gone)
+
+            let first = try await actionsOffPool { try panel.invoke("send") }
+            #expect(first.ok, "a send in which one file started is not refused: \(first.error ?? "")")
+            let notSent = notSentFiles(first.payload)
+            #expect(notSent.map { $0.file } == [gone.path] && notSent.first?.reason == "Cannot read that file.",
+                    "the reply names the file that did not start, and why: \(notSent.map { URL(fileURLWithPath: $0.file).lastPathComponent + ": " + $0.reason })")
+            let started = (try? first.decode(ActionsReply.self).transfers) ?? []
+            #expect(started.count == 1 && started.first?.kind == "file", "the other file started")
+            #expect(stateField(first.payload, "attachments") == "1", "only the file that did not start stays attached")
+            let line = stateField(first.payload, "send_line") ?? ""
+            #expect(line.contains(gone.lastPathComponent), "the panel's line names the file not sent: \(line)")
+            _ = try await row(on: peer, "the good file on the peer") { $0.direction == "received" && $0.sha256 == goodHash }
+
+            try goneBytes.write(to: gone)
+            let second = try await actionsOffPool { try panel.invoke("send") }
+            #expect(second.ok, "Send again: \(second.error ?? "")")
+            let again = (try? second.decode(ActionsReply.self).transfers) ?? []
+            #expect(again.count == 1, "Send again sends only the file that did not start")
+            #expect(stateField(second.payload, "attachments") == "0")
+            _ = try await row(on: peer, "the second file on the peer") { $0.direction == "received" && $0.sha256 == goneHash }
+            // Every send has ended (its row is ok on the panel), so the peer has all it will get.
+            for id in (started + again).map(\.id) {
+                _ = try await row(on: panel, "a sent file's row on the panel") { $0.direction == "sent" && $0.id == id }
+            }
+            let received = try await actionsOffPool { try peer.history() }.filter { $0.direction == "received" }
+            let counts = (received.filter { $0.sha256 == goodHash }.count, received.filter { $0.sha256 == goneHash }.count)
+            #expect(counts.0 == 1 && counts.1 == 1, "each file arrived exactly once: good=\(counts.0) second=\(counts.1)")
+            print("MacActionsE2E two attachments: first_started=\(started.count) not_sent=\(notSent.count) attached_after=\(stateField(first.payload, "attachments") ?? "none") again=\(again.count) arrived good=\(counts.0) second=\(counts.1)")
+        }
+    }
+
+    // MARK: Opening the app again
+
+    /// Opening Catflap.app while it runs, as Finder does (`open` on the running app), brings up
+    /// the running agent's panel, focused, and starts no second agent. The arguments given to
+    /// `open` reach only a newly started copy, which would find this agent's data folder locked
+    /// and stop, so no default data folder is ever used.
+    @Test func testOpeningTheRunningAppShowsItsPanelFocused() async throws {
+        let installed = try await actionsOffPool { try InstalledApp.make() }
+        defer { installed.remove() }
+        let agent = try ActionsAgent(platform: true, executable: installed.binary, domain: Self.appDomain)
+        var failure: (any Error)?
+        do {
+            try await actionsOffPool { try agent.start() }
+            let before = try await actionsOffPool { try agent.request("ui.state").payload }
+            #expect(stateField(before, "visible") == "0", "the panel starts closed")
+            let opened = try await actionsOffPool {
+                try actionsRun("/usr/bin/open", [installed.app.path, "--args", "agent", "--data-dir", agent.directory.path], in: agent.directory, seconds: 60)
+            }
+            #expect(opened.code == 0, "open: \(opened.errorText)")
+            // AppKit's reopen event is counted once the panel has been shown for it.
+            let after = try await actionsOffPool {
+                try agent.waitFor("the running app's reopen event", seconds: 30) { () -> Data? in
+                    let payload = try agent.request("ui.state").payload
+                    return (stateField(payload, "reopens").flatMap { Int($0) } ?? 0) >= 1 ? payload : nil
+                }
+            }
+            #expect(stateField(after, "mode") == "focused" && stateField(after, "has_focus") == "1", "the panel is open and focused")
+            let running = await MainActor.run { NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == Self.appDomain }.count }
+            #expect(running == 1, "one Catflap runs: \(running)")
+            #expect(try await actionsOffPool { try agent.request("status") }.ok, "the agent still answers")
+            print("MacActionsE2E reopen: open_exit=\(opened.code) mode=\(stateField(after, "mode") ?? "none") has_focus=\(stateField(after, "has_focus") ?? "none") running=\(running)")
+            _ = try await actionsOffPool { try agent.invoke("hide") }
+        } catch { failure = error }
+        let problems = try await actionsOffPool { agent.close() }
+        for problem in problems { Issue.record(Comment(rawValue: problem)) }
+        if let failure { throw failure }
     }
 }
 }
