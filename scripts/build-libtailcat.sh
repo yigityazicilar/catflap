@@ -29,8 +29,13 @@ fi
 if ! git -C "$source_dir" cat-file -e "$commit^{commit}" 2>/dev/null; then
     git -C "$source_dir" fetch -q --depth=1 https://github.com/tailscale/tailcat.git "$commit"
 fi
-# Extract the exact commit, not a moving branch or the state of a working tree.
-git -C "$source_dir" archive "$commit" | tar -x -C "$source_dir"
+# Extract the exact commit, not a moving branch or the state of a working tree. The archive goes
+# through a file, not a pipe: when tar stops reading before git has written its last bytes, git
+# dies of SIGPIPE and pipefail fails the build with 141 and no message, as a macOS CI run did.
+archive="$root/.build/tailcat-src.tar"
+git -C "$source_dir" archive -o "$archive" "$commit"
+tar -x -f "$archive" -C "$source_dir"
+rm -f -- "$archive"
 # Without this check a missing cmp would be reported as a header mismatch.
 if ! command -v cmp >/dev/null 2>&1; then
     printf '%s\n' 'cmp is required to check the vendored header (install diffutils)' >&2
