@@ -179,7 +179,8 @@ import Testing
             ("one letter", { String(repeating: "A", count: $0) })
         ]
         for (label, make) in families {
-            try await expectLinearScaling(label, small: 4 * 1024, make: make) { SecretFilter.rejects($0) }
+            // LEAD DIAGNOSTIC, never landed: 128 KiB against the 4 MiB text limit on macOS.
+            try await expectLinearScaling(label, small: 128 * 1024, make: make) { SecretFilter.rejects($0) }
         }
     }
 }
