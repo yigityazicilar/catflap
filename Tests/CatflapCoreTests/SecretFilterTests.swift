@@ -136,29 +136,25 @@ import Testing
     /// that restarts at every word start does, fails it, and one pass over the input passes.
     @Test func testScalingCheckFailsOnQuadraticWork() async throws {
         let make: @Sendable (Int) -> String = { String(repeating: "a", count: $0) }
-        await withKnownIssue("quadratic work must fail the scaling check") {
-            // An error from the helper is recorded as itself, so it cannot pass for the known issue.
-            do {
-                try await expectLinearScaling("quadratic work", small: 128, make: make) { text in
-                    let bytes = Array(text.utf8)
-                    var matches = 0
-                    for start in bytes.indices {
-                        for byte in bytes[start...] where byte == bytes[start] { matches += 1 }
-                    }
-                    return matches == 0
-                }
-            } catch {
-                Issue.record(error)
-            }
+        // Factor 64 gives triangular work a ratio of 4080.3 before overhead, leaving
+        // headroom above 1024. The product check remains factor 32 with cutoff 256.
+        let quadratic = try await measureScaling("quadratic work", small: 256, factor: 64, make: make,
+                                               expected: { text in
+            let count = text.utf8.count
+            return count * (count + 1) / 2
+        }, work: quadraticMatches)
+        #expect(quadratic.ratio >= 1024, "quadratic self-test margin: \(quadratic)")
+        withKnownIssue("quadratic work must fail the scaling check") {
+            // Only this assertion is expected to fail, never measurement or checksum checks.
+            expectLinearScaling(quadratic)
         } matching: { issue in
             if case .expectationFailed = issue.kind { return true }
             return false
         }
-        try await expectLinearScaling("linear work", small: 128, make: make) { text in
-            var matches = 0
-            for byte in text.utf8 where byte == UInt8(ascii: "a") { matches += 1 }
-            return matches == 0
-        }
+        let linear = try await measureScaling("linear work", small: 64 * 1024, make: make,
+                                            expected: { $0.utf8.count }, work: linearMatches)
+        expectLinearScaling(linear)
+        #expect(linear.ratio <= 64, "linear self-test margin: \(linear)")
     }
     /// A copy that nearly matches a pattern is checked in linear time: 32 times the input
     /// takes about 32 times as long. As a regex the JWT check took 22 s on 128 KiB of "eyJ-"
@@ -184,8 +180,40 @@ import Testing
     }
 }
 
-/// The best time of one call on an input of the small size and on one 32 times as large.
-/// Linear work gives a ratio of about 32 and quadratic work about 1024.
+/// Read runtime bytes without slices or allocations per comparison. Returning each count
+/// to the measured batch keeps its result observable, including in optimized builds.
+@inline(never)
+private func quadraticMatches(_ text: String) -> Int {
+    Array(text.utf8).withUnsafeBufferPointer { bytes in
+        var matches = 0
+        var start = 0
+        while start < bytes.count {
+            var index = start
+            while index < bytes.count {
+                if bytes[index] == bytes[start] { matches += 1 }
+                index += 1
+            }
+            start += 1
+        }
+        return matches
+    }
+}
+
+@inline(never)
+private func linearMatches(_ text: String) -> Int {
+    Array(text.utf8).withUnsafeBufferPointer { bytes in
+        var matches = 0
+        var index = 0
+        while index < bytes.count {
+            if bytes[index] == UInt8(ascii: "a") { matches += 1 }
+            index += 1
+        }
+        return matches
+    }
+}
+
+/// Best per-call times at two sizes. The product uses factor 32; only the quadratic
+/// self-test uses factor 64 to leave room for measurement overhead.
 private struct Scaling: CustomStringConvertible, Sendable {
     let label: String
     let smallBytes: Int, largeBytes: Int
@@ -198,28 +226,54 @@ private struct Scaling: CustomStringConvertible, Sendable {
     }
 }
 
-/// Times `work` on `make(small)` and on `make(small * 32)` and fails when the large input
-/// takes 256 times as long as the small one or more. A wall-clock bound flaked, because
-/// hosted macOS runners differ fourfold in speed from run to run (one test took 18.7 to
-/// 79.1 s), while a ratio taken on one runner within seconds does not. The sizes take turns,
-/// small, large, three times each, so that contention that lasts slows both alike, and the
-/// best of each counts. A sample under 5 ms repeats the call within itself until it takes
-/// longer, so that a fast small size is measured rather than the clock. Prints one line with
-/// the label, the sizes and the times, never the input.
+/// The product guard is shared with the self-test, whose expected issue surrounds only
+/// this assertion. Measurement errors and margin expectations remain ordinary failures.
+private func expectLinearScaling(_ scaling: Scaling, sourceLocation: SourceLocation = #_sourceLocation) {
+    #expect(scaling.ratio < 256, "\(scaling)", sourceLocation: sourceLocation)
+}
+
 @discardableResult
 private func expectLinearScaling(_ label: String, small: Int, make: @escaping @Sendable (Int) -> String,
                                  sourceLocation: SourceLocation = #_sourceLocation,
                                  work: @escaping @Sendable (String) -> Bool) async throws -> Scaling {
+    let scaling = try await measureScaling(label, small: small, make: make, expected: work, work: work)
+    expectLinearScaling(scaling, sourceLocation: sourceLocation)
+    return scaling
+}
+
+private struct InvalidScalingWork: Error, CustomStringConvertible {
+    let label: String
+    let bytes: Int
+    var description: String { "scaling workload validation failed: \(label), \(bytes) bytes" }
+}
+
+/// Interleave small and large batches three times and keep the best per-call times.
+/// Batches shorter than 5 ms are doubled to measure work rather than clock resolution;
+/// that is a calibration floor, not an absolute success bound. Each call stores its result
+/// in a preallocated slot, then every slot is validated after stopping the clock, even for
+/// calibration batches. Both sizes have independent expected results. No timed result is
+/// discarded, and no assertion or checksum validation is inside the timed loop.
+private func measureScaling<Value: Equatable & Sendable>(
+    _ label: String, small: Int, factor: Int = 32, make: @escaping @Sendable (Int) -> String,
+    expected: @escaping @Sendable (String) -> Value,
+    work: @escaping @Sendable (String) -> Value
+) async throws -> Scaling {
+    try Task.checkCancellation()
     let scaling = try await filterOffPool { () -> Scaling in
-        let inputs = [make(small), make(small * 32)]
+        let inputs = [make(small), make(small * factor)]
+        let expectedResults = inputs.map(expected)
         var repeats = [1, 1]
         var best: [Duration?] = [nil, nil]
         for _ in 0..<3 {
             for side in 0..<2 {
                 while true {
+                    var results = Array(repeating: expectedResults[side], count: repeats[side])
                     let start = ContinuousClock.now
-                    for _ in 0..<repeats[side] { _ = work(inputs[side]) }
+                    for index in results.indices { results[index] = work(inputs[side]) }
                     let took = start.duration(to: .now)
+                    guard results.allSatisfy({ $0 == expectedResults[side] }) else {
+                        throw InvalidScalingWork(label: label, bytes: inputs[side].utf8.count)
+                    }
                     if took < .milliseconds(5) {
                         repeats[side] *= 2
                         continue
@@ -233,8 +287,8 @@ private func expectLinearScaling(_ label: String, small: Int, make: @escaping @S
         return Scaling(label: label, smallBytes: inputs[0].utf8.count, largeBytes: inputs[1].utf8.count,
                        smallBest: best[0]!, largeBest: best[1]!)
     }
+    try Task.checkCancellation()
     print(scaling)
-    #expect(scaling.ratio < 256, "\(scaling)", sourceLocation: sourceLocation)
     return scaling
 }
 
