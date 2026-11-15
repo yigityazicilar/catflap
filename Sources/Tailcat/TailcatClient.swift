@@ -5,7 +5,7 @@ import Foundation
 /// all of them.
 public final class TailcatClient: Sendable {
     let owned: OwnedHandle
-    private let secrets: [String]
+    let secrets: [String]
 
     var handle: tc_handle { owned.handle }
 
