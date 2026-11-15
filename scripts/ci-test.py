@@ -34,13 +34,10 @@ import tempfile
 import termios
 import time
 
-# Programs of the toolchain and of this script. Anything else the run starts is a test
-# process or a program under test.
-TOOLING = {
-    "swift", "swift-test", "swift-build", "swift-package", "swift-run", "swiftc", "swift-driver",
-    "swift-frontend", "clang", "ld", "xcrun", "bash", "sh", "zsh", "env", "sleep", "ps", "sudo",
-    "sample", "eu-stack", "gdb",
-}
+import uuid
+from pathlib import Path
+
+# Names never exempt a process from ownership or leak checks.
 STARTED = re.compile(r"^\S+ +Test (?!run started)(.+) started\.\s*$")
 ENDED = re.compile(r"^\S+ +Test (?!run with )(.+) (?:(?:passed|failed) after \d|skipped[.:])")
 FAULT = re.compile(r"harness-error: (.*?)\s*$")
@@ -54,67 +51,115 @@ def say(text=""):
 
 
 def process_table():
-    """pid -> (parent pid, start time, program name) for every process."""
+    """pid -> (parent pid, start time, program, session, state)."""
     listing = subprocess.run(
-        ["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart=", "-o", "comm="],
-        capture_output=True, text=True, errors="replace").stdout
+        ["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart=", "-o", "pgid=" if sys.platform == "darwin" else "sid=",
+         "-o", "stat=", "-o", "comm="], capture_output=True, text=True, errors="replace", check=True).stdout
     table = {}
     for line in listing.splitlines():
-        fields = line.split(None, 7)
-        if len(fields) == 8 and fields[0].isdigit():
-            table[int(fields[0])] = (int(fields[1]), " ".join(fields[2:7]), os.path.basename(fields[7]))
+        fields = line.split(None, 9)
+        if len(fields) == 10 and fields[0].isdigit() and not fields[8].startswith("Z"):
+            table[int(fields[0])] = (int(fields[1]), " ".join(fields[2:7]),
+                                     os.path.basename(fields[9]), int(fields[7], 0) if fields[7].startswith("0x") else int(fields[7]), fields[8])
     return table
 
 
+def make_cgroup():
+    """Use a delegated cgroup v2 when available; never require privilege."""
+    if sys.platform != "linux":
+        return None
+    group = None
+    try:
+        relative = next(line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines() if line.startswith("0::"))
+        group = Path("/sys/fs/cgroup") / relative.lstrip("/") / ("catflap-test-" + uuid.uuid4().hex)
+        group.mkdir()
+        # Check delegation before starting anything in it.
+        with (group / "cgroup.procs").open("w"):
+            pass
+        say("process-watch: using delegated cgroup v2 and a private session")
+        return group
+    except (OSError, StopIteration) as error:
+        if group is not None:
+            try:
+                group.rmdir()
+            except OSError:
+                pass
+        say(f"process-watch: no delegated cgroup v2 ({type(error).__name__}); using private session and descendant tracking")
+        return None
+
+
 class Family:
-    """The processes one run started. A process stays a member after its parent has gone.
+    """Own a private session, plus descendants seen escaping it and a delegated cgroup.
 
-    Members are found by reading the process table twice a second, so a process that starts
-    in the last half second before its parent goes can be missed."""
-
-    def __init__(self, runner):
+    Session membership survives an intermediate parent's exit. A cgroup also retains
+    descendants that create new sessions before the first snapshot. Without delegation,
+    fully daemonized children escaping between snapshots require explicit test cleanup
+    (as do jobs created by launchd rather than by our runner).
+    """
+    def __init__(self, runner, cgroup=None):
         self.runner = runner
-        self.members = {}  # pid -> start time
+        self.cgroup = cgroup
+        self.members = {}
 
     def alive(self):
-        """pid -> (parent pid, start time, program name) of the members that still run."""
         table = process_table()
         family = {pid for pid, start in self.members.items() if pid in table and table[pid][1] == start}
+        family.update(pid for pid, entry in table.items() if entry[3] == self.runner.pid)
+        if self.cgroup:
+            for path in self.cgroup.rglob("cgroup.procs"):
+                family.update(int(pid) for pid in path.read_text().split())
         root = self.runner.pid if self.runner.poll() is None else None
-        family.add(root)
+        if root is not None:
+            family.add(root)
         grew = True
         while grew:
             grew = False
-            for pid, (parent, start, _) in table.items():
-                if pid not in family and parent in family:
+            for pid, entry in table.items():
+                if pid not in family and entry[0] in family:
                     family.add(pid)
-                    self.members[pid] = start
                     grew = True
-        return {pid: table[pid] for pid in sorted(family - {root}) if pid in table}
+        for pid in family:
+            if pid in table:
+                self.members[pid] = table[pid][1]
+        return {pid: table[pid][:3] for pid in sorted(family - {root}) if pid in table}
 
     def stop(self):
-        """End the runner and every member. They are frozen first, so that none of them
-        starts another process while the rest are being found."""
+        """Bounded cleanup; group signals also catch forks between snapshots."""
         def signal_to(pid, sig):
             try:
                 os.kill(pid, sig)
-            except OSError:
+            except ProcessLookupError:
                 pass
-        if self.runner.poll() is None:
-            signal_to(self.runner.pid, signal.SIGSTOP)
-        frozen = set()
+        try:
+            os.killpg(self.runner.pid, signal.SIGSTOP)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 5
         while True:
-            found = set(self.alive()) - frozen
-            if not found:
-                break
-            for pid in found:
+            alive = self.alive()
+            for pid in alive:
                 signal_to(pid, signal.SIGSTOP)
-            frozen |= found
-        for pid in frozen:
-            signal_to(pid, signal.SIGKILL)
-        if self.runner.poll() is None:
-            self.runner.kill()
-        self.runner.wait()
+            if self.cgroup and (self.cgroup / "cgroup.kill").exists():
+                (self.cgroup / "cgroup.kill").write_text("1")
+            try:
+                os.killpg(self.runner.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            for pid in alive:
+                signal_to(pid, signal.SIGKILL)
+            if self.runner.poll() is None:
+                self.runner.kill()
+            self.runner.wait(timeout=5)
+            if not self.alive():
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("process cleanup did not finish within 5 s")
+            time.sleep(0.05)
+        if self.cgroup:
+            for path in sorted(self.cgroup.rglob("*"), reverse=True):
+                if path.is_dir():
+                    path.rmdir()
+            self.cgroup.rmdir()
 
 
 class Tests:
@@ -208,7 +253,7 @@ def report(limit, tests, family, scratch):
     say("--- processes of this run still alive")
     for pid, (parent, start, program) in alive.items():
         say(f"  pid {pid}, parent {parent}, started {start}: {program}")
-    ours = [(pid, entry[2]) for pid, entry in alive.items() if entry[2] not in TOOLING]
+    ours = [(pid, entry[2]) for pid, entry in alive.items()]
     for pid, program in ours[:3]:
         say(f"--- threads of {program} (pid {pid})")
         try:
@@ -310,10 +355,14 @@ def run_once(arguments, limit, scratch):
         settings = termios.tcgetattr(slave)
         settings[1] &= ~termios.OPOST  # leave line endings as they are written
         termios.tcsetattr(slave, termios.TCSANOW, settings)
-        runner = subprocess.Popen(["swift", "test", "--skip-build", *arguments], stdin=subprocess.DEVNULL,
+        cgroup = make_cgroup()
+        command = ["swift", "test", "--skip-build", *arguments]
+        if cgroup:
+            command = [sys.executable, os.path.abspath(__file__), "--owned-exec", str(cgroup), *command]
+        runner = subprocess.Popen(command, stdin=subprocess.DEVNULL, start_new_session=True,
                                   stdout=slave, stderr=slave, env=dict(os.environ, TERM="dumb"))
         os.close(slave)
-        family, tests = Family(runner), Tests()
+        family, tests = Family(runner, cgroup), Tests()
         deadline = time.monotonic() + limit
         next_look, unread, open_output = 0.0, b"", True
         while True:
@@ -349,7 +398,7 @@ def run_once(arguments, limit, scratch):
             tests.read(unread.decode("utf-8", "replace"))
         left = {}
         for _ in range(6):  # a process that is on its way out is not left behind
-            left = {pid: entry for pid, entry in family.alive().items() if entry[2] not in TOOLING}
+            left = family.alive()
             if not left:
                 break
             time.sleep(0.5)
@@ -388,6 +437,9 @@ def run_once(arguments, limit, scratch):
 
 
 def main():
+    if sys.argv[1:2] == ["--owned-exec"]:
+        (Path(sys.argv[2]) / "cgroup.procs").write_text(str(os.getpid()))
+        os.execvp(sys.argv[3], sys.argv[3:])
     if sys.argv[1:2] == ["--stall-sampler"]:
         sample(sys.argv[2], int(sys.argv[3]))
         return 0

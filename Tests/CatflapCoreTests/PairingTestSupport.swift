@@ -280,6 +280,7 @@ final class MiddleMachine: WireTransport, Sendable {
     static let commitLabel = "catflap-pair-commit-v1"
     let inner: any WireTransport
     let clientKey: String
+    let dishonestReveal: Bool
     let exchangeKey = Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation.base64EncodedString()
     private struct State {
         var incoming = FrameDecoder()
@@ -289,11 +290,13 @@ final class MiddleMachine: WireTransport, Sendable {
         var forgedInitiatorHello: Data?
         var searched = false
         var matched = false
+        var brokeCommitment = false
     }
     private let state = Mutex(State())
 
-    init(_ inner: any WireTransport) {
+    init(_ inner: any WireTransport, dishonestReveal: Bool = false) {
         self.inner = inner
+        self.dishonestReveal = dishonestReveal
         clientKey = (try? TailcatKeys.generate().publicKey) ?? "nodekey:middle"
     }
 
@@ -302,6 +305,7 @@ final class MiddleMachine: WireTransport, Sendable {
     /// Whether it could search, and whether the search made the digits equal.
     var searched: Bool { state.withLock { $0.searched } }
     var matched: Bool { state.withLock { $0.matched } }
+    var brokeCommitment: Bool { state.withLock { $0.brokeCommitment } }
 
     func read(upTo maxLength: Int, timeout: Duration?) async throws -> Data? {
         while true {
@@ -360,7 +364,17 @@ final class MiddleMachine: WireTransport, Sendable {
         case "pair_hello":
             s.joinerHello = frame.header
             if s.forgedJoinerHello == nil { s.forgedJoinerHello = try forge(frame.header) }
-            return try WireCodec.frame(header: s.forgedJoinerHello!)
+            let committed = s.forgedJoinerHello!
+            if dishonestReveal {
+                // The commitment has already crossed and the initiator's hello is known.
+                // Now reveal a different, valid hello instead of honoring that commitment.
+                var changed = try headerObject(committed)
+                changed["name"] = "Dishonest device"
+                let revealed = try headerData(changed)
+                s.brokeCommitment = revealed != committed
+                return try WireCodec.frame(header: revealed)
+            }
+            return try WireCodec.frame(header: committed)
         default:
             return try WireCodec.frame(header: frame.header)
         }
@@ -421,9 +435,11 @@ final class MiddleMachine: WireTransport, Sendable {
 /// Holds the middle machine a transport hook made, for the test to inspect.
 final class MiddleBox: Sendable {
     private let made = Mutex<MiddleMachine?>(nil)
+    private let dishonestReveal: Bool
+    init(dishonestReveal: Bool = false) { self.dishonestReveal = dishonestReveal }
     var machine: MiddleMachine? { made.withLock { $0 } }
     func wrap(_ transport: any WireTransport) -> any WireTransport {
-        let machine = MiddleMachine(transport)
+        let machine = MiddleMachine(transport, dishonestReveal: dishonestReveal)
         made.withLock { $0 = machine }
         return machine
     }
