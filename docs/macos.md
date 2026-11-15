@@ -181,11 +181,18 @@ panel's controls by name (`control`, and `id` for a row's Copy, Delete, Retry or
 uses what the panel shows; scripts that need arguments (`text`, `id`, `files`, `key`, `value`)
 send them over the control socket.
 
+A send goes to a device from the paired devices as the agent reads them when you send. If they
+cannot be read, nothing is sent, the field and the attached files stay, and the panel says
+"Catflap could not read your paired devices. Try again." When one of the panel's lists cannot
+be read, the panel keeps showing it as it last read it until a read works again; `ui state`
+names the lists whose latest read failed under `unreadable` (`devices`, `clipboard`,
+`history`), an empty array when all were read.
+
 The control command `panel.show` opens the panel focused, whether it was closed or open
 without the keyboard (opened by hover); a focused panel stays as it is, and `panel.show` never
 closes it. It answers with what `ui state` reports after it. Opening Catflap.app again while it
 runs does the same.
 
-The actions `notification-press`, `test-press-recorder`, `test-hold-shortcut` and
-`test-release-shortcut` exist for Catflap's own tests, only in an agent started with
-`CATFLAP_TEST_HOOKS=on`. Otherwise they are unknown actions.
+The actions `notification-press`, `test-press-recorder`, `test-hold-shortcut`,
+`test-release-shortcut` and `test-fail-reads` exist for Catflap's own tests, only in an agent
+started with `CATFLAP_TEST_HOOKS=on`. Otherwise they are unknown actions.

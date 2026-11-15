@@ -54,6 +54,20 @@ struct PanelReport: Codable, Sendable {
     }
 }
 
+/// What `ui state` answers on Linux: the fields every desktop reports, and the panel's lists
+/// whose latest read failed (`devices`, `clipboard`, `history`, `pause`), which the panel keeps
+/// showing as it last read them.
+struct LinuxUIState: Encodable, Sendable {
+    let state: UIState
+    let unreadable: [String]
+    enum CodingKeys: String, CodingKey { case unreadable }
+    func encode(to encoder: any Encoder) throws {
+        try state.encode(to: encoder)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(unreadable, forKey: .unreadable)
+    }
+}
+
 /// The panel inside the agent with everything it does: the state machine, the view, the host,
 /// the hover band and the hotkey as T10 built them, and the actions behind the controls,
 /// pairing, settings, notifications on arrival, the tray item, the send-clipboard shortcut and
@@ -103,6 +117,12 @@ final class PanelController: @unchecked Sendable {
     private(set) var openedFrom = "top"
     var records: [TransferRecord] = []
     var items: [ClipboardItem] = []
+    /// The rest of what the panel last read from the agent, kept while a read fails.
+    private var knownDevices: [PanelDevice] = []
+    private var knownHistory: [HistoryRecord] = []
+    private var knownPaused = false
+    /// The lists whose latest read failed, by name; `ui state` reports them.
+    private(set) var unreadable: [String] = []
     private let snapshots = ProcessInfo.processInfo.environment["CATFLAP_PANEL_SNAPSHOT_DIR"]
 
     private init(runtime: AgentRuntime, loop: GtkLoop, backends: DesktopBackends, dataDirectory: URL) {
@@ -414,23 +434,29 @@ final class PanelController: @unchecked Sendable {
     func refresh() {
         let runtime = runtime, loop = loop
         track(Task { [weak self] in
-            async let devices = Self.request([DeviceSummary].self, "devices", runtime)
-            async let clipboard = Self.request([ClipboardItem].self, "clip.list", runtime)
-            async let history = Self.request([HistoryRecord].self, "history", runtime)
-            async let transfers = Self.request([TransferRecord].self, "history", runtime)
-            async let pause = Self.request([String: Bool].self, "clip.pause", runtime)
-            let list = (await devices ?? []).map { PanelDevice(id: $0.id, name: $0.name) }
-            let items = await clipboard ?? [], rows = await history ?? [], paused = await pause?["paused"] ?? false
-            let records = await transfers ?? []
+            async let devices = Self.read([DeviceSummary].self, list: "devices", "devices", runtime)
+            async let clipboard = Self.read([ClipboardItem].self, list: "clipboard", "clip.list", runtime)
+            async let history = Self.read([HistoryRecord].self, list: "history", "history", runtime)
+            async let transfers = Self.read([TransferRecord].self, list: "history", "history", runtime)
+            async let pause = Self.read([String: Bool].self, list: "pause", "clip.pause", runtime)
+            let readDevices = (await devices)?.map { PanelDevice(id: $0.id, name: $0.name) }
+            let readItems = await clipboard, readRows = await history, readRecords = await transfers
+            let readPaused = (await pause).map { $0["paused"] ?? false }
             guard !Task.isCancelled else { return }
             await loop.perform { [weak self] in
                 guard let self, !stopped else { return }
-                self.items = items
-                self.records = records
-                view.update(devices: list, clipboard: items, history: rows, paused: paused)
+                // A list that could not be read keeps what the panel last had instead of showing
+                // as empty; only the agent's answer replaces it, an empty one too.
+                var failed: [String] = []
+                if let readDevices { knownDevices = readDevices } else { failed.append("devices") }
+                if let readItems { items = readItems } else { failed.append("clipboard") }
+                if let readRows, let readRecords { knownHistory = readRows; records = readRecords } else { failed.append("history") }
+                if let readPaused { knownPaused = readPaused } else { failed.append("pause") }
+                unreadable = failed
+                view.update(devices: knownDevices, clipboard: items, history: knownHistory, paused: knownPaused)
                 extras.listChanged()
-                settingsPage.update(devices: list)
-                tray.update(paused: paused)
+                if readDevices != nil { settingsPage.update(devices: knownDevices) }
+                tray.update(paused: knownPaused)
             }
         })
     }
@@ -474,10 +500,30 @@ final class PanelController: @unchecked Sendable {
         return try? response.decode(type)
     }
 
+    /// One of the panel's lists from the agent, as `request` reads it; `list` is the name the
+    /// test fault below and `ui state` use for it.
+    static func read<T: Decodable>(_ type: T.Type, list: String, _ command: String, _ runtime: AgentRuntime) async -> T? {
+        if failing(list) { return nil }
+        return await request(type, command, runtime)
+    }
+
+    /// Tests only: while the file this names exists, the panel's reads of the lists it names
+    /// (one per line: devices, clipboard, history, pause) fail as an agent error would. The
+    /// read of the paired devices before a send has its own, CATFLAP_TEST_DEVICES_FAULT.
+    /// Unset outside tests.
+    private static let listsFault = ProcessInfo.processInfo.environment["CATFLAP_TEST_LISTS_FAULT"].flatMap { $0.isEmpty ? nil : $0 }
+
+    private static func failing(_ list: String) -> Bool {
+        guard let path = listsFault, let names = try? String(contentsOfFile: path, encoding: .utf8) else { return false }
+        return names.split(whereSeparator: \.isNewline).contains { $0.trimmingCharacters(in: .whitespaces) == list }
+    }
+
     // MARK: Control commands
 
     private func register() async {
-        await runtime.register("ui.state") { [self] _ in try ControlResponse(value: await loop.perform { self.state() }) }
+        await runtime.register("ui.state") { [self] _ in
+            try ControlResponse(value: await loop.perform { LinuxUIState(state: self.state(), unreadable: self.unreadable) })
+        }
         await runtime.register("toggle") { [self] _ in
             try ControlResponse(value: await loop.perform {
                 self.open(from: "top"); self.handle(.hotkey(display: nil)); return self.state()

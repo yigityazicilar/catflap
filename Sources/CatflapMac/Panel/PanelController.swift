@@ -48,8 +48,11 @@ struct MacUIState: Codable, Sendable {
     var glyph: String
     /// The panel's line saying how the last send went; empty before the first.
     var sendLine: String
+    /// The lists whose latest read failed (`devices`, `clipboard`, `history`); the panel shows
+    /// them as it last read them.
+    var unreadable: [String]
     enum CodingKeys: String, CodingKey {
-        case visible, mode, display, shortcut, frame, level, background, motion, list, rows, devices, attachments, glyph
+        case visible, mode, display, shortcut, frame, level, background, motion, list, rows, devices, attachments, glyph, unreadable
         case hasFocus = "has_focus", shortcutKeys = "shortcut_keys", displayFrame = "display_frame", visibleFrame = "visible_frame"
         case appActive = "app_active", appFrontmost = "app_frontmost", activations, reopens, activationPolicy = "activation_policy", eventLoop = "event_loop"
         case statusItem = "status_item", clipboardRows = "clipboard_rows", historyRows = "history_rows"
@@ -100,6 +103,8 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
     private var arrivedEnd: Task<Void, Never>?
     private var sendLine = ""
     private var sendLineFailed = false
+    /// The lists whose latest read failed, by name.
+    private var unreadable: [String] = []
     /// How long cf-arrived stays after something arrives or is sent.
     static let arrivedSeconds: TimeInterval = 3
 
@@ -249,7 +254,8 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
             motion: accessibility.accessibilityDisplayShouldReduceMotion ? "fade" : "flap",
             statusItem: statusItem != nil, list: model.list.rawValue, rows: model.rows.count,
             clipboardRows: model.clipboard.count, historyRows: model.history.count, devices: model.devices.count,
-            attachments: model.attachments.count, sendLabel: model.sendLabel(), glyph: "cf-" + glyph.rawValue, sendLine: sendLine)
+            attachments: model.attachments.count, sendLabel: model.sendLabel(), glyph: "cf-" + glyph.rawValue, sendLine: sendLine,
+            unreadable: unreadable)
     }
 
     // MARK: Glyph and the send line
@@ -467,13 +473,21 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
     /// Reads the lists again now, open or closed, instead of at the next refresh: after a
     /// pairing the new device is the send target as soon as the panel shows.
     func reloadLists() {
-        let feed = feed
-        Task { [weak self] in
-            let snapshot = await feed.load()
-            guard let self else { return }
-            self.model.update(devices: snapshot.devices, clipboard: snapshot.clipboard, history: snapshot.history, paused: snapshot.paused)
-            self.render()
-        }
+        Task { [weak self] in await self?.reloadListsNow() }
+    }
+
+    /// Reads the lists again and returns once the panel shows what was read.
+    func reloadListsNow() async {
+        showLists(await feed.load(known: model.devices, failing: MacTestHooks.failingReads))
+    }
+
+    /// Shows what a read found. A list that could not be read keeps what the panel last had
+    /// instead of showing as empty; only a list that was read replaces it, an empty one too.
+    private func showLists(_ snapshot: PanelFeed.Snapshot) {
+        model.update(devices: snapshot.devices ?? model.devices, clipboard: snapshot.clipboard ?? model.clipboard,
+                     history: snapshot.history ?? model.history, paused: snapshot.paused)
+        unreadable = snapshot.unreadable
+        render()
     }
 
     private func startRefreshing() {
@@ -482,10 +496,10 @@ final class PanelController: PanelWindowEvents, PanelViewActions, HoverBandEvent
         refresher = Task { [weak self] in
             await feed.checkDevices()
             while !Task.isCancelled {
-                let snapshot = await feed.load()
-                guard !Task.isCancelled, let self else { return }
-                self.model.update(devices: snapshot.devices, clipboard: snapshot.clipboard, history: snapshot.history, paused: snapshot.paused)
-                self.render()
+                guard let known = self?.model.devices else { return }
+                let snapshot = await feed.load(known: known, failing: MacTestHooks.failingReads)
+                guard !Task.isCancelled else { return }
+                self?.showLists(snapshot)
                 try? await Task.sleep(for: .seconds(1))
             }
         }

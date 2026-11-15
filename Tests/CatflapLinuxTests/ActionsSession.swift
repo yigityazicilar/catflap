@@ -177,6 +177,14 @@ final class ActionsSession {
         try ControlJSON.decoder.decode(ActionsDescription.self, from: catflap(["ui", "invoke", "describe"]))
     }
 
+    /// The lists `ui state` says the panel could not read at its latest refresh; nil when it
+    /// does not report them. Read without a typed state, so this runs against an agent that
+    /// lacks the field.
+    func unreadable() throws -> [String]? {
+        let object = try JSONSerialization.jsonObject(with: catflap(["ui", "state"])) as? [String: Any]
+        return object?["unreadable"] as? [String]
+    }
+
     func history(peer: Bool = false) throws -> [TransferRecord] {
         try ControlJSON.decoder.decode([TransferRecord].self, from: catflap(["history"], peer: peer))
     }
@@ -514,6 +522,7 @@ struct ActionsDescription: Decodable {
     let placement: Placement
     let field: String
     let rows: [String]
+    let devices: [String]
     let sendLabel: String
     let page: String
     let attachments: [String]
@@ -544,7 +553,7 @@ struct ActionsDescription: Decodable {
         }
     }
     enum CodingKeys: String, CodingKey {
-        case visible, mode, shortcut, placement, field, rows, page, attachments, message, pairing, settings, tray, controls
+        case visible, mode, shortcut, placement, field, rows, devices, page, attachments, message, pairing, settings, tray, controls
         case hasFocus = "has_focus", sendClipboardShortcut = "send_clipboard_shortcut", openedFrom = "opened_from"
         case sendLabel = "send_label", messageActions = "message_actions"
     }
