@@ -180,3 +180,12 @@ panel's controls by name (`control`, and `id` for a row's Copy, Delete, Retry or
 `simulate-key` presses a key equivalent in the open panel (`key`, `modifiers`). Without arguments an action
 uses what the panel shows; scripts that need arguments (`text`, `id`, `files`, `key`, `value`)
 send them over the control socket.
+
+The control command `panel.show` opens the panel focused, whether it was closed or open
+without the keyboard (opened by hover); a focused panel stays as it is, and `panel.show` never
+closes it. It answers with what `ui state` reports after it. Opening Catflap.app again while it
+runs does the same.
+
+The actions `notification-press`, `test-press-recorder`, `test-hold-shortcut` and
+`test-release-shortcut` exist for Catflap's own tests, only in an agent started with
+`CATFLAP_TEST_HOOKS=on`. Otherwise they are unknown actions.
