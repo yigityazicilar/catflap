@@ -35,6 +35,8 @@ public actor AuditService {
             do {
                 let findings = try await run(extras: extras)
                 jobs[id] = .init(id: id, status: "done", findings: findings, error: nil)
+            } catch let error as DiskAuditError {
+                jobs[id] = .init(id: id, status: "failed", findings: nil, error: error.rawValue)
             } catch { jobs[id] = .init(id: id, status: "failed", findings: nil, error: "Cannot scan all audit files.") }
         }
         return progress
@@ -63,9 +65,12 @@ public actor AuditService {
             needles.append(.init(bytes: Data(line.utf8), kind: "extra", line: index + 1))
         }
         let paths = await store.paths
+        // The receiver keeps the inbox it started with; a new choice applies from the next
+        // start. Both are scanned while they differ, the next one as `pending-inbox`.
         let configured = try await store.setting("inbox")
-        let inbox = configured.map { URL(fileURLWithPath: $0) } ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads/Catflap")
-        let scanner = DiskAudit(directory: paths.directory, inbox: inbox)
+        let pending = configured.map { URL(fileURLWithPath: $0) } ?? TransferInbox.defaultDirectory
+        let live = await runtime.service(TransferService.self)?.inbox.directory
+        let scanner = DiskAudit(directory: paths.directory, inbox: live ?? pending, pendingInbox: live == nil ? nil : pending)
         // Filesystem scanning is synchronous and can include multi-gigabyte inbox files.
         return try await withCheckedThrowingContinuation { continuation in
             Thread.detachNewThread { [needles] in continuation.resume(with: Result { try scanner.scan(needles: needles, devices: devices) }) }

@@ -80,14 +80,24 @@ private enum LocalSocket {
         return getpeereid(fd, &uid, &gid) == 0 && uid == getuid()
         #endif
     }
-    static func readFrame(_ fd: Int32) throws -> Data {
+    /// More bytes than the server's budget for all connections together.
+    struct OverBudget: Error {}
+    /// How long a frame may take to arrive: five seconds, and one more for each 64 KiB that
+    /// has arrived. A large frame that keeps arriving on a busy machine is read whole, and one
+    /// that stops is still cut off: a read waits at most five seconds for the next bytes.
+    static func frameAllowance(received: Int) -> Duration {
+        .seconds(5) + .seconds(Double(received) / 65_536)
+    }
+    /// Reads one frame. `hold` is asked before each piece is kept, and may refuse it.
+    static func readFrame(_ fd: Int32, hold: (Int) -> Bool = { _ in true }) throws -> Data {
         var data = Data()
         var buffer = [UInt8](repeating: 0, count: 16_384)
-        let deadline = Date().addingTimeInterval(5)
-        while data.count < maxFrame && Date() < deadline {
+        let started = ContinuousClock.now
+        while data.count < maxFrame && started.duration(to: .now) < frameAllowance(received: data.count) {
             let count = buffer.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, 0) }
             if count < 0 && errno == EINTR { continue }
             guard count > 0 else { throw AgentError.control }
+            guard hold(count) else { throw OverBudget() }
             if let newline = buffer[..<count].firstIndex(of: 10) {
                 guard data.count + newline < maxFrame, newline == count - 1 else { throw AgentError.invalidRequest }
                 data.append(contentsOf: buffer[..<newline])
@@ -196,22 +206,74 @@ private final class ControlSession: Sendable {
     }
 }
 
+/// A failure a test makes the control listener see, to prove how it and the agent handle it.
+public enum ControlListenerFault: Sendable {
+    /// The next `times` accepts fail with `errno`.
+    case acceptFails(errno: Int32, times: Int)
+    /// After `afterPolls` real polls, the next one fails with `errno`.
+    case pollFails(errno: Int32, afterPolls: Int)
+}
+
 public final class ControlServer: Sendable {
+    /// Bytes for frames and replies larger than `smallFrame`, across all connections: two
+    /// connections at a time may hold a near-limit frame; more are refused as busy.
+    public static let defaultByteBudget = 2 * LocalSocket.maxFrame
+    /// What any connection may hold without a share of the budget. Ordinary requests and
+    /// replies are far smaller, and 32 connections hold at most 32 times this.
+    public static let smallFrame = 1_048_576
+    public static let busy = "The agent is busy with other large requests. Try again in a moment."
+    public static let listenerFailure = "The agent's control channel stopped working, so the agent stopped. Start it again."
     private let fd: Int32
     private let wakeRead: Int32
     private let wakeWrite: Int32
     private let url: URL
     // Retain the lock until the socket has closed, including shutdown/error paths.
     private let lock: AgentLock
+    private let byteBudget: Int
     private struct State: Sendable {
         var started = false
         var stopped = false
+        var failed = false
         var sessions: [UUID: ControlSession] = [:]
+        var acceptFaults: (errno: Int32, times: Int)?
+        var pollFault: (errno: Int32, afterPolls: Int)?
+        var acceptAttempts: [ContinuousClock.Instant] = []
+        var small = 0
+        var reserved = 0
+        var peakReserved = 0
+        var refused = 0
     }
+    /// What one connection holds: up to `smallFrame` bytes of its own, or else one whole-frame
+    /// reservation from the budget. A frame that grows past `smallFrame` reserves a whole
+    /// frame at once, or is refused there; reserving as it grows would let several large
+    /// frames fill the budget together and every one of them be refused.
+    private struct Holding { var small = 0; var reserved = false }
     private let state = Mutex(State())
     var activeConnections: Int { state.withLock { $0.sessions.count } }
-    public init(paths: AgentPaths, lock: AgentLock) throws {
-        self.lock = lock; url = paths.socket
+    /// When each accept was tried, for tests.
+    var acceptAttempts: [ContinuousClock.Instant] { state.withLock { $0.acceptAttempts } }
+    /// Bytes counted for all connections now: their small holdings and reservations.
+    var inFlightBytes: Int { state.withLock { $0.small + $0.reserved } }
+    /// Budget reserved now, and at most so far.
+    var reservedBytes: Int { state.withLock { $0.reserved } }
+    var peakReservedBytes: Int { state.withLock { $0.peakReserved } }
+    /// Connections refused as busy because the budget was full, counted once they let go.
+    var busyRefusals: Int { state.withLock { $0.refused } }
+    /// True when the listener ended because it failed, not because it was stopped.
+    public var listenerFailed: Bool { state.withLock { $0.failed } }
+    public func inject(_ fault: ControlListenerFault) {
+        state.withLock { value in
+            switch fault {
+            case .acceptFails(let code, let times): value.acceptFaults = (code, times)
+            case .pollFails(let code, let afterPolls): value.pollFault = (code, afterPolls)
+            }
+        }
+    }
+    public convenience init(paths: AgentPaths, lock: AgentLock) throws {
+        try self.init(paths: paths, lock: lock, byteBudget: Self.defaultByteBudget)
+    }
+    init(paths: AgentPaths, lock: AgentLock, byteBudget: Int) throws {
+        self.lock = lock; url = paths.socket; self.byteBudget = byteBudget
         let descriptor = try LocalSocket.create()
         var wake = [Int32](repeating: -1, count: 2)
         guard pipe(&wake) == 0 else { close(descriptor); throw AgentError.control }
@@ -245,7 +307,9 @@ public final class ControlServer: Sendable {
         var byte: UInt8 = 1
         _ = write(wakeWrite, &byte, 1)
     }
-    /// One JSON-line request per connection; up to 32 independent connection workers.
+    /// One JSON-line request per connection; up to 32 independent connection workers, which
+    /// together hold at most the byte budget of requests and replies. Returns after `stop()`,
+    /// or when the listener fails (`listenerFailed`), which the agent must end on.
     public func run(handler: @escaping @Sendable (ControlRequest) async -> ControlResponse) async {
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -262,18 +326,32 @@ public final class ControlServer: Sendable {
             }
         } onCancel: { self.stop() }
     }
+    /// Accept failures that pass: a shortage of descriptors or memory, or a connection that
+    /// went away before it was taken. Each is retried after `acceptBackoff`, never at once.
+    private static let passingAcceptErrors: Set<Int32> = [EMFILE, ENFILE, ENOBUFS, ENOMEM, ECONNABORTED, EINTR, EAGAIN, EWOULDBLOCK, EPROTO]
     private func acceptLoop(handler: @escaping @Sendable (ControlRequest) async -> ControlResponse) {
         let workers = DispatchGroup()
+        var failures = 0
+        var failed = false
         while !state.withLock({ $0.stopped }) {
             // An infinite wait on a dedicated thread: no timer or idle polling wake-ups.
             var items = [pollfd(fd: fd, events: Int16(POLLIN), revents: 0),
                          pollfd(fd: wakeRead, events: Int16(POLLIN), revents: 0)]
-            let result = poll(&items, nfds_t(items.count), -1)
+            let result = pollListener(&items)
             if result < 0 && errno == EINTR { continue }
-            guard result >= 0, items[1].revents == 0 else { break }
-            guard items[0].revents & Int16(POLLIN) != 0 else { break }
-            let client = accept(fd, nil, nil)
-            if client < 0 { continue }
+            // Anything else wrong with the poll or the listening socket does not pass.
+            guard result >= 0 else { failed = true; break }
+            if items[1].revents != 0 { break }
+            guard items[0].revents & Int16(POLLERR | POLLHUP | POLLNVAL) == 0 else { failed = true; break }
+            guard items[0].revents & Int16(POLLIN) != 0 else { continue }
+            let client = acceptClient()
+            if client < 0 {
+                guard Self.passingAcceptErrors.contains(errno) else { failed = true; break }
+                failures += 1
+                if pause(Self.acceptBackoff(failures: failures)) { break }
+                continue
+            }
+            failures = 0
             LocalSocket.configureAccepted(client)
             guard LocalSocket.owner(client) else { close(client); continue }
             let id = UUID()
@@ -286,27 +364,111 @@ public final class ControlServer: Sendable {
             guard admitted else { close(client); continue }
             workers.enter()
             Thread.detachNewThread {
+                var holding = Holding()
+                var refused = false
                 defer {
                     session.closeSocket()
-                    _ = self.state.withLock { $0.sessions.removeValue(forKey: id) }
+                    self.release(&holding)
+                    self.state.withLock { value in
+                        value.sessions.removeValue(forKey: id)
+                        if refused { value.refused += 1 }
+                    }
                     workers.leave()
                 }
                 do {
-                    let request = try ControlJSON.decoder.decode(ControlRequest.self, from: LocalSocket.readFrame(client))
+                    let request = try ControlJSON.decoder.decode(ControlRequest.self, from: LocalSocket.readFrame(client) { self.hold($0, &holding) })
+                    // The frame itself is gone once decoded.
+                    if !holding.reserved { self.release(&holding) }
                     let task = Task {
                         let response = await handler(request)
                         session.complete(response)
                     }
                     session.install(task)
                     if let response = session.reply() {
-                        try LocalSocket.writeFrame(ControlJSON.encoder.encode(response), client)
+                        let reply = try ControlJSON.encoder.encode(response)
+                        // A reply is held while it is written, so a large one needs a reservation too.
+                        if self.hold(reply.count, &holding) {
+                            try LocalSocket.writeFrame(reply, client)
+                        } else {
+                            try LocalSocket.writeFrame(ControlJSON.encoder.encode(ControlResponse(failure: Self.busy)), client)
+                        }
                     }
+                } catch is LocalSocket.OverBudget {
+                    refused = true
+                    try? LocalSocket.writeFrame(ControlJSON.encoder.encode(ControlResponse(failure: Self.busy)), client)
                 } catch {
                     try? LocalSocket.writeFrame(ControlJSON.encoder.encode(ControlResponse(error: .invalidRequest)), client)
                 }
             }
         }
+        if failed {
+            // Nobody will accept on this socket again: remove it at once, so a client fails
+            // to connect rather than waiting, and let the agent see that its listener failed.
+            // Requests already taken may finish first, for a few seconds.
+            state.withLock { $0.failed = true }
+            _ = unlink(url.path)
+            _ = workers.wait(timeout: .now() + 5)
+        }
         stop()
         workers.wait()
+    }
+    /// Waits `duration` unless `stop()` is called first; true if it was.
+    private func pause(_ duration: Duration) -> Bool {
+        var item = pollfd(fd: wakeRead, events: Int16(POLLIN), revents: 0)
+        let milliseconds = Int32(duration.components.seconds * 1000 + duration.components.attoseconds / 1_000_000_000_000_000)
+        return poll(&item, 1, milliseconds) > 0
+    }
+    private func pollListener(_ items: inout [pollfd]) -> Int32 {
+        let fault = state.withLock { value -> Int32? in
+            guard let fault = value.pollFault else { return nil }
+            if fault.afterPolls > 0 { value.pollFault = (fault.errno, fault.afterPolls - 1); return nil }
+            value.pollFault = nil
+            return fault.errno
+        }
+        if let fault { errno = fault; return -1 }
+        return poll(&items, nfds_t(items.count), -1)
+    }
+    private func acceptClient() -> Int32 {
+        let fault = state.withLock { value -> Int32? in
+            value.acceptAttempts.append(.now)
+            guard let fault = value.acceptFaults, fault.times > 0 else { return nil }
+            value.acceptFaults = fault.times > 1 ? (fault.errno, fault.times - 1) : nil
+            return fault.errno
+        }
+        if let fault { errno = fault; return -1 }
+        return accept(fd, nil, nil)
+    }
+    /// How long the listener waits after its `failures`th accept failure in a row: doubling
+    /// from 10 ms, at most a second, so a lasting shortage of descriptors costs no CPU.
+    static func acceptBackoff(failures: Int) -> Duration {
+        .milliseconds(min(10 << min(max(failures - 1, 0), 7), 1000))
+    }
+    /// Lets a connection hold `count` more bytes: within `smallFrame` freely, beyond it under
+    /// a whole-frame reservation, which is refused when the budget has no frame left.
+    private func hold(_ count: Int, _ holding: inout Holding) -> Bool {
+        if holding.reserved { return true }
+        if holding.small + count <= Self.smallFrame {
+            holding.small += count
+            state.withLock { $0.small += count }
+            return true
+        }
+        let budget = byteBudget, small = holding.small
+        let granted = state.withLock { value in
+            guard value.reserved + LocalSocket.maxFrame <= budget else { return false }
+            value.reserved += LocalSocket.maxFrame
+            value.small -= small
+            value.peakReserved = max(value.peakReserved, value.reserved)
+            return true
+        }
+        if granted { holding = Holding(small: 0, reserved: true) }
+        return granted
+    }
+    private func release(_ holding: inout Holding) {
+        let released = holding
+        holding = Holding()
+        state.withLock { value in
+            value.small -= released.small
+            if released.reserved { value.reserved -= LocalSocket.maxFrame }
+        }
     }
 }

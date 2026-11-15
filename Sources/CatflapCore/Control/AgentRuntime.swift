@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 public struct AgentStatus: Codable, Sendable {
     public var running: Bool = true
@@ -46,6 +47,13 @@ public struct UIState: Codable, Sendable {
 public actor AgentRuntime {
     public let store: Store
     public let identityServer: IdentityServer
+    /// The runtime this process's agent serves control commands from, for desktop code that
+    /// is reached only through a toolkit callback and holds no reference to it: the Linux
+    /// clipboard writer fetches a whole item with `clip.get` through it. The agent sets it
+    /// once at start; nil in a process that runs no agent.
+    public static var process: AgentRuntime? { processRuntime.withLock { $0 } }
+    public static func setProcess(_ runtime: AgentRuntime?) { processRuntime.withLock { $0 = runtime } }
+    private static let processRuntime = Mutex<AgentRuntime?>(nil)
     private var ui = UIState()
     private var platform = PlatformStatus()
     public typealias Handler = @Sendable (ControlRequest) async throws -> ControlResponse

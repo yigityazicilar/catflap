@@ -25,11 +25,11 @@ struct Catflap: AsyncParsableCommand {
         // Finder, `open` and a double click start Catflap.app with no arguments: that is the
         // agent. A bare `catflap` with no arguments still prints its help.
         if CommandLine.arguments.count == 1, Bundle.main.bundleIdentifier != nil, Bundle.main.bundleURL.pathExtension == "app" {
-            await main(["agent"])
-            return
+            // Started again while an agent runs, it shows that agent's panel instead.
+            await CommandBoundary.run(["agent", "--show-if-running"])
         }
         #endif
-        await main(nil)
+        await CommandBoundary.run(Array(CommandLine.arguments.dropFirst()))
     }
 }
 
@@ -42,7 +42,8 @@ struct ClientOptions: ParsableArguments {
     @Option(name: .long, help: "Agent data directory.") var dataDir: String?
     @Flag(name: .long, help: "Print JSON.") var json = false
     var socket: URL { URL(fileURLWithPath: dataDir ?? AgentPaths.defaultDirectory.path).appendingPathComponent("control.sock") }
-    func call(_ command: String, arguments: [String: String] = [:]) throws {
+    /// One request, printed as the agent's JSON once it has the shape `expect` checks for.
+    func call(_ command: String, arguments: [String: String] = [:], expect: (ControlResponse) throws -> Void) throws {
         let response: ControlResponse
         do { response = try ControlClient.request(.init(command, arguments: arguments), socket: socket) }
         catch {
@@ -56,6 +57,7 @@ struct ClientOptions: ParsableArguments {
             } else { FileHandle.standardError.write(Data(((response.error ?? "Control request failed.") + "\n").utf8)) }
             throw ExitCode(response.exitCode)
         }
+        try expect(response)
         // JSON is also the stable text representation until platform presentation lands.
         print(String(decoding: response.payload, as: UTF8.self))
     }
@@ -68,19 +70,31 @@ struct ClientOptions: ParsableArguments {
 
 struct Agent: AsyncParsableCommand {
     @Option(name: .long) var dataDir: String?
+    /// What opening the app means: when an agent already runs for this folder, show its panel
+    /// and end with status 0. Without it a second agent is refused.
+    @Flag(name: .long, help: .hidden) var showIfRunning = false
     mutating func run() async throws {
         // New sockets, database sidecars and any platform-created files are private from creation.
         umask(0o077)
+        var listenerFailed = false
         do {
             let paths = try AgentPaths(directory: URL(fileURLWithPath: dataDir ?? AgentPaths.defaultDirectory.path))
-            let lock = try AgentLock(paths: paths)
+            let lock: AgentLock
+            do { lock = try AgentLock(paths: paths) }
+            catch AgentError.alreadyRunning where showIfRunning {
+                guard await Self.showPanel(of: paths) else { throw AgentError.alreadyRunning }
+                return
+            }
             let runtime = try AgentRuntime(paths: paths)
+            AgentRuntime.setProcess(runtime)
             try await Pair.install(on: runtime)
             try await Send.install(on: runtime)
             try await Clip.install(on: runtime)
             try await Audit.install(on: runtime)
             try await runtime.start()
             let control = try ControlServer(paths: paths, lock: lock)
+            // For the test of a listener that fails while the agent runs.
+            if ProcessInfo.processInfo.environment["CATFLAP_TEST_CONTROL_FAULT"] == "poll" { control.inject(.pollFails(errno: EBADF, afterPolls: 1)) }
             // The desktop side: clipboard capture, later the panel. CATFLAP_PLATFORM=off runs
             // the agent without it, for tests (whose agents must not watch the person's real
             // clipboard) and for a machine with no desktop session.
@@ -98,36 +112,54 @@ struct Agent: AsyncParsableCommand {
             term.setEventHandler { continuation.yield(()) }
             interrupt.setEventHandler { continuation.yield(()) }
             term.resume(); interrupt.resume()
-            let task = Task { await control.run { await runtime.handle($0) } }
+            // A listener that fails ends the agent as a signal does, then with status 1.
+            let task = Task { await control.run { await runtime.handle($0) }; continuation.yield(()) }
             for await _ in signals { break }
             control.stop(); await task.value
             continuation.finish(); term.cancel(); interrupt.cancel()
             await platform?.stop()
             await runtime.stop()
+            AgentRuntime.setProcess(nil)
+            listenerFailed = control.listenerFailed
             withExtendedLifetime(control) {}
+            withExtendedLifetime(lock) {}
         } catch {
             reportAgentError(error)
             throw ExitCode.failure
         }
+        // The socket and the lock were released with the server above.
+        if listenerFailed {
+            FileHandle.standardError.write(Data((ControlServer.listenerFailure + "\n").utf8))
+            throw ExitCode.failure
+        }
+    }
+    /// Asks the agent that runs for `paths` to show its panel: a hidden one is opened with
+    /// `toggle`, a shown one is left as it is. False if that agent cannot be asked.
+    private static func showPanel(of paths: AgentPaths) async -> Bool {
+        guard let state = try? await ControlClient.requestAsync(.init("ui.state"), socket: paths.socket), state.ok,
+              let shape = (try? JSONSerialization.jsonObject(with: state.payload)) as? [String: Any] else { return false }
+        if shape["visible"] as? Bool == true { return true }
+        guard let shown = try? await ControlClient.requestAsync(.init("toggle"), socket: paths.socket) else { return false }
+        return shown.ok
     }
 }
 struct Status: ParsableCommand {
     @OptionGroup var options: ClientOptions
-    func run() throws { try options.call("status") }
+    func run() throws { try options.call("status") { _ = try $0.expect(AgentStatus.self) } }
 }
 struct Devices: ParsableCommand {
     @OptionGroup var options: ClientOptions
-    func run() throws { try options.call("devices") }
+    func run() throws { try options.call("devices") { _ = try $0.expect([DeviceSummary].self) } }
 }
 struct Toggle: ParsableCommand {
     @OptionGroup var options: ClientOptions
-    func run() throws { try options.call("toggle") }
+    func run() throws { try options.call("toggle") { try $0.expectObject() } }
 }
 struct UI: ParsableCommand {
     static let configuration = CommandConfiguration(commandName: "ui", subcommands: [State.self, Invoke.self])
     struct State: ParsableCommand {
         @OptionGroup var options: ClientOptions
-        func run() throws { try options.call("ui.state") }
+        func run() throws { try options.call("ui.state") { try $0.expectObject() } }
     }
     struct Invoke: ParsableCommand {
         @OptionGroup var options: ClientOptions
@@ -138,7 +170,7 @@ struct UI: ParsableCommand {
             // Absolute paths: the agent does not share this command's working directory.
             let paths = file.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
             if !paths.isEmpty { arguments["files"] = paths.joined(separator: "\n") }
-            try options.call("ui.invoke", arguments: arguments)
+            try options.call("ui.invoke", arguments: arguments) { try $0.expectObject() }
         }
     }
 }
