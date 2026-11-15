@@ -57,6 +57,24 @@ private func closedUnanswered(_ descriptor: Int32) throws -> Bool {
         return recv(descriptor, &byte, 1, 0) == 0
     }
 }
+/// The one frame written to the connection before it was closed; nil if none came, or more
+/// than one, or it did not close (20 s guard against a hang).
+private func onlyFrameBeforeClose(_ descriptor: Int32) throws -> ControlResponse? {
+    try onControlProbeThread {
+        var timeout = timeval(tv_sec: 20, tv_usec: 0)
+        _ = setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        var data = Data(), buffer = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { recv(descriptor, $0.baseAddress, $0.count, 0) }
+            if count < 0 && errno == EINTR { continue }
+            guard count >= 0 else { return nil }
+            if count == 0 { break }
+            data.append(contentsOf: buffer[..<count])
+        }
+        guard data.firstIndex(of: 10) == data.count - 1 else { return nil }
+        return try? ControlJSON.decoder.decode(ControlResponse.self, from: data.dropLast())
+    }
+}
 private func waitUntil(seconds: Int, _ condition: () -> Bool) async throws -> Bool {
     let deadline = ContinuousClock.now.advanced(by: .seconds(seconds))
     while !condition() {
@@ -94,7 +112,8 @@ extension ControlTests {
         }
         try #require(overlapped, "every status reply came after the server gave up on the silent connection")
         // Wait for the probes to release their slots, then hold all 32, each admitted before
-        // the next one connects. The next connection must be closed, not queued to a worker.
+        // the next one connects. The next connection is not queued to a worker: it is told at
+        // once that the agent is busy, in one frame, and closed, while all 32 are still held.
         try #require(try await waitUntil(seconds: 20) { server.activeConnections == 0 })
         for count in 1...32 {
             silent.append(try rawControlConnection(paths.socket))
@@ -102,7 +121,9 @@ extension ControlTests {
         }
         let extra = try rawControlConnection(paths.socket)
         defer { close(extra) }
-        #expect(try closedUnanswered(extra))
+        let refusal = try onlyFrameBeforeClose(extra)
+        #expect(refusal?.ok == false && refusal?.error == ControlServer.crowded, "the 33rd connection got: \(refusal?.error ?? "not one frame then the end")")
+        #expect(server.activeConnections == 32, "a slot was let go before the refusal came")
         // Stopping must interrupt the silent connections, not wait out their 5 s: an
         // interrupted one is closed with nothing written to it, while one that ran out of time
         // gets a reply first. The newest one opened moments before the stop.
