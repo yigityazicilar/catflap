@@ -54,26 +54,31 @@ Open Catflap.app from Finder (or `open /Applications/Catflap.app`): opened with 
 the app runs the agent. Then switch on Start Catflap at login in its settings (below), and it
 starts by itself from then on. The bare executable run with no arguments from Terminal prints
 its help instead; `catflap agent` runs the agent there. While the agent runs, opening the app
-again does not open the panel or start a second agent; use the menu bar item or the shortcut.
+again (from Finder, Spotlight or `open`) opens its panel with the keyboard in its field; no
+second agent starts.
 
 macOS asks once whether Catflap may show notifications, and may ask whether Catflap may read
 the clipboard. Clipboard history needs that; without it everything else works.
 
 ## The panel
 
-Ctrl+Option+Space opens the panel at the top centre of the screen with the keyboard in its
-field. Resting the pointer on the top edge of the screen opens it without the keyboard, and
-dragging a file to the top edge opens it to take the file. Esc, the shortcut again or a click
-outside closes it.
+Ctrl+Option+Command+Space (⌃⌥⌘Space) opens the panel at the top centre of the screen with the
+keyboard in its field. Resting the pointer on the top edge of the screen opens it without the
+keyboard, and dragging a file to the top edge opens it to take the file. Esc, the shortcut again
+or a click outside closes it.
 
 - **Send text.** Type and press Return. Typing also filters the list.
 - **Send a row.** Arrow keys select a row of the clipboard or history list; Return sends it.
   The send button always says what goes where, for example `Send "meeting notes…" to studio`.
 - **Attach files.** The paperclip (⌘O) opens the file picker. ⌘V with files on the clipboard
   attaches them, and so does dropping files on the panel or on the menu bar item. Return sends
-  them to the selected device; the first device is the one you sent to last.
+  them to the selected device; the first device is the one you sent to last. A file that
+  cannot be sent (moved or deleted since, unreadable, too large) does not stop the others: the
+  panel's line names it and says why, and it alone stays attached, so Return sends it again.
 - **Don't keep** (⌘D): the next sends are recorded in history on both sides without their
-  content. A received text that was not kept can be copied for ten minutes.
+  content. A received text that was not kept can be copied for ten minutes. That copy is marked
+  concealed on the clipboard, so clipboard managers, Catflap's own history included, leave it
+  out; so is the one Put received text on the clipboard makes.
 - **Pause** (⌘⇧P): clipboard history records nothing until you resume it.
 - **Copy** and **Delete** are on every row of both lists. With a row selected, ⌘C copies it
   and ⌘⌫ deletes it; with no row selected they act on the field as usual. Deleting a history row
@@ -92,8 +97,8 @@ attached and the device you used last selected.
 
 ### Send the clipboard
 
-Ctrl+Option+Shift+Space sends the last thing you copied to the device you used last, without
-opening the panel. It sends only a copy clipboard history recorded: right after Catflap starts,
+Ctrl+Option+Shift+Command+Space (⌃⌥⇧⌘Space) sends the last thing you copied to the device you
+used last, without opening the panel. It sends only a copy clipboard history recorded: right after Catflap starts,
 after a copy it skipped as a password, or while history is paused, it sends nothing and a
 notification says why. A send that does not arrive raises a notification with Retry.
 
@@ -114,13 +119,27 @@ To remove a device, choose Remove next to it in settings. It is cut off at once.
 
 | Setting | Kept in |
 | --- | --- |
-| The panel's shortcut and the send-clipboard shortcut | Catflap's preferences |
+| The panel's shortcut and the send-clipboard shortcut (record, or Delete to remove) | Catflap's preferences |
 | Open the panel on hover, and also over full-screen apps | Catflap's data |
 | Put received text on the clipboard (off by default) | Catflap's data |
 | Folder for received files (default `Downloads/Catflap`; a change applies from the next start) | Catflap's data |
 | Start Catflap at login | macOS, under System Settings, General, Login Items |
 
 All of them survive a restart. Catflap's data lives in `~/Library/Application Support/Catflap/`.
+
+### Shortcuts
+
+The defaults are ⌃⌥⌘Space for the panel and ⌃⌥⇧⌘Space to send the clipboard. Earlier versions
+used ⌃⌥Space, which macOS itself uses for Select next source in Input menu once a second input
+source is added; a shortcut recorded with an earlier version still applies.
+
+Catflap registers its shortcuts with macOS itself. A combination that one of macOS's own
+enabled shortcuts uses (System Settings, Keyboard, Keyboard Shortcuts), or that another app or
+Catflap's other shortcut already holds, is not taken: settings show the shortcut in orange as
+doing nothing, and `catflap ui state --json` reports it as `conflict` (`shortcut` for the panel,
+`send_shortcut` for the other, and `panel_shortcut_state` and `send_shortcut_state` under
+`settings`), never as `bound`. Everything else keeps working. Record another combination, or
+switch the macOS shortcut off and record this one again, and it works.
 
 ## The menu bar item
 

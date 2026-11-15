@@ -25,6 +25,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let receivedText = NSSwitch()
     private let login = NSSwitch()
     private let loginNote = NSTextField(wrappingLabelWithString: "")
+    private let panelShortcutNote = NSTextField(wrappingLabelWithString: "")
+    private let sendShortcutNote = NSTextField(wrappingLabelWithString: "")
     private let inboxPath = NSTextField(labelWithString: "")
     private let devices = NSStackView()
     private let message = NSTextField(wrappingLabelWithString: "")
@@ -78,10 +80,18 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         note(loginNote)
         loginNote.preferredMaxLayoutWidth = 280
         inboxNote.preferredMaxLayoutWidth = 280
+        for shortcutNote in [panelShortcutNote, sendShortcutNote] {
+            note(shortcutNote)
+            shortcutNote.textColor = .systemOrange
+            shortcutNote.preferredMaxLayoutWidth = 280
+            shortcutNote.isHidden = true
+        }
 
         let grid = NSGridView(views: [
             [label("Open the panel:"), panelRecorder],
+            [NSGridCell.emptyContentView, panelShortcutNote],
             [label("Send the clipboard:"), sendRecorder],
+            [NSGridCell.emptyContentView, sendShortcutNote],
             [label("Top of the screen:"), switchRow(hoverBand, "Open the panel on hover")],
             [NSGridCell.emptyContentView, switchRow(hoverFullScreen, "Also over full-screen apps")],
             [label("Received text:"), switchRow(receivedText, "Put it on the clipboard")],
@@ -163,6 +173,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
         panelRecorder.refresh()
         sendRecorder.refresh()
+        for (shortcutNote, state) in [(panelShortcutNote, settings.panelShortcutState), (sendShortcutNote, settings.sendShortcutState)] {
+            // A shortcut whose keys macOS or another app has does nothing until it is rebound.
+            shortcutNote.stringValue = state == "conflict" ? "macOS or another app uses this shortcut, so it does nothing. Record another." : ""
+            shortcutNote.isHidden = shortcutNote.stringValue.isEmpty
+        }
         message.stringValue = text
         message.isHidden = text.isEmpty
         let ids = list.map { $0.id + "\u{0}" + $0.name }

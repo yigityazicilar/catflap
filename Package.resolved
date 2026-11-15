@@ -1,15 +1,6 @@
 {
-  "originHash" : "29cb2e82b09ba4b5c673de03411bb6a8249412d3320de8d32c022f27356213da",
+  "originHash" : "333b710aa251b89abd9b02624b06c6b98f552483ccc6390b94204408cb3bcfbb",
   "pins" : [
-    {
-      "identity" : "keyboardshortcuts",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/sindresorhus/KeyboardShortcuts.git",
-      "state" : {
-        "revision" : "1aef85578fdd4f9eaeeb8d53b7b4fc31bf08fe27",
-        "version" : "2.4.0"
-      }
-    },
     {
       "identity" : "swift-argument-parser",
       "kind" : "remoteSourceControl",
