@@ -132,9 +132,39 @@ import Testing
         #expect(different.isEmpty, "scan and regex differ on: \(different)")
         #expect(found >= 200, "the draw found \(found) JWT shapes")
     }
-    /// A copy up to the 4 MiB text limit that nearly matches a pattern is checked in linear
-    /// time. As a regex the JWT check took 22 s on 128 KiB of "eyJ-" and hours on 4 MiB,
-    /// holding the clipboard actor the whole time.
+    /// The scaling check itself: work that reads from every position to the end, as a pattern
+    /// that restarts at every word start does, fails it, and one pass over the input passes.
+    @Test func testScalingCheckFailsOnQuadraticWork() async throws {
+        let make: @Sendable (Int) -> String = { String(repeating: "a", count: $0) }
+        await withKnownIssue("quadratic work must fail the scaling check") {
+            // An error from the helper is recorded as itself, so it cannot pass for the known issue.
+            do {
+                try await expectLinearScaling("quadratic work", small: 128, make: make) { text in
+                    let bytes = Array(text.utf8)
+                    var matches = 0
+                    for start in bytes.indices {
+                        for byte in bytes[start...] where byte == bytes[start] { matches += 1 }
+                    }
+                    return matches == 0
+                }
+            } catch {
+                Issue.record(error)
+            }
+        } matching: { issue in
+            if case .expectationFailed = issue.kind { return true }
+            return false
+        }
+        try await expectLinearScaling("linear work", small: 128, make: make) { text in
+            var matches = 0
+            for byte in text.utf8 where byte == UInt8(ascii: "a") { matches += 1 }
+            return matches == 0
+        }
+    }
+    /// A copy that nearly matches a pattern is checked in linear time: 32 times the input
+    /// takes about 32 times as long. As a regex the JWT check took 22 s on 128 KiB of "eyJ-"
+    /// and hours on 4 MiB, holding the clipboard actor the whole time. The sizes are 4 KiB and
+    /// 128 KiB, so that a pattern gone quadratic fails here in a minute or two instead of
+    /// running for hours at the 4 MiB text limit.
     @Test func testLongNearMissesFinishQuickly() async throws {
         let families: [(String, @Sendable (Int) -> String)] = [
             ("JWT start after a hyphen", { String(repeating: "eyJ-", count: $0 / 4) }),
@@ -149,20 +179,63 @@ import Testing
             ("one letter", { String(repeating: "A", count: $0) })
         ]
         for (label, make) in families {
-            for size in [128 * 1024, ClipboardHistory.textLimit] {
-                let (bytes, took) = try await filterOffPool { () -> (Int, Duration) in
-                    let text = make(size)
-                    let start = ContinuousClock.now
-                    _ = SecretFilter.rejects(text)
-                    return (text.utf8.count, start.duration(to: .now))
-                }
-                let limit: Duration = size == ClipboardHistory.textLimit ? .seconds(20) : .seconds(3)
-                #expect(took < limit, "\(label), \(bytes) bytes: \(took)")
-                // A family already slow at 128 KiB would take hours at 4 MiB.
-                if took >= limit { break }
-            }
+            try await expectLinearScaling(label, small: 4 * 1024, make: make) { SecretFilter.rejects($0) }
         }
     }
+}
+
+/// The best time of one call on an input of the small size and on one 32 times as large.
+/// Linear work gives a ratio of about 32 and quadratic work about 1024.
+private struct Scaling: CustomStringConvertible, Sendable {
+    let label: String
+    let smallBytes: Int, largeBytes: Int
+    let smallBest: Duration, largeBest: Duration
+    var ratio: Double { largeBest / smallBest }
+    var description: String {
+        let milliseconds = { (time: Duration) in String(format: "%.3f", time / .milliseconds(1)) }
+        return "scaling: \(label), \(smallBytes) and \(largeBytes) bytes, best \(milliseconds(smallBest)) "
+            + "and \(milliseconds(largeBest)) ms, ratio \(String(format: "%.1f", ratio))"
+    }
+}
+
+/// Times `work` on `make(small)` and on `make(small * 32)` and fails when the large input
+/// takes 256 times as long as the small one or more. A wall-clock bound flaked, because
+/// hosted macOS runners differ fourfold in speed from run to run (one test took 18.7 to
+/// 79.1 s), while a ratio taken on one runner within seconds does not. The sizes take turns,
+/// small, large, three times each, so that contention that lasts slows both alike, and the
+/// best of each counts. A sample under 5 ms repeats the call within itself until it takes
+/// longer, so that a fast small size is measured rather than the clock. Prints one line with
+/// the label, the sizes and the times, never the input.
+@discardableResult
+private func expectLinearScaling(_ label: String, small: Int, make: @escaping @Sendable (Int) -> String,
+                                 sourceLocation: SourceLocation = #_sourceLocation,
+                                 work: @escaping @Sendable (String) -> Bool) async throws -> Scaling {
+    let scaling = try await filterOffPool { () -> Scaling in
+        let inputs = [make(small), make(small * 32)]
+        var repeats = [1, 1]
+        var best: [Duration?] = [nil, nil]
+        for _ in 0..<3 {
+            for side in 0..<2 {
+                while true {
+                    let start = ContinuousClock.now
+                    for _ in 0..<repeats[side] { _ = work(inputs[side]) }
+                    let took = start.duration(to: .now)
+                    if took < .milliseconds(5) {
+                        repeats[side] *= 2
+                        continue
+                    }
+                    let each = took / repeats[side]
+                    best[side] = min(best[side] ?? each, each)
+                    break
+                }
+            }
+        }
+        return Scaling(label: label, smallBytes: inputs[0].utf8.count, largeBytes: inputs[1].utf8.count,
+                       smallBest: best[0]!, largeBest: best[1]!)
+    }
+    print(scaling)
+    #expect(scaling.ratio < 256, "\(scaling)", sourceLocation: sourceLocation)
+    return scaling
 }
 
 /// Runs a filter workload on a thread of its own. A synchronous test holds one of Swift's
