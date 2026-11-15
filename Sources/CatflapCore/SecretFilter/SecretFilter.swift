@@ -50,7 +50,7 @@ public enum SecretFilter {
             let p = Double(count) / size
             return total - p * log2(p)
         }
-        if readsAsWords(text) || isUUID(text) { return false }
+        if readsAsWords(text) || isUUID(text) || isDigestExemption(text) || isVersion(text) { return false }
         return entropy >= (text.utf8.count >= 32 ? 3.5 : 4.0)
     }
 
@@ -81,9 +81,40 @@ public enum SecretFilter {
     /// words have few capitals. Random letters switch case at about every other character,
     /// so a token made of letters and joiners (base64url with no digit in it) does not pass.
     /// Anything with a digit or another symbol goes to the entropy test.
+    /// Whole one-case hashes only, after provider shapes. Prefix and length must agree.
+    static func isDigestExemption(_ text: String) -> Bool {
+        var body = text
+        for (prefix, length) in [("sha1:", 40), ("sha256:", 64), ("sha512:", 128)] where text.hasPrefix(prefix) {
+            body = String(text.dropFirst(prefix.count))
+            guard body.utf8.count == length else { return false }
+            break
+        }
+        guard [40, 64, 128].contains(body.utf8.count) else { return false }
+        var lower = false, upper = false
+        for byte in body.utf8 {
+            switch byte {
+            case 48...57: break
+            case 97...102: lower = true
+            case 65...70: upper = true
+            default: return false
+            }
+        }
+        return !(lower && upper)
+    }
+    static func isVersion(_ text: String) -> Bool {
+        text.range(of: #"^v?[0-9]{1,8}(?:\.[0-9]{1,8}){1,3}(?:-[a-z]+(?:\.[0-9]{1,8})?)?(?:\+build\.[0-9]{1,8})?$"#, options: .regularExpression) != nil
+    }
     static func readsAsWords(_ text: String) -> Bool {
+        var words = text
+        // Only a trailing numeric schema/version tag, not digits scattered through a token.
+        if let suffix = words.range(of: #"_v[0-9]{1,8}$"#, options: .regularExpression) { words.removeSubrange(suffix) }
+        // A fixed vocabulary preserves acronym-heavy identifiers without exempting random
+        // mixed-case tokens. The remaining letters must still read as words.
+        for acronym in ["HTTPS", "HTTP", "JSON", "URL", "UUID", "XML", "SQL", "UTF", "ASCII", "TCP", "UDP", "TLS", "SSL", "HTML", "CSS", "DOM", "API"] {
+            words = words.replacingOccurrences(of: acronym, with: "word")
+        }
         var letters = 0, capitals = 0
-        for byte in text.utf8 {
+        for byte in words.utf8 {
             switch byte {
             case UInt8(ascii: "a")...UInt8(ascii: "z"): letters += 1
             case UInt8(ascii: "A")...UInt8(ascii: "Z"): letters += 1; capitals += 1

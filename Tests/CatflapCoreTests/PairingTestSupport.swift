@@ -169,18 +169,7 @@ func waitForStatus(_ device: TestDevice, timeout: Duration = .seconds(60),
     }
 }
 
-/// How long `waitUntil` waits by default before it gives up: a hang guard only, never the
-/// expected time. A passing wait returns as soon as its condition holds. It outlasts the
-/// longest path a send may legitimately take before its row settles, taken from the product's
-/// own limits: one overall dial deadline, the two Open handshake reads, then the waits for the
-/// accept and for the acknowledgement. A guard equal to the dial limit alone failed a refused
-/// text on a loaded macOS runner that the product would have passed.
-let testWaitGuard: Duration = {
-    let limits = TransferLimits()
-    return limits.dial + PeerOpen.handshakeTimeout * 2 + limits.idle * 2 + .seconds(10)
-}()
-
-func waitUntil(timeout: Duration = testWaitGuard, _ condition: () async throws -> Bool) async throws -> Bool {
+func waitUntil(timeout: Duration = .seconds(30), _ condition: () async throws -> Bool) async throws -> Bool {
     let deadline = ContinuousClock.now + timeout
     let step = TestProgress.current?.last ?? ""
     TestProgress.mark(step + " (waiting for a condition)")

@@ -161,6 +161,8 @@ public actor TransferService {
     var wake: AsyncStream<Void>.Continuation?
     var schedulerTask: Task<Void, Never>?
     var sweepTask: Task<Void, Never>?
+    var receivedHandler: (@Sendable (String, String, ClipboardContent, Bool, String) async -> Void)?
+    public func setReceivedHandler(_ handler: (@Sendable (String, String, ClipboardContent, Bool, String) async -> Void)?) { receivedHandler = handler }
     var eventHandler: (@Sendable (TransferEvent) async -> Void)?
     nonisolated var outbox: URL { history.store.paths.directory.appendingPathComponent("outbox") }
     public var freeBytesOverride: Int64?
@@ -266,21 +268,33 @@ public actor TransferService {
             if row.status == "waiting", let stored = try await history.record(deviceID: deviceID, id: id) {
                 var merged = row; merged.waiting = stored.waiting; return merged
             }
-            return row
+            return try await withOpenable(row)
         }
         if let row = receiving[key] { return row }
-        return try await history.record(deviceID: deviceID, id: id)
+        guard let row = try await history.record(deviceID: deviceID, id: id) else { return nil }
+        return try await withOpenable(row)
     }
     public func list(_ query: TransferQuery) async throws -> TransferPage {
         let page = try await history.page(query)
         // Rows under way carry their progress and phase from memory.
-        let items = page.items.map { row -> TransferRecord in
+        var items: [TransferRecord] = []
+        for row in page.items {
             let key = row.deviceID + "/" + row.id
-            guard var live = results[key] ?? receiving[key], live.status == row.status else { return row }
-            live.waiting = row.waiting
-            return live.listed
+            var selected = row
+            if var live = results[key] ?? receiving[key], live.status == row.status {
+                live.waiting = row.waiting; selected = live
+            }
+            items.append(try await withOpenable(selected).listed)
         }
         return TransferPage(items: items, nextBefore: page.nextBefore)
+    }
+
+    private func withOpenable(_ record: TransferRecord) async throws -> TransferRecord {
+        var row = record
+        if row.direction == "received", row.kind == "text", row.status == "ok" {
+            row.linkOpenable = try await copyText(deviceID: row.deviceID, id: row.id).flatMap(LinkNormalizer.normalize) != nil
+        }
+        return row
     }
 
     // MARK: Cancelling

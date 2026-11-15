@@ -65,6 +65,8 @@ public struct TransferRecord: Codable, Sendable {
     public var partExpiresAt: Date?
     /// In a list: at most 200 characters of a kept text, in place of the text.
     public var preview: String?
+    var linkOpenable: Bool?
+    public var openable: Bool { linkOpenable ?? (direction == "received" && status == "ok" && text.flatMap(LinkNormalizer.normalize) != nil) }
     public var canRetry: Bool { direction == "sent" && ["failed", "unconfirmed", "expired", "cancelled"].contains(status) }
     public var canCancel: Bool {
         direction == "sent" ? ["sending", "waiting"].contains(status) : status == "interrupted"
@@ -72,6 +74,7 @@ public struct TransferRecord: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case id, timestamp, direction, kind, size, status, text, path, sha256, keep, error, mime, intent, entries, skipped, phase, progress, waiting, preview
         case deviceID = "device_id", targetName = "target_name", canRetry = "can_retry", canCancel = "can_cancel"
+        case openable
         case sendID = "send_id", clipKind = "clip_kind", updatedAt = "updated_at", resumedFrom = "resumed_from", partExpiresAt = "part_expires_at"
     }
     public init(id: String, deviceID: String, direction: String, kind: String, size: Int64, status: String, keep: Bool = true) {
@@ -92,9 +95,11 @@ public struct TransferRecord: Codable, Sendable {
         resumedFrom = try c.decodeIfPresent(Int64.self, forKey: .resumedFrom); progress = try c.decodeIfPresent(TransferProgress.self, forKey: .progress)
         waiting = try c.decodeIfPresent(WaitingInfo.self, forKey: .waiting); partExpiresAt = try c.decodeIfPresent(Date.self, forKey: .partExpiresAt)
         preview = try c.decodeIfPresent(String.self, forKey: .preview)
+        linkOpenable = try c.decodeIfPresent(Bool.self, forKey: .openable)
     }
     public func encode(to encoder: any Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(openable, forKey: .openable)
         try c.encode(id, forKey: .id); try c.encode(deviceID, forKey: .deviceID); try c.encode(timestamp, forKey: .timestamp)
         try c.encode(direction, forKey: .direction); try c.encode(kind, forKey: .kind); try c.encode(size, forKey: .size); try c.encode(status, forKey: .status)
         try c.encodeIfPresent(text, forKey: .text); try c.encodeIfPresent(path, forKey: .path); try c.encodeIfPresent(sha256, forKey: .sha256)
@@ -108,6 +113,7 @@ public struct TransferRecord: Codable, Sendable {
     /// The row without its body, for lists.
     public var listed: TransferRecord {
         var row = self
+        row.linkOpenable = openable
         if let text { row.preview = String(text.prefix(200)) }
         row.text = nil
         return row

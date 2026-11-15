@@ -4,7 +4,7 @@ import Foundation
 
 struct Clip: AsyncParsableCommand, AgentFeature {
     @OptionGroup var options: ClientOptions
-    @Argument(help: "list, get, add, keep, delete, pause, or send") var action: String?
+    @Argument(help: "list, get, add, keep, delete, pause, filter, or send") var action: String?
     @Argument(help: "Item id, or on/off for pause.") var id: String?
     @Option(name: .long) var text: String?
     @Option(name: .long, help: "Read an image from a file, or add a file reference with --kind files.") var file: String?
@@ -14,6 +14,8 @@ struct Clip: AsyncParsableCommand, AgentFeature {
     @Option(name: .long) var search: String?
     @Option(name: .long) var to: String?
     @Flag(name: .long) var dontKeep = false
+    @Flag(name: .long) var on = false
+    @Flag(name: .long) var off = false
     @Flag(name: .long, help: "With send: the newest copy, only if clipboard history recorded it.") var latest = false
 
     static func install(on runtime: AgentRuntime) async throws {
@@ -23,11 +25,19 @@ struct Clip: AsyncParsableCommand, AgentFeature {
         let paths = await store.paths
         let service = ClipboardService(history: history, transfers: transfers, store: store, directory: paths.directory)
         try await service.install(on: runtime)
+        let follow = FollowService(store: store, transfers: transfers)
+        await follow.install(on: runtime, clipboard: service)
+        if ProcessInfo.processInfo.environment["CATFLAP_PLATFORM"] == "off", ProcessInfo.processInfo.environment["CATFLAP_TEST_FOLLOW_PLATFORM"] == "1" {
+            let platform = TestFollowPlatform(history: history)
+            await follow.setPlatform(platform)
+            await runtime.register("follow.test.state") { _ in try await ControlResponse(value: platform.state()) }
+        }
     }
     func run() async throws {
-        guard let action, ["list", "get", "add", "keep", "delete", "pause", "send"].contains(action) else {
+        guard let action, ["list", "get", "add", "keep", "delete", "pause", "filter", "send"].contains(action) else {
             try fail("Use clip list, get, add, keep, delete, pause, or send.", code: 64)
         }
+        if (on || off) && action != "filter" || (on && off) { try fail("Use --on or --off with clip filter.", code: 64) }
         if latest && action != "send" { try fail("--latest goes with clip send.", code: 64) }
         var arguments: [String: String] = [:]
         switch action {
@@ -67,6 +77,9 @@ struct Clip: AsyncParsableCommand, AgentFeature {
                 guard let id else { try fail("An item id is required.", code: 64) }
                 arguments["id"] = id
             }
+        case "filter":
+            guard id == nil else { try fail("Use clip filter --on or --off.", code: 64) }
+            if on || off { arguments["filter_secrets"] = on ? "true" : "false" }
         case "pause":
             if let id {
                 guard ["on", "off"].contains(id) else { try fail("Use clip pause on or off.", code: 64) }
@@ -80,7 +93,7 @@ struct Clip: AsyncParsableCommand, AgentFeature {
             switch action {
             case "list": _ = try response.expect([ClipboardItem].self)
             case "get": _ = try response.expect(ClipboardItem.self)
-            case "pause": _ = try response.expect([String: Bool].self)
+            case "pause", "filter": _ = try response.expect([String: Bool].self)
             default: _ = try response.expect(ClipboardIngestResult.self)
             }
             print(String(decoding: response.payload, as: UTF8.self)); return

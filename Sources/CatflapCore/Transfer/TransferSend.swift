@@ -34,6 +34,7 @@ extension TransferService {
 
     /// With `single`, a refusal throws instead of being listed, as `start` always did.
     private func enqueue(_ request: SendRequest, single: Bool) async throws -> TransferBatch {
+        guard ["deliver", "follow", "open"].contains(request.intent) else { throw TransferFailure.invalid }
         let paired = Set(try await history.store.devices().map(\.id))
         let sendID = UUID().uuidString
         var refused: [TransferRefusal] = []
@@ -45,7 +46,23 @@ extension TransferService {
         }
         var payloads: [(TransferPayload, kind: String, size: Int64, mime: String)] = []
         for payload in request.payloads {
-            do { payloads.append(try check(payload)) }
+            do {
+                var source = payload
+                if request.intent == "open" {
+                    guard case .text(let text) = payload, let url = LinkNormalizer.normalize(text) else { throw TransferFailure.invalid }
+                    source = .text(url.absoluteString)
+                }
+                if request.intent == "follow" {
+                    switch payload {
+                    case .text(let text):
+                        guard ["text", "url"].contains(request.clipKind) else { throw TransferFailure.invalid }
+                        if request.clipKind == "url", LinkNormalizer.normalize(text) == nil { throw TransferFailure.invalid }
+                    case .image: guard request.clipKind == "image" else { throw TransferFailure.invalid }
+                    default: throw TransferFailure.invalid
+                    }
+                } else if request.clipKind != nil { throw TransferFailure.invalid }
+                payloads.append(try check(source))
+            }
             catch {
                 if single { throw error }
                 refused.append(.init(deviceID: nil, file: Self.path(of: payload), error: (error as? LocalizedError)?.errorDescription ?? "Cannot send it."))

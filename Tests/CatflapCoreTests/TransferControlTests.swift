@@ -25,7 +25,7 @@ struct ControlFixture: Sendable {
         let f = try await ControlFixture(); defer { f.cleanup() }
         let status = try await f.handle("status").decode(AgentStatus.self)
         #expect(status.schemaVersion == (try await f.runtime.store.schemaVersion()))
-        #expect(status.schemaVersion == 2)
+        #expect(status.schemaVersion == 3)
     }
 
     @Test func testTransferListSendsPreviewsNotBodies() async throws {

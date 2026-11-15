@@ -11,7 +11,7 @@ struct AgentE2E {
         #expect(status.code == 0)
         let first = try status.decode(AgentStatus.self)
         #expect(first.running && !first.serverRunning && first.pairedDevices == 0)
-        #expect(first.schemaVersion == 2)
+        #expect(first.schemaVersion == 3)
         // A test agent runs without its platform module, so it never watches a real clipboard.
         #expect(first.clipboardCapture == "off")
         let refusedErase = try agent.eraseIdentity()

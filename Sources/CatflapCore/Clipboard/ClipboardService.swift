@@ -19,7 +19,7 @@ public actor ClipboardService {
         try await cleanOutbox()
         await runtime.provide(history)
         await runtime.provide(self)
-        for command in ["clip.list", "clip.get", "clip.add", "clip.keep", "clip.delete", "clip.pause", "clip.send", "clip.send.status"] {
+        for command in ["clip.list", "clip.get", "clip.add", "clip.keep", "clip.delete", "clip.pause", "clip.filter", "clip.send", "clip.send.status"] {
             await runtime.register(command) { [self] request in
                 do { return try await handle(request) }
                 catch { return ControlResponse(failure: Self.failureMessage(for: error)) }
@@ -57,7 +57,7 @@ public actor ClipboardService {
             guard let kind = ClipboardKind(rawValue: a["kind"] ?? "text") else { throw ClipboardFailure.invalid }
             let types = a["offered_types"]?.split(separator: "\n").map(String.init) ?? []
             // Base64 decoding and validation are inside the reader, after the marker gate.
-            let result = try await history.ingest(offeredTypes: types, passwordManagerFrontmost: a["password_manager_frontmost"] == "true", kind: kind) {
+            let result = try await history.ingest(offeredTypes: types, passwordManagerFrontmost: a["password_manager_frontmost"] == "true", kind: kind, origin: a["origin"].flatMap { $0.data(using: .utf8) }.flatMap { try? JSONDecoder().decode(ClipboardOrigin.self, from: $0) }) {
                 let bytes: Data
                 if let encoded = a["data"] {
                     guard let decoded = Data(base64Encoded: encoded) else { throw ClipboardFailure.invalid }
@@ -73,6 +73,12 @@ public actor ClipboardService {
             guard let id = a["id"] else { throw ClipboardFailure.missing }
             try await history.delete(id: id)
             return try ControlResponse(value: ClipboardIngestResult("deleted", id: id))
+        case "clip.filter":
+            if let value = a["filter_secrets"] {
+                guard ["true", "false"].contains(value) else { throw ClipboardFailure.invalid }
+                try await history.setFiltersSecrets(value == "true")
+            }
+            return try ControlResponse(value: ["filter_secrets": await history.filtersSecrets()])
         case "clip.pause":
             if let value = a["paused"] {
                 guard ["true", "false"].contains(value) else { throw ClipboardFailure.invalid }

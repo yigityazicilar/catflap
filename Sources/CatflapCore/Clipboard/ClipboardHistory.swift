@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 public enum ClipboardKind: String, Codable, Sendable { case text, url, image, files }
 public struct ClipboardContent: Sendable {
@@ -23,11 +24,12 @@ public struct ClipboardItem: Codable, Sendable, Identifiable {
     public let size: Int
     /// True when `content` is not the whole item; `clip.get` returns it whole.
     public let truncated: Bool
+    public let followedFrom: String?
     public var text: String? { kind == .image ? nil : String(data: content, encoding: .utf8) }
-    enum CodingKeys: String, CodingKey { case id, timestamp, kind, content, mime, kept, size, truncated }
-    init(id: String, timestamp: Date, kind: ClipboardKind, content: Data, mime: String?, kept: Bool, size: Int? = nil, truncated: Bool = false) {
+    enum CodingKeys: String, CodingKey { case id, timestamp, kind, content, mime, kept, size, truncated; case followedFrom = "followed_from" }
+    init(id: String, timestamp: Date, kind: ClipboardKind, content: Data, mime: String?, kept: Bool, size: Int? = nil, truncated: Bool = false, followedFrom: String? = nil) {
         self.id = id; self.timestamp = timestamp; self.kind = kind; self.content = content; self.mime = mime; self.kept = kept
-        self.size = size ?? content.count; self.truncated = truncated
+        self.size = size ?? content.count; self.truncated = truncated; self.followedFrom = followedFrom
     }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -37,6 +39,7 @@ public struct ClipboardItem: Codable, Sendable, Identifiable {
         // An item from before previews existed is whole.
         size = try c.decodeIfPresent(Int.self, forKey: .size) ?? content.count
         truncated = try c.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
+        followedFrom = try c.decodeIfPresent(String.self, forKey: .followedFrom)
     }
 }
 public struct ClipboardIngestResult: Codable, Sendable {
@@ -44,9 +47,10 @@ public struct ClipboardIngestResult: Codable, Sendable {
     public let id: String?
     public let canKeep: Bool
     public let message: String?
-    enum CodingKeys: String, CodingKey { case status, id, message; case canKeep = "can_keep" }
-    init(_ status: String, id: String? = nil, canKeep: Bool = false, message: String? = nil) {
-        self.status = status; self.id = id; self.canKeep = canKeep; self.message = message
+    public let followedFrom: String?
+    enum CodingKeys: String, CodingKey { case status, id, message; case canKeep = "can_keep", followedFrom = "followed_from" }
+    init(_ status: String, id: String? = nil, canKeep: Bool = false, message: String? = nil, followedFrom: String? = nil) {
+        self.status = status; self.id = id; self.canKeep = canKeep; self.message = message; self.followedFrom = followedFrom
     }
 }
 public enum ClipboardFailure: String, Error, LocalizedError {
@@ -59,6 +63,7 @@ public enum ClipboardFailure: String, Error, LocalizedError {
     case latestPaused = "Clipboard history is paused, so there is no recorded copy to send."
     case latestCopiedWhilePaused = "The last copy was made while clipboard history was paused."
     case latestFiltered = "The last copy was skipped because it looks like a secret. Keep it in Catflap to send it."
+    case latestFollowedNotKept = "The last copy was followed without Keep."
     case latestMarked = "The last copy came from a password manager and was not recorded."
     case latestOversize = "The last copy was too large to record."
     case latestUnreadable = "The last copy was not something Catflap records."
@@ -66,6 +71,8 @@ public enum ClipboardFailure: String, Error, LocalizedError {
     case latestNoDevice = "No paired device. Pair one first with `catflap pair start`."
     public var errorDescription: String? { rawValue }
 }
+
+private final class GenerationGate: Sendable { let value = Mutex<UInt64>(0) }
 
 public actor ClipboardHistory {
     public static let imageLimit = 20_000_000
@@ -79,8 +86,21 @@ public actor ClipboardHistory {
     private enum Latest { case stored(String), skipped(ClipboardFailure), reading }
     private var latest: Latest?
     private var generation: UInt64 = 0
-    private var pending: (id: String, content: ClipboardContent)?
-    public init(store: Store, paused: Bool = false) { self.store = store; self.paused = paused }
+    private let commitGeneration = GenerationGate()
+    private let filterWorker: ClipboardFilterWorker
+    private var beforeCommit: (@Sendable () async -> Void)?
+    func setBeforeCommit(_ hook: (@Sendable () async -> Void)?) { beforeCommit = hook }
+    private var recordedHandler: (@Sendable (String, ClipboardContent, Bool) async -> Void)?
+    public func setRecordedHandler(_ handler: (@Sendable (String, ClipboardContent, Bool) async -> Void)?) { recordedHandler = handler }
+    private var pending: (id: String, content: ClipboardContent, origin: ClipboardOrigin?, suppressFollow: Bool)?
+    public init(store: Store, paused: Bool = false, filterWorker: ClipboardFilterWorker = .init()) {
+        self.store = store; self.paused = paused; self.filterWorker = filterWorker
+    }
+    public func filtersSecrets() async throws -> Bool { try await store.setting("clipboard.filter_secrets") != "false" }
+    public func setFiltersSecrets(_ value: Bool) async throws {
+        try await store.setSetting("clipboard.filter_secrets", value: value ? "true" : "false")
+        generation &+= 1; commitGeneration.value.withLock { $0 = generation }; pending = nil
+    }
     public static func open(store: Store) async throws -> ClipboardHistory {
         let history = ClipboardHistory(store: store, paused: try await store.setting("clipboard_paused") == "true")
         try await history.retain()
@@ -91,8 +111,10 @@ public actor ClipboardHistory {
     /// The adapter also bounds its read to the corresponding limit when the size is unknown.
     public func ingest(offeredTypes: [String], passwordManagerFrontmost: Bool = false,
                        declaredSize: Int? = nil, kind: ClipboardKind = .text, now: Date = Date(),
+                       origin: ClipboardOrigin? = nil,
                        read: @Sendable () async throws -> ClipboardContent) async throws -> ClipboardIngestResult {
         generation &+= 1
+        commitGeneration.value.withLock { $0 = generation }
         let ticket = generation
         pending = nil
         // From here until its outcome is known, this copy is the newest one.
@@ -120,20 +142,37 @@ public actor ClipboardHistory {
         }
         do { try Self.validate(content) }
         catch { latest = .skipped(.latestUnreadable); throw error }
-        if content.kind != .image, SecretFilter.rejects(String(decoding: content.data, as: UTF8.self)) {
+        let hasOrigin = origin != nil || offeredTypes.contains(ClipboardOrigin.macType) || offeredTypes.contains(ClipboardOrigin.linuxType)
+        if hasOrigin, origin?.keep == false {
+            latest = .skipped(.latestFollowedNotKept)
+            return .init("followed", followedFrom: origin?.deviceID)
+        }
+        let filtering = try await filtersSecrets()
+        guard ticket == generation, !paused else { return .init("superseded") }
+        let rejected: Bool
+        if content.kind != .image, filtering {
+            guard let verdict = await filterWorker.rejects(String(decoding: content.data, as: UTF8.self)),
+                  ticket == generation, !paused else { return .init("superseded") }
+            rejected = verdict
+        } else { rejected = false }
+        if rejected {
             let id = UUID().uuidString
-            pending = (id, content)
+            pending = (id, content, origin, hasOrigin)
             latest = .skipped(.latestFiltered)
             return .init("filtered", id: id, canKeep: true, message: "Skipped, looks like a secret")
         }
-        let id = try await save(content, kept: false, now: now)
+        await beforeCommit?()
+        let id = try await save(content, kept: false, now: now, ticket: ticket, origin: origin, filtering: filtering)
         // Another copy may have arrived while this one was written; its outcome stands.
         guard let id else {
-            if ticket == generation { latest = .skipped(.latestCopiedWhilePaused) }
-            return .init("paused")
+            let persistedPause = try await store.setting("clipboard_paused") == "true"
+            guard ticket == generation else { return .init("superseded") }
+            latest = .skipped(persistedPause ? .latestCopiedWhilePaused : .latestUnreadable)
+            return .init(persistedPause ? "paused" : "superseded")
         }
         if ticket == generation { latest = .stored(id) }
-        return .init("stored", id: id)
+        if !hasOrigin, ticket == generation { await recordedHandler?(id, content, true) }
+        return .init("stored", id: id, followedFrom: origin?.deviceID)
     }
     private static func limit(_ kind: ClipboardKind) -> Int { kind == .image ? imageLimit : textLimit }
     private static func validate(_ content: ClipboardContent) throws {
@@ -156,14 +195,17 @@ public actor ClipboardHistory {
         pending = nil
         // Only the newest copy can be pending, so a kept copy is the newest one.
         let ticket = generation
-        guard let saved = try await save(candidate.content, kept: true, now: now) else { return .init("paused") }
-        if ticket == generation { latest = .stored(saved) }
-        return .init("stored", id: saved)
+        guard let saved = try await save(candidate.content, kept: true, now: now, ticket: ticket, origin: candidate.origin) else { return .init("paused") }
+        if ticket == generation {
+            latest = .stored(saved)
+            if !candidate.suppressFollow { await recordedHandler?(saved, candidate.content, true) }
+        }
+        return .init("stored", id: saved, followedFrom: candidate.origin?.deviceID)
     }
     public func setPaused(_ value: Bool) async throws {
         try await store.setSetting("clipboard_paused", value: value ? "true" : "false")
         guard value != paused else { return }
-        paused = value; generation &+= 1; pending = nil
+        paused = value; generation &+= 1; commitGeneration.value.withLock { $0 = generation }; pending = nil
         // A copy that was being read when history paused is not recorded.
         if value, case .reading = latest { latest = .skipped(.latestCopiedWhilePaused) }
     }
@@ -172,7 +214,7 @@ public actor ClipboardHistory {
     /// `latestItem` waits for it instead of returning the copy before it, and that copy's
     /// Keep is gone, as for any new copy.
     public func noteChange() {
-        generation &+= 1; pending = nil
+        generation &+= 1; commitGeneration.value.withLock { $0 = generation }; pending = nil
         latest = paused ? .skipped(.latestCopiedWhilePaused) : .reading
     }
     public func isPaused() -> Bool { paused }
@@ -213,8 +255,16 @@ public actor ClipboardHistory {
     /// in `ingest` or `keep` while that write was queued would otherwise be stored after the
     /// pause had returned. Transactions run one at a time, so the write is either before the
     /// pause is written or sees it.
-    private func save(_ content: ClipboardContent, kept: Bool, now: Date) async throws -> String? {
-        try await store.transaction { tx in
+    private func save(_ content: ClipboardContent, kept: Bool, now: Date, ticket: UInt64, origin: ClipboardOrigin? = nil, filtering: Bool? = nil) async throws -> String? {
+        let gate = commitGeneration
+        return try await store.transaction { tx in
+            try gate.value.withLock { current in
+            guard current == ticket else { return nil }
+            if let filtering {
+                let setting = try tx.query("SELECT value FROM settings WHERE key='clipboard.filter_secrets'")
+                let enabled = setting.first?["value"] != .text("false")
+                guard enabled == filtering else { return nil }
+            }
             let paused = try tx.query("SELECT value FROM settings WHERE key='clipboard_paused'")
             if paused.first?["value"] == .text("true") { return nil }
             let duplicate = try tx.query("SELECT id FROM clipboard WHERE kind=? AND content=? AND mime IS ? LIMIT 1",
@@ -226,13 +276,19 @@ public actor ClipboardHistory {
                 INSERT INTO clipboard(id,timestamp,kind,content,mime,kept) VALUES(?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET timestamp=excluded.timestamp,kept=MAX(clipboard.kept,excluded.kept)
                 """, bindings: [.text(id), .real(now.timeIntervalSince1970), .text(content.kind.rawValue), .blob(content.data), content.mime.map(SQLValue.text) ?? .null, .integer(kept ? 1 : 0)])
+            try tx.execute("DELETE FROM clipboard_origins WHERE clip_id=?", bindings: [.text(id)])
+            if let origin {
+                try tx.execute("INSERT INTO clipboard_origins(clip_id,device_id) VALUES(?,?)", bindings: [.text(id), .text(origin.deviceID)])
+            }
             try Self.prune(tx, now: now)
             return id
+            }
         }
     }
+
     public func items(search: String? = nil, now: Date = Date()) async throws -> [ClipboardItem] {
         try await retain(now: now)
-        let rows = try await store.query("SELECT * FROM clipboard ORDER BY timestamp DESC,rowid DESC")
+        let rows = try await store.query("SELECT c.*,o.device_id AS followed_from FROM clipboard c LEFT JOIN clipboard_origins o ON o.clip_id=c.id ORDER BY c.timestamp DESC,c.rowid DESC")
         return try rows.map(Self.item).filter { item in search.map { item.text?.localizedCaseInsensitiveContains($0) == true } ?? true }
     }
     /// The list `clip.list` sends: every item without an image's body and with at most
@@ -242,9 +298,9 @@ public actor ClipboardHistory {
         try await retain(now: now)
         // One byte past the limit shows whether, and where, the cut falls inside a character.
         let rows = try await store.query("""
-            SELECT id,timestamp,kind,mime,kept,length(content) AS size,
+            SELECT c.id,c.timestamp,c.kind,c.mime,c.kept,o.device_id AS followed_from,length(c.content) AS size,
                    CASE WHEN kind='image' THEN NULL ELSE substr(content,1,?) END AS content
-            FROM clipboard ORDER BY timestamp DESC,rowid DESC
+            FROM clipboard c LEFT JOIN clipboard_origins o ON o.clip_id=c.id ORDER BY c.timestamp DESC,c.rowid DESC
             """, bindings: [.integer(Int64(Self.previewLimit + 1))])
         var result: [ClipboardItem] = []
         for row in rows {
@@ -270,7 +326,7 @@ public actor ClipboardHistory {
                 guard text.localizedCaseInsensitiveContains(search) else { continue }
             }
             result.append(ClipboardItem(id: id, timestamp: Date(timeIntervalSince1970: time), kind: parsed, content: content,
-                                        mime: mime, kept: kept != 0, size: Int(size), truncated: truncated))
+                                        mime: mime, kept: kept != 0, size: Int(size), truncated: truncated, followedFrom: Self.origin(row)))
         }
         return result
     }
@@ -287,12 +343,15 @@ public actor ClipboardHistory {
               case .blob(let data) = row["content"], case .integer(let kept) = row["kept"] else { throw AgentError.storage }
         let mime: String?
         if case .text(let value) = row["mime"] { mime = value } else { mime = nil }
-        return ClipboardItem(id: id, timestamp: Date(timeIntervalSince1970: time), kind: parsed, content: data, mime: mime, kept: kept != 0)
+        return ClipboardItem(id: id, timestamp: Date(timeIntervalSince1970: time), kind: parsed, content: data, mime: mime, kept: kept != 0, followedFrom: Self.origin(row))
+    }
+    private static func origin(_ row: SQLRow) -> String? {
+        if case .text(let device) = row["followed_from"] { return device }; return nil
     }
     /// One whole item, read on its own.
     public func item(id: String) async throws -> ClipboardItem {
         try await retain()
-        guard let row = try await store.query("SELECT * FROM clipboard WHERE id=?", bindings: [.text(id)]).first else { throw ClipboardFailure.missing }
+        guard let row = try await store.query("SELECT c.*,o.device_id AS followed_from FROM clipboard c LEFT JOIN clipboard_origins o ON o.clip_id=c.id WHERE c.id=?", bindings: [.text(id)]).first else { throw ClipboardFailure.missing }
         return try Self.item(row)
     }
 }

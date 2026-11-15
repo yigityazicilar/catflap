@@ -18,7 +18,9 @@ extension AgentHarness: @unchecked Sendable {}
 final class PairedAgents: @unchecked Sendable {
     let first: AgentHarness
     let second: AgentHarness
-    init() throws { first = try AgentHarness(); second = try AgentHarness() }
+    init(environment: [String: String] = [:]) throws {
+        first = try AgentHarness(environment: environment); second = try AgentHarness(environment: environment)
+    }
     func stop() { first.stop(); second.stop() }
 
     func startAndPair() async throws {

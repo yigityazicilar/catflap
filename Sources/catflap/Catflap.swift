@@ -18,7 +18,7 @@ struct Catflap: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "catflap", abstract: "Local Catflap agent and control client.",
         subcommands: [Agent.self, Status.self, Devices.self, History.self, Toggle.self, UI.self,
-                      Pair.self, Unpair.self, Send.self, Transfers.self, Inbox.self, Clip.self, Audit.self, Version.self, EraseIdentity.self])
+                      Pair.self, Unpair.self, Send.self, Transfers.self, Inbox.self, Clip.self, Follow.self, Open.self, Audit.self, Version.self, EraseIdentity.self])
 
     static func main() async {
         #if os(macOS)
@@ -137,6 +137,7 @@ struct Agent: AsyncParsableCommand {
             continuation.finish(); term.cancel(); interrupt.cancel()
             await platform?.stop()
             await presence.stop()
+            await runtime.service(FollowService.self)?.stop()
             await runtime.service(TransferService.self)?.stop()
             await runtime.stop()
             AgentRuntime.setProcess(nil)

@@ -89,6 +89,13 @@ extension TransferService {
             if offer.size > limit { throw TransferFailure.rejected(.tooLarge) }
             if kind == "folder", (offer.entries ?? 0) > limits.folder.entries { throw TransferFailure.folderLimit(.entries) }
 
+            if offer.intent == "follow", offer.size > Int64(offer.kind == "image" ? ClipboardHistory.imageLimit : ClipboardHistory.textLimit) {
+                throw TransferFailure.rejected(.tooLarge)
+            }
+            // Follow permissions are decided by the service after verification, never by a
+            // stale admission snapshot. Until that decision, no follow body reaches disk.
+            let memoryOnlyFollow = offer.intent == "follow"
+
             // A part from this device for this id resumes only when everything about it matches.
             var resume: PartRow?
             if let part = try await partRow(deviceID: deviceID, id: offer.id) {
@@ -100,12 +107,12 @@ extension TransferService {
                     try await dropPart(deviceID: deviceID, id: offer.id, status: nil)
                 }
             }
-            if resume == nil, kind != "text", !(kind == "image" && !offer.keep) {
+            if resume == nil, kind != "text", !(kind == "image" && (!offer.keep || memoryOnlyFollow)) {
                 let parts = try await history.store.query("SELECT COUNT(*) AS n FROM parts WHERE device_id=?", bindings: [.text(deviceID)])
                 if case .integer(let n) = parts.first?["n"], n >= Int64(limits.partsPerDevice) { throw TransferFailure.rejected(.busy) }
             }
             // A text, and an image not kept, are held in memory only: no file, no name.
-            let usesDisk = kind == "file" || kind == "folder" || (kind == "image" && offer.keep)
+            let usesDisk = kind == "file" || kind == "folder" || (kind == "image" && offer.keep && !memoryOnlyFollow)
             var target: TransferInbox?
             if usesDisk {
                 let chosen: TransferInbox
@@ -268,7 +275,10 @@ extension TransferService {
             guard done.sha256 == offer.sha256, actual == offer.sha256 else { throw TransferFailure.rejected(.corrupt) }
             if kind == "text" { guard String(data: memory, encoding: .utf8) != nil else { throw TransferFailure.rejected(.invalid) } }
             if kind == "image" { guard ImageKind.matches(memory, mime: offer.mime) else { throw TransferFailure.rejected(.invalid) } }
-            if offer.keep { row.sha256 = actual }
+            if offer.intent == "open" || offer.clipKind == "url" {
+                guard let text = String(data: memory, encoding: .utf8), LinkNormalizer.normalize(text) != nil else { throw TransferFailure.rejected(.invalid) }
+            }
+            if offer.keep && !memoryOnlyFollow { row.sha256 = actual }
             // Kept: the name and path are recorded before the item is published, so a restart
             // finds them; a don't-keep name is chosen now and stays in memory.
             var name: String?
@@ -291,9 +301,11 @@ extension TransferService {
             try checkpoint(.renamed)
             if kind == "text" {
                 let value = String(decoding: memory, as: UTF8.self)
-                if offer.keep { row.text = value } else { rememberText(value, key: key) }
+                if !memoryOnlyFollow {
+                    if offer.keep { row.text = value } else { rememberText(value, key: key) }
+                }
             }
-            if kind == "image" && !offer.keep { rememberImage(memory, mime: offer.mime, key: key) }
+            if kind == "image" && !offer.keep && !memoryOnlyFollow { rememberImage(memory, mime: offer.mime, key: key) }
             row.status = "ok"; row.phase = nil; row.progress = nil; row.resumedFrom = nil
             try await history.save(row)
             record = row
@@ -303,6 +315,10 @@ extension TransferService {
                 if kind == "folder" { _ = unlink(recovery.inbox.sidecar(recovery.id).path) } else { _ = unlink(recovery.inbox.recoveryPart(recovery.id).path) }
             }
             receiving[key] = nil
+            if ["text", "image"].contains(kind), let receivedHandler {
+                let clip = ClipboardKind(rawValue: offer.clipKind ?? (kind == "image" ? "image" : "text")) ?? .text
+                await receivedHandler(deviceID, offer.id, .init(kind: clip, data: memory, mime: offer.mime), offer.keep, offer.intent)
+            }
             if !dropAck { try await connection.send(TransferAck(storedAs: offer.keep ? (name ?? "") : "")) }
             await connection.finish()
         } catch {
@@ -350,7 +366,9 @@ extension TransferService {
     static func check(_ offer: TransferOffer) throws {
         guard ["text", "file", "image", "folder"].contains(offer.kind), offer.size >= 0, isDigest(offer.sha256),
               ["deliver", "follow", "open"].contains(offer.intent) else { throw TransferFailure.rejected(.invalid) }
-        if offer.intent == "follow" { guard let clip = offer.clipKind, ["text", "url", "image"].contains(clip) else { throw TransferFailure.rejected(.invalid) } }
+        if offer.intent == "follow" {
+            guard let clip = offer.clipKind, (offer.kind == "text" && ["text", "url"].contains(clip)) || (offer.kind == "image" && clip == "image") else { throw TransferFailure.rejected(.invalid) }
+        }
         else { guard offer.clipKind == nil else { throw TransferFailure.rejected(.invalid) } }
         if offer.intent == "open" { guard offer.kind == "text" else { throw TransferFailure.rejected(.invalid) } }
         if offer.kind == "image" { guard ImageKind.extensions[offer.mime] != nil else { throw TransferFailure.rejected(.invalid) } }

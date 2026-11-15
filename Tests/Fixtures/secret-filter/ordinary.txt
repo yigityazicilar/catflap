@@ -1,0 +1,5 @@
+clipboard_history_schema_v2
+v2026.11.15-beta.3+build.128
+HTTPResponseJSONDecoderFactory
+URLSessionHTTPStatusCodeParser
+parseHTTPResponseJSONPayload

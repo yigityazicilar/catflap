@@ -21,7 +21,7 @@ struct StoreTests {
         let paths = try storeTestPaths()
         defer { removeStoreTestPaths(paths) }
         let store = try Store(paths: paths)
-        #expect(try await store.schemaVersion() == 2)
+        #expect(try await store.schemaVersion() == 3)
         let old = Date(timeIntervalSince1970: 100)
         let newer = Date(timeIntervalSince1970: 200)
         for (id, paired, sent) in [("first", old, old as Date?), ("second", newer, nil), ("third", old, newer as Date?)] {
@@ -30,7 +30,7 @@ struct StoreTests {
         try await store.saveHistory(.init(id: "row", deviceID: "first", direction: "sent", kind: "text", size: 5, status: "ok", text: "hello"))
         try await store.setSetting("example", value: "saved")
         let reopened = try Store(paths: paths)
-        #expect(try await reopened.schemaVersion() == 2)
+        #expect(try await reopened.schemaVersion() == 3)
         #expect(try await reopened.devices().map(\.id) == ["third", "first", "second"])
         #expect(try await reopened.history(search: "hello").count == 1)
         #expect(try await reopened.setting("example") == "saved")
@@ -62,7 +62,7 @@ struct StoreTests {
         try FileManager.default.copyItem(at: v1, to: paths.database)
         let store: Store
         do { store = try Store(paths: paths) } catch { Issue.record("open failed"); throw error }
-        #expect(try await store.schemaVersion() == 2)
+        #expect(try await store.schemaVersion() == 3)
         #expect(try await store.devices().map(\.id) == ["first", "second"])
         #expect(try await store.setting("example") == "saved")
         let sent = try #require(try await store.query("SELECT intent, text, updated_at FROM history WHERE id='sent'").first)

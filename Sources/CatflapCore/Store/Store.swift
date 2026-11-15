@@ -28,7 +28,7 @@ public actor Store {
             sqlite3_busy_timeout(connection, 5000)
             try Self.execute(connection, "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")
             let version = try Self.version(connection)
-            guard version <= 2 else { throw AgentError.storage }
+            guard version <= 3 else { throw AgentError.storage }
             if version == 0 {
                 try Self.execute(connection, """
                 BEGIN IMMEDIATE;
@@ -57,6 +57,7 @@ public actor Store {
             // v2 only adds: columns to `history`, and the waiting queue, part files, peer state
             // and forgotten ids. `devices`, `clipboard` and `settings` keep their v1 layout.
             if version <= 1 { try Self.execute(connection, Self.migrationToV2) }
+            if version <= 2 { try Self.execute(connection, Self.migrationToV3) }
         } catch {
             sqlite3_close(connection)
             throw AgentError.storage
@@ -127,6 +128,17 @@ public actor Store {
         PRIMARY KEY (device_id, id)
     );
     PRAGMA user_version=2;
+    COMMIT;
+    """
+    // Permissions and policies keep their settings keys. Origin metadata belongs to the
+    // schema, not to whichever clipboard history method happens to run first.
+    static let migrationToV3 = """
+    BEGIN IMMEDIATE;
+    CREATE TABLE IF NOT EXISTS clipboard_origins (
+        clip_id TEXT PRIMARY KEY REFERENCES clipboard(id) ON DELETE CASCADE,
+        device_id TEXT NOT NULL
+    );
+    PRAGMA user_version=3;
     COMMIT;
     """
     private static func execute(_ db: OpaquePointer, _ sql: String) throws {
