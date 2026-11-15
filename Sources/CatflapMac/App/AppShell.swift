@@ -35,6 +35,19 @@ final class AppShell: NSObject, NSApplicationDelegate {
     private(set) var activations = 0
     func applicationDidBecomeActive(_ notification: Notification) { activations += 1 }
 
+    /// What opening Catflap.app again while it runs does (Finder, `open`): the panel sets it.
+    var onReopen: (@MainActor () -> Void)?
+    /// How often Catflap.app was opened again while it ran, counted once it was handled.
+    private(set) var reopens = 0
+
+    /// LaunchServices does not start a second copy of a running app: it sends the running one
+    /// this event instead. Catflap has no window to bring back, so the panel opens, focused.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        onReopen?()
+        reopens += 1
+        return false
+    }
+
     /// A quit from the system (log out, restart) goes through the agent's own shutdown, which
     /// stops the panel and the run loop, instead of AppKit ending the process at once.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
