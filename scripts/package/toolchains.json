@@ -1,0 +1,18 @@
+{
+  "ubuntu": {
+    "url": "https://download.swift.org/swift-6.4.2-release/ubuntu2604/swift-6.4.2-RELEASE/swift-6.4.2-RELEASE-ubuntu26.04.tar.gz",
+    "sha256": "ff69258a20ad7a70e31ec6bd983b4bcb241481001ebdbf5245150f7125f11e27"
+  },
+  "debian": {
+    "url": "https://download.swift.org/swift-6.4.2-release/debian13/swift-6.4.2-RELEASE/swift-6.4.2-RELEASE-debian13.tar.gz",
+    "sha256": "8b6fde775b7cfc7a3758739d8abb09bb6fba519c6532d6b1a47faff791646c64"
+  },
+  "fedora": {
+    "url": "https://download.swift.org/swift-6.4.2-release/fedora41/swift-6.4.2-RELEASE/swift-6.4.2-RELEASE-fedora41.tar.gz",
+    "sha256": "48168cdae669b62a9f6d9a8569e152edb51ceecb58b7bf50012e8c8beb056621"
+  },
+  "arch": {
+    "url": "https://download.swift.org/swift-6.4.2-release/ubi10/swift-6.4.2-RELEASE/swift-6.4.2-RELEASE-ubi10.tar.gz",
+    "sha256": "d2663c735fd2a5a6d2a004a5701f77df14ff93b9e5ea54815e8616832058bfbf"
+  }
+}

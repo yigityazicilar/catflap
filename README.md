@@ -8,6 +8,16 @@ The intended platforms are macOS 26 or later on Apple silicon and Linux on
 Wayland (KDE and GNOME). Pairing, transfers, history, clipboard capture, desktop
 panels, and installation packages are not implemented yet.
 
+## Install
+
+Linux package recipes target Arch, Ubuntu 26.04 LTS, Debian 13 and Fedora 45.
+They are built and install-tested in separate containers; no Swift toolchain is
+needed on the target. Packages are CI artifacts, not published releases or an
+AUR listing. Ubuntu 24.04 is not packaged because its repositories lack
+GTK 4's gtk4-layer-shell; use the source installer after supplying that dependency.
+See [installation](docs/install.md) for package commands, source installation,
+removal and desktop support.
+
 ## Build
 
 Requires Swift 6.2 or later, Go 1.27.2 or later, Git, a C compiler, and the
